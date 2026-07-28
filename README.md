@@ -73,6 +73,7 @@ Copy-Item .\config-template.json .\config.json
 - 增加会话历史持久化、去重、保留周期和公众号内容学习相关配置。
 - 提供 Windows 前台管理脚本 `cow.ps1`，支持 `start`、`stop`、`restart`、`status` 和紧急停止热键。
 - 增加微信 UIA 冒烟测试及会话控件树诊断脚本。
+- 移除 CowAgent Electron 桌面客户端、Docker/Linux 部署文件和旧通用启停脚本；本项目统一通过 Windows PowerShell 与 `cow.ps1` 管理。
 
 ## 后续计划
 
