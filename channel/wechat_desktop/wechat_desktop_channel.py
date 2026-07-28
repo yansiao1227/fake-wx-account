@@ -145,6 +145,19 @@ class WechatDesktopChannel(ChatChannel):
 
     def startup(self):
         self._stop_event.clear()
+        try:
+            activated = self._driver.ensure_foreground()
+            logger.info(
+                "[WechatDesktop] WeChat foreground check completed; activated=%s",
+                activated,
+            )
+        except Exception as exc:
+            # Keep the channel alive so its regular reconciliation loop can
+            # recover if WeChat is launched or becomes available later.
+            logger.warning(
+                "[WechatDesktop] unable to bring WeChat to the foreground at startup: %s",
+                exc,
+            )
         self._reply_queue = WechatReplyQueue()
         self._queue_thread = threading.Thread(
             target=self._consume_reply_queue,

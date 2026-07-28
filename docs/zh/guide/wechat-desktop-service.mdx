@@ -84,7 +84,8 @@ description: "在 Windows 和 cowagent-wechat Conda 环境中管理 CowAgent"
 
 ## 微信 UIA 冒烟测试
 
-默认脱敏检查 UIA 树、账号、Shell Hook 以及“颜料盒”和“测试群”两个会话：
+检查 UIA 树、账号、Shell Hook 以及“颜料盒”和“测试群”两个会话。报告会包含
+原始会话名称和消息内容：
 
 ```powershell
 conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --standard-targets
@@ -98,16 +99,15 @@ conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --standard-targ
 conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --send-smoke
 ```
 
-如需诊断会话列表控件，可以将其 UIA 树输出为 JSON。默认输出会脱敏会话名称和
-消息预览；只有本地诊断确有需要时才使用 `--include-content`：
+如需诊断会话列表控件，可以将其 UIA 树（包括原始会话名称和消息预览）输出为 JSON：
 
 ```powershell
 conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py
 conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py --output .\tmp\wechat-conversations.json
 ```
 
-诊断气泡 UIA 边界时可增加 `--geometry-summary`。该选项不输出消息正文；不要将
-`--include-content` 生成的报告直接对外发送。
+诊断气泡 UIA 边界时可增加 `--geometry-summary`。诊断报告包含原始聊天内容，
+不要未经检查直接对外发送。
 
 ## 常见问题
 

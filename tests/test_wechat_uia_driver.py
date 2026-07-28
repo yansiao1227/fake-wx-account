@@ -42,6 +42,167 @@ def test_send_button_uses_real_click_and_restores_cursor(monkeypatch):
     ]
 
 
+def test_startup_foreground_check_does_not_use_uia_tree(monkeypatch):
+    import win32gui
+    import win32process
+
+    client = WechatUiaClient({})
+    calls = []
+    foreground = {"hwnd": 200}
+
+    monkeypatch.setattr(client, "_window", lambda: (100, 42))
+    monkeypatch.setattr(
+        client,
+        "probe_tree",
+        lambda: (_ for _ in ()).throw(AssertionError("UIA tree must not be read")),
+    )
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: foreground["hwnd"])
+    monkeypatch.setattr(
+        win32process,
+        "GetWindowThreadProcessId",
+        lambda hwnd: (1, 42 if hwnd == 100 else 99),
+    )
+    monkeypatch.setattr(
+        win32gui,
+        "ShowWindow",
+        lambda hwnd, command: calls.append(("restore", hwnd, command)),
+    )
+
+    def set_foreground(hwnd):
+        calls.append(("foreground", hwnd))
+        foreground["hwnd"] = hwnd
+
+    monkeypatch.setattr(win32gui, "SetForegroundWindow", set_foreground)
+
+    assert client.ensure_foreground_window() is True
+    assert [item[0] for item in calls] == ["restore", "foreground"]
+
+
+def test_startup_foreground_check_accepts_any_wechat_process_window(monkeypatch):
+    import win32gui
+    import win32process
+
+    client = WechatUiaClient({})
+    monkeypatch.setattr(client, "_window", lambda: (100, 42))
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 101)
+    monkeypatch.setattr(
+        win32process,
+        "GetWindowThreadProcessId",
+        lambda _hwnd: (1, 42),
+    )
+    monkeypatch.setattr(
+        win32gui,
+        "ShowWindow",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("foreground WeChat must not be restored")
+        ),
+    )
+
+    assert client.ensure_foreground_window() is False
+
+
+def test_input_text_normalization_handles_uia_line_endings_and_spaces():
+    normalize = WechatUiaClient._normalize_input_text
+
+    assert normalize("第一行\r\n第二行\u00a0文本") == normalize(
+        "第一行\n第二行 文本"
+    )
+    assert normalize("e\u0301") == normalize("é")
+
+
+def test_paste_sends_nonempty_text_even_when_uia_value_differs(monkeypatch):
+    import win32api
+
+    state = {"value": "", "paste_count": 0, "click_count": 0}
+
+    class Input(GeometryControl):
+        def SetFocus(self):
+            pass
+
+        def GetValuePattern(self):
+            return SimpleNamespace(Value=state["value"])
+
+    class Button(GeometryControl):
+        def Click(self, **_kwargs):
+            state["click_count"] += 1
+            state["value"] = ""
+
+    input_control = Input((0, 0, 100, 50), automation_id="chat_input_field")
+    send_button = Button(
+        (100, 0, 150, 50), name="发送", class_name="mmui::XOutlineButton"
+    )
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield object()
+
+    def keybd_event(key, _scan, flags, _extra):
+        if key == ord("V") and flags == 0:
+            state["paste_count"] += 1
+            state["value"] = "UIA 返回的可见片段"
+
+    monkeypatch.setattr(win32api, "keybd_event", keybd_event)
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_walk", lambda _root: iter((input_control, send_button)))
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+
+    client._paste_and_send("完整的原始文本")
+
+    assert state == {"value": "", "paste_count": 1, "click_count": 1}
+
+
+def test_paste_retries_once_when_input_remains_empty(monkeypatch):
+    import win32api
+
+    state = {"value": "", "paste_count": 0, "click_count": 0}
+
+    class Input(GeometryControl):
+        def SetFocus(self):
+            pass
+
+        def GetValuePattern(self):
+            return SimpleNamespace(Value=state["value"])
+
+    class Button(GeometryControl):
+        def Click(self, **_kwargs):
+            state["click_count"] += 1
+            state["value"] = ""
+
+    input_control = Input((0, 0, 100, 50), automation_id="chat_input_field")
+    send_button = Button(
+        (100, 0, 150, 50), name="发送", class_name="mmui::XOutlineButton"
+    )
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield object()
+
+    def keybd_event(key, _scan, flags, _extra):
+        if key == ord("V") and flags == 0:
+            state["paste_count"] += 1
+            if state["paste_count"] == 2:
+                state["value"] = "第二次粘贴成功"
+
+    monkeypatch.setattr(win32api, "keybd_event", keybd_event)
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_walk", lambda _root: iter((input_control, send_button)))
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(
+        client,
+        "_wait_for_input_value",
+        lambda control, predicate, _timeout: predicate(client._input_value(control)),
+    )
+
+    client._paste_and_send("第二次粘贴成功")
+
+    assert state == {"value": "", "paste_count": 2, "click_count": 1}
+
+
 class GeometryControl:
     def __init__(
         self,

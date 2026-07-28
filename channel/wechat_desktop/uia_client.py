@@ -9,6 +9,7 @@ import random
 import re
 import threading
 import time
+import unicodedata
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
@@ -280,33 +281,60 @@ class WechatUiaClient:
         with self.operation_lock, self._uia_root() as root:
             return sum(1 for _ in self._walk(root))
 
-    def focus_window(self) -> None:
+    def ensure_foreground_window(self) -> bool:
+        """Bring WeChat forward when its process does not own the foreground."""
         self._require_windows()
         import win32api
         import win32con
         import win32gui
         import win32process
 
-        hwnd = self.get_owner_window_handle()
-        if win32gui.GetForegroundWindow() != hwnd:
-            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        hwnd, process_id = self._window()
+        foreground = win32gui.GetForegroundWindow()
+        if foreground:
+            try:
+                _, foreground_process_id = win32process.GetWindowThreadProcessId(
+                    foreground
+                )
+            except Exception:
+                foreground_process_id = 0
+            if int(foreground_process_id) == int(process_id):
+                return False
+
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            current_thread = win32api.GetCurrentThreadId()
+            foreground = win32gui.GetForegroundWindow()
+            foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
+            ctypes.windll.user32.AttachThreadInput(
+                current_thread, foreground_thread, True
+            )
             try:
                 win32gui.SetForegroundWindow(hwnd)
-            except Exception:
-                current_thread = win32api.GetCurrentThreadId()
-                foreground = win32gui.GetForegroundWindow()
-                foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
-                ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, True)
-                try:
-                    win32gui.SetForegroundWindow(hwnd)
-                finally:
-                    ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, False)
+            finally:
+                ctypes.windll.user32.AttachThreadInput(
+                    current_thread, foreground_thread, False
+                )
         self._paced_wait(
             "uia_focus_settle_ms_min",
             "uia_focus_settle_ms_max",
             int(self.config.get("uia_focus_settle_ms", 350)),
             700,
         )
+        foreground = win32gui.GetForegroundWindow()
+        try:
+            _, foreground_process_id = win32process.GetWindowThreadProcessId(foreground)
+        except Exception:
+            foreground_process_id = 0
+        if int(foreground_process_id) != int(process_id):
+            raise RuntimeError("WeChat could not be brought to the foreground")
+        return True
+
+    def focus_window(self) -> None:
+        self.ensure_foreground_window()
+        hwnd = self.get_owner_window_handle()
         self._recover_empty_tree(hwnd)
 
     def _click_taskbar_button(self) -> bool:
@@ -1103,6 +1131,18 @@ class WechatUiaClient:
             time.sleep(0.05)
         return predicate(self._input_value(control))
 
+    @staticmethod
+    def _normalize_input_text(value: str) -> str:
+        """Normalize harmless UIA text differences for paste diagnostics."""
+        return (
+            unicodedata.normalize("NFC", str(value or ""))
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\u00a0", " ")
+            .replace("\u2007", " ")
+            .replace("\u202f", " ")
+        )
+
     def _click_send_button(self, send_button):
         """Click the visible Send button while restoring the user's cursor.
 
@@ -1130,6 +1170,21 @@ class WechatUiaClient:
         import win32api
         import win32con
 
+        def paste_into(control) -> None:
+            control.SetFocus()
+            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+            win32api.keybd_event(ord("A"), 0, 0, 0)
+            win32api.keybd_event(ord("A"), 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(
+                win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0
+            )
+            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+            win32api.keybd_event(ord("V"), 0, 0, 0)
+            win32api.keybd_event(ord("V"), 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(
+                win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0
+            )
+
         # Conversation selection and clipboard setup can take long enough for
         # another window to steal focus. Reassert WeChat immediately before
         # keyboard input and the physical Send-button click.
@@ -1145,24 +1200,38 @@ class WechatUiaClient:
             )
             if control is None:
                 raise RuntimeError("WeChat chat input is unavailable")
-            control.SetFocus()
             # The desktop channel owns the input for this atomic operation.
             # Replace any stale draft left by an earlier failed UI action so
             # replies can never be concatenated accidentally.
-            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-            win32api.keybd_event(ord("A"), 0, 0, 0)
-            win32api.keybd_event(ord("A"), 0, win32con.KEYEVENTF_KEYUP, 0)
-            win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-            win32api.keybd_event(ord("V"), 0, 0, 0)
-            win32api.keybd_event(ord("V"), 0, win32con.KEYEVENTF_KEYUP, 0)
-            win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            paste_into(control)
+            actual_text = ""
+
+            def capture_nonempty(value: str) -> bool:
+                nonlocal actual_text
+                actual_text = value
+                return bool(value)
+
             if expected_text and not self._wait_for_input_value(
-                control,
-                lambda value: value == expected_text,
-                1.0,
+                control, capture_nonempty, 1.0
             ):
-                raise RuntimeError("WeChat did not accept the pasted reply text")
+                # A transient focus or clipboard miss is common enough to
+                # justify one bounded retry. Ctrl+A prevents concatenating a
+                # late first paste with the retry.
+                paste_into(control)
+                if not self._wait_for_input_value(
+                    control, capture_nonempty, 1.0
+                ):
+                    raise RuntimeError("WeChat chat input remained empty after retry")
+            if expected_text:
+                if self._normalize_input_text(actual_text) != self._normalize_input_text(
+                    expected_text
+                ):
+                    logger.warning(
+                        "[WechatDesktop] pasted reply text differs from the source; "
+                        "continuing because the input is non-empty: expected=%r actual=%r",
+                        expected_text,
+                        actual_text,
+                    )
             self._paced_wait(
                 "uia_paste_settle_ms_min",
                 "uia_paste_settle_ms_max",

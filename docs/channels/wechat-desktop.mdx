@@ -48,13 +48,13 @@ If WeChat is in the background it is restored before inspection. An empty UIA tr
 
 ## Smoke test
 
-The default report is redacted and does not take screenshots:
+The diagnostic report includes raw conversation names and message text, but does not take screenshots:
 
 ```powershell
 python scripts/test_wechat_uia.py
 python scripts/test_wechat_uia.py --conversation "File Transfer"
 ```
 
-Add `--include-content` only when local message text is safe to print. Sending occurs only when both `--send-to` and `--text` are supplied.
+Review diagnostic reports before sharing them. Sending occurs only when both `--send-to` and `--text` are supplied.
 
 During automation, the global `Ctrl+Alt+Shift+Q` hotkey stops CowAgent without requiring the mouse.

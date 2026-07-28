@@ -54,24 +54,15 @@ def _tree():
     return Control(class_name="MainWindow", children=[session_list, unrelated])
 
 
-def test_dump_conversation_tree_selects_list_and_redacts_content():
+def test_dump_conversation_tree_selects_list_and_includes_content():
     result = dump_conversation_tree(Client(_tree()))
 
     assert result["root_class"] == "SessionList"
     assert result["visible_session_count"] == 2
     assert result["node_count"] == 3
     assert [node["automation_id"] for node in result["nodes"][1:]] == [
-        "session_item_<redacted>",
-        "session_item_<redacted>",
-    ]
-    assert all("name" not in node for node in result["nodes"])
-
-
-def test_dump_conversation_tree_can_include_content():
-    result = dump_conversation_tree(Client(_tree()), include_content=True)
-
-    assert [node["automation_id"] for node in result["nodes"][1:]] == [
         "session_item_甲",
         "session_item_乙",
     ]
+    assert result["content_included"] is True
     assert result["nodes"][1]["name"] == "甲\n预览一"

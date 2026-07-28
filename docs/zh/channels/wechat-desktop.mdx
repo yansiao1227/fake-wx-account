@@ -48,13 +48,13 @@ Shell Hook、聚焦、选择会话、粘贴和发送之间采用可中断的保�
 
 ## 冒烟测试
 
-默认报告会脱敏，也不会截图：
+诊断报告包含原始会话名称和消息内容，但不会截图：
 
 ```powershell
 python scripts/test_wechat_uia.py
 python scripts/test_wechat_uia.py --conversation "文件传输助手"
 ```
 
-只有确认聊天内容可以输出时才添加 `--include-content`。只有同时提供 `--send-to` 和 `--text` 才会发送消息。
+不要未经检查直接对外发送诊断报告。只有同时提供 `--send-to` 和 `--text` 才会发送消息。
 
 自动化期间可在任意窗口按 `Ctrl+Alt+Shift+Q` 停止 CowAgent，无需操作鼠标。

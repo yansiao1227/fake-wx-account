@@ -1,4 +1,4 @@
-"""Redacted smoke test for the WeChat 4.x UIA backend."""
+"""Diagnostic smoke test for the WeChat 4.x UIA backend."""
 
 from __future__ import annotations
 
@@ -26,8 +26,8 @@ from channel.wechat_desktop.uia_client import (
 SIMULATED_MENTION_MARKER = "[有人@我]"
 
 
-def _geometry_summary(client: WechatUiaClient, include_text: bool = False) -> list[dict]:
-    """Return bubble geometry without exposing message or sender text."""
+def _geometry_summary(client: WechatUiaClient) -> list[dict]:
+    """Return bubble geometry and UIA text for selector diagnosis."""
     with client.operation_lock, client._uia_root() as root:
         message_list = next(
             (
@@ -61,7 +61,7 @@ def _geometry_summary(client: WechatUiaClient, include_text: bool = False) -> li
                         "type": _text(control.ControlTypeName),
                         "class": _text(control.ClassName),
                         "bounds": _bounds(control),
-                        "has_name": bool(value),
+                        "name": value,
                         "matches_item": bool(value and value == item_text),
                     }
                 )
@@ -72,24 +72,23 @@ def _geometry_summary(client: WechatUiaClient, include_text: bool = False) -> li
                 "legacy_role": legacy.Role if legacy else None,
                 "legacy_state": legacy.State if legacy else None,
                 "legacy_has_default_action": bool(legacy and legacy.DefaultAction),
+                "name": item_text,
                 "descendants": descendants,
-            }
-            if include_text:
-                row["uia_properties"] = {
+                "uia_properties": {
                     "aria": _text(item.AriaProperties),
                     "help": _text(item.HelpText),
                     "item_status": _text(item.ItemStatus),
                     "provider": _text(item.ProviderDescription),
                     "legacy_description": _text(legacy.Description) if legacy else "",
                     "legacy_value": _text(legacy.Value) if legacy else "",
-                }
+                },
+            }
             rows.append(row)
         return rows
 
 
 def _dump_current_chat_tree(
     client: WechatUiaClient,
-    include_content: bool,
     max_nodes: int = 500,
 ) -> dict:
     """Capture the current ChatDetailView hierarchy as structured JSON."""
@@ -104,10 +103,10 @@ def _dump_current_chat_tree(
         )
         if chat_root is None:
             raise RuntimeError("WeChat chat detail UI tree is unavailable")
-        return _dump_control_tree(chat_root, include_content, max_nodes)
+        return _dump_control_tree(chat_root, max_nodes)
 
 
-def _dump_control_tree(control, include_content: bool, max_nodes: int = 1000) -> dict:
+def _dump_control_tree(control, max_nodes: int = 1000) -> dict:
     queue = [(control, 0, None)]
     nodes = []
     while queue and len(nodes) < max(1, int(max_nodes)):
@@ -129,25 +128,20 @@ def _dump_control_tree(control, include_content: bool, max_nodes: int = 1000) ->
             "bounds": _bounds(item),
             "child_count": len(children),
         }
-        if include_content:
-            node["name"] = name
-        else:
-            node["has_name"] = bool(name)
-            node["name_length"] = len(name)
+        node["name"] = name
         nodes.append(node)
         queue.extend((child, depth + 1, index) for child in children)
     return {
         "root_class": _text(control.ClassName),
         "node_count": len(nodes),
         "truncated": bool(queue),
-        "content_included": include_content,
+        "content_included": True,
         "nodes": nodes,
     }
 
 
 def _open_and_dump_history(
     client: WechatUiaClient,
-    include_content: bool,
     open_member_filter: bool = False,
     select_member: str = "",
 ) -> dict:
@@ -258,7 +252,7 @@ def _open_and_dump_history(
         with auto.UIAutomationInitializerInThread():
             for hwnd in windows:
                 root = auto.ControlFromHandle(hwnd)
-                item = _dump_control_tree(root, include_content, 1500)
+                item = _dump_control_tree(root, 1500)
                 item["window_handle"] = int(hwnd)
                 item["window_class"] = win32gui.GetClassName(hwnd)
                 item["window_bounds"] = list(win32gui.GetWindowRect(hwnd))
@@ -286,13 +280,12 @@ def main() -> int:
     parser.add_argument("--conversation", help="read the latest visible bubbles")
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--self-display-name", default="")
-    parser.add_argument("--include-content", action="store_true")
     parser.add_argument("--send-to", default="")
     parser.add_argument("--text", default="")
     parser.add_argument(
         "--standard-targets",
         action="store_true",
-        help="read the redacted smoke summary for 颜料盒 and 测试群",
+        help="read the smoke diagnostics for 颜料盒 and 测试群",
     )
     parser.add_argument(
         "--send-smoke",
@@ -302,7 +295,7 @@ def main() -> int:
     parser.add_argument(
         "--geometry-summary",
         action="store_true",
-        help="include redacted bubble classes and bounds for selector diagnosis",
+        help="include bubble text, classes, and bounds for selector diagnosis",
     )
     parser.add_argument(
         "--dump-tree",
@@ -375,9 +368,8 @@ def main() -> int:
                 "limit": min(max(args.limit, 1), 5),
                 "directions": [item.direction for item in messages],
                 "types": [item.message_type for item in messages],
+                "content": [item.content for item in messages],
             }
-            if args.include_content:
-                report["history"]["content"] = [item.content for item in messages]
         if args.standard_targets or args.send_smoke:
             report["standard_targets"] = {}
             for target, expected_type in (("颜料盒", "private"), ("测试群", "group")):
@@ -404,6 +396,7 @@ def main() -> int:
                     "history_count": len(messages),
                     "directions": [message.direction for message in messages],
                     "types": [message.message_type for message in messages],
+                    "content": [message.content for message in messages],
                     "direction_available": bool(messages)
                     and all(
                         message.direction in {"incoming", "outgoing"}
@@ -427,10 +420,8 @@ def main() -> int:
                         "recent_bubble": bubble_marker,
                         "rule": "contains",
                     }
-                if args.include_content:
-                    item["content"] = [message.content for message in messages]
                 if args.geometry_summary:
-                    item["geometry"] = _geometry_summary(client, args.include_content)
+                    item["geometry"] = _geometry_summary(client)
                 report["standard_targets"][target] = item
             report["standard_summary"] = {
                 "targets_located": all(
@@ -458,7 +449,7 @@ def main() -> int:
                 raise ValueError("--send-to and --text must be supplied together")
             report["send"] = client.send_message(args.send_to, args.text)
         if args.dump_tree:
-            tree = _dump_current_chat_tree(client, args.include_content)
+            tree = _dump_current_chat_tree(client)
             output_dir = ROOT / "tmp"
             output_dir.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
@@ -476,7 +467,6 @@ def main() -> int:
         if args.dump_history_tree:
             history_tree = _open_and_dump_history(
                 client,
-                args.include_content,
                 args.history_member_filter or args.select_owner_member,
                 owner.nick_name if args.select_owner_member else "",
             )
@@ -494,7 +484,7 @@ def main() -> int:
                 "node_count": sum(
                     item["node_count"] for item in history_tree["windows"]
                 ),
-                "content_included": args.include_content,
+                "content_included": True,
             }
     except Exception as exc:
         report["error"] = str(exc)
@@ -503,8 +493,7 @@ def main() -> int:
     finally:
         hook.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    if args.include_content:
-        print("[WARN] The report contains visible chat text; review before sharing.")
+    print("[WARN] The report contains visible chat text; review before sharing.")
     return 0
 
 

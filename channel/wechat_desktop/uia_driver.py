@@ -70,6 +70,9 @@ class WechatUiaDriver:
             self._hook_started = self._hook.start()
         return self._hook_started
 
+    def ensure_foreground(self) -> bool:
+        return self.client.ensure_foreground_window()
+
     def close(self):
         self._hook.close()
         self._hook_started = False

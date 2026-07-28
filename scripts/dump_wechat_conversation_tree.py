@@ -69,13 +69,7 @@ def _find_conversation_list_root(root, max_scan_nodes: int = 4000):
     return controls[start], len(session_indexes)
 
 
-def _safe_automation_id(value: str, include_content: bool) -> str:
-    if include_content or not value.startswith(SESSION_PREFIX):
-        return value
-    return f"{SESSION_PREFIX}<redacted>"
-
-
-def _dump_control_tree(control, include_content: bool, max_nodes: int) -> dict:
+def _dump_control_tree(control, max_nodes: int) -> dict:
     queue = [(control, 0, None)]
     nodes = []
     while queue and len(nodes) < max(1, int(max_nodes)):
@@ -90,16 +84,12 @@ def _dump_control_tree(control, include_content: bool, max_nodes: int) -> dict:
             "depth": depth,
             "control_type": _text(item.ControlTypeName),
             "class_name": _text(item.ClassName),
-            "automation_id": _safe_automation_id(automation_id, include_content),
+            "automation_id": automation_id,
             "runtime_id": _runtime_id(item),
             "bounds": _bounds(item),
             "child_count": len(children),
         }
-        if include_content:
-            node["name"] = name
-        else:
-            node["has_name"] = bool(name)
-            node["name_length"] = len(name)
+        node["name"] = name
         nodes.append(node)
         queue.extend((child, depth + 1, index) for child in children)
 
@@ -107,14 +97,13 @@ def _dump_control_tree(control, include_content: bool, max_nodes: int) -> dict:
         "root_class": _text(control.ClassName),
         "node_count": len(nodes),
         "truncated": bool(queue),
-        "content_included": include_content,
+        "content_included": True,
         "nodes": nodes,
     }
 
 
 def dump_conversation_tree(
     client: WechatUiaClient,
-    include_content: bool = False,
     max_nodes: int = 2000,
     max_scan_nodes: int = 4000,
 ) -> dict:
@@ -122,7 +111,7 @@ def dump_conversation_tree(
         list_root, session_count = _find_conversation_list_root(
             root, max_scan_nodes
         )
-        result = _dump_control_tree(list_root, include_content, max_nodes)
+        result = _dump_control_tree(list_root, max_nodes)
         result["visible_session_count"] = session_count
         return result
 
@@ -132,11 +121,6 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--include-content",
-        action="store_true",
-        help="include conversation names and message previews (sensitive)",
-    )
     parser.add_argument("--max-nodes", type=int, default=2000)
     parser.add_argument("--max-scan-nodes", type=int, default=4000)
     parser.add_argument(
@@ -151,7 +135,6 @@ def main() -> int:
         client.focus_window()
         tree = dump_conversation_tree(
             client,
-            include_content=args.include_content,
             max_nodes=args.max_nodes,
             max_scan_nodes=args.max_scan_nodes,
         )
