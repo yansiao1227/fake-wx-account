@@ -524,7 +524,7 @@ function Get-ChannelLabel {
     switch ($Key) {
         "web"            { return (T "Web 网页控制台（推荐）" "Web Console (recommended)") }
         "weixin"         { return (T "微信官方接口 Weixin" "Official Weixin") }
-        "wechat_desktop" { return (T "微信 4.x 桌面自动化" "WeChat 4.x Desktop Automation") }
+        "wechat_desktop" { return (T "微信 4.1.9.30 桌面自动化" "WeChat 4.1.9.30 Desktop Automation") }
         "skip"           { return (T "⏭  跳过" "⏭  Skip") }
     }
 }
@@ -553,7 +553,7 @@ function Configure-Channel {
         "wechat_desktop" {
             $script:ChannelType = "web,wechat_desktop"
             $script:ChannelExtra["web_port"] = 9899
-            $script:AccessInfo = T "微信 4.x UI Automation 已配置，请先登录桌面微信" "WeChat 4.x UI Automation configured. Sign in to desktop WeChat first."
+            $script:AccessInfo = T "微信 4.1.9.30 UI Automation 已配置，请先登录桌面微信" "WeChat 4.1.9.30 UI Automation configured. Sign in to desktop WeChat first."
         }
     }
 }

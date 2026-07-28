@@ -1,4 +1,4 @@
-"""Diagnostic smoke test for the WeChat 4.x UIA backend."""
+"""Diagnostic smoke test for the WeChat 4.1.9.30 UIA backend."""
 
 from __future__ import annotations
 

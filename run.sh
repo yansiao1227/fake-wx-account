@@ -658,7 +658,7 @@ channel_label() {
     case "$1" in
         web) echo "$(t "Web 网页控制台（推荐）" "Web Console (recommended)")" ;;
         weixin) echo "$(t "微信官方接口 Weixin" "Official Weixin")" ;;
-        wechat_desktop) echo "$(t "微信 4.x 桌面自动化" "WeChat 4.x Desktop Automation")" ;;
+        wechat_desktop) echo "$(t "微信 4.1.9.30 桌面自动化" "WeChat 4.1.9.30 Desktop Automation")" ;;
         skip) echo "$(t "⏭  跳过" "⏭  Skip")" ;;
     esac
 }
@@ -686,7 +686,7 @@ configure_channel() {
         wechat_desktop)
             CHANNEL_TYPE="web,wechat_desktop"
             WEB_PORT="9899"
-            ACCESS_INFO="$(t "微信 4.x UI Automation 已配置，请先登录桌面微信" "WeChat 4.x UI Automation configured. Sign in to desktop WeChat first.")"
+            ACCESS_INFO="$(t "微信 4.1.9.30 UI Automation 已配置，请先登录桌面微信" "WeChat 4.1.9.30 UI Automation configured. Sign in to desktop WeChat first.")"
             ;;
     esac
 }

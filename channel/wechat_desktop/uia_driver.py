@@ -1,4 +1,4 @@
-"""Event driver for the WeChat 4.x UIA client."""
+"""Event driver for the WeChat 4.1.9.30 UIA client."""
 
 from __future__ import annotations
 

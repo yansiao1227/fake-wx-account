@@ -32,7 +32,7 @@ def test_send_button_uses_real_click_and_restores_cursor(monkeypatch):
             calls.append(("click", kwargs))
 
         def GetInvokePattern(self):
-            raise AssertionError("WeChat 4.x InvokePattern must not be used")
+            raise AssertionError("WeChat 4.1.9.30 InvokePattern must not be used")
 
     WechatUiaClient({})._click_send_button(Button())
 

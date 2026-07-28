@@ -1,4 +1,4 @@
-"""Synchronous WeChat 4.x client built on Windows UI Automation."""
+"""Synchronous WeChat 4.1.9.30 client built on Windows UI Automation."""
 
 from __future__ import annotations
 
@@ -235,10 +235,10 @@ class WechatUiaClient:
     def _window(self) -> tuple[int, int]:
         windows = self._enumerate_main_windows()
         if not windows:
-            raise RuntimeError("No logged-in WeChat 4.x main window was found")
+            raise RuntimeError("No logged-in WeChat 4.1.9.30 main window was found")
         if len(windows) != 1:
             raise RuntimeError(
-                f"Exactly one WeChat 4.x main window is required; found {len(windows)}"
+                f"Exactly one WeChat 4.1.9.30 main window is required; found {len(windows)}"
             )
         return windows[0]
 
@@ -592,7 +592,7 @@ class WechatUiaClient:
             if control is None and not runtime_id and len(candidates) == 1:
                 control = candidates[0]
             if control is not None:
-                # Recent WeChat 4.x builds expose SelectionItemPattern on a
+                # WeChat 4.1.9.30 exposes SelectionItemPattern on a
                 # session row but Select() only changes UIA selection state;
                 # it does not activate the detail pane.  Use a real click,
                 # restore the cursor, and verify the chat UI before
@@ -1146,7 +1146,7 @@ class WechatUiaClient:
     def _click_send_button(self, send_button):
         """Click the visible Send button while restoring the user's cursor.
 
-        WeChat 4.x exposes InvokePattern on this button, but some releases
+        WeChat 4.1.9.30 exposes InvokePattern on this button, but some environments
         acknowledge Invoke() without actually sending. A real button click is
         therefore the primary operation.
         """

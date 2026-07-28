@@ -14,7 +14,7 @@ click>=8.0
 qrcode
 json-repair
 
-# ---- WeChat 4.x automation ----
+# ---- WeChat 4.1.9.30 automation ----
 uiautomation==2.0.29; platform_system == "Windows"
 pywin32>=312; platform_system == "Windows"
 
