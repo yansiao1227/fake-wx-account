@@ -12,7 +12,7 @@ class WechatDesktopTool(BaseTool):
         "Send a message through the normal Windows WeChat desktop client using "
         "the dedicated wechat_desktop policy executor. Use this tool instead "
         "of generic computer clicks for outbound WeChat messages. Allowlisted "
-        "high-confidence text may send immediately; other actions are queued "
+        "text may send immediately; other actions are queued "
         "for approval in the Web console."
     )
     params = {

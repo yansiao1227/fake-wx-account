@@ -23,5 +23,4 @@ class WechatDesktopMessage(ChatMessage):
         self.actual_user_nickname = event.sender_name
         self.at_list = []
         self.self_display_name = ""
-        self.confidence = event.confidence
         self.evidence_path = event.evidence_path

@@ -7,10 +7,12 @@ import random
 import threading
 import time
 import unicodedata
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Optional
 
+from common.log import logger
 from channel.wechat_desktop.models import UiaChatMessage, WechatDesktopEvent
 from channel.wechat_desktop.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia_client import WechatUiaClient
@@ -33,19 +35,20 @@ class WechatUiaDriver:
         self._hook_started = False
         self._last_hook_at = 0.0
         self._rows = {}
-        self._message_tails: dict[str, list[UiaChatMessage]] = {}
         self._conversation_selectors = {}
         self._emitted_targets: dict[str, str] = {}
-        self._seen_ids: set[str] = set()
-        self._seen_order: list[str] = []
         self._known_groups = {str(x) for x in config.get("auto_reply_groups", [])}
         self._known_group_keys: set[str] = set()
-        self._outgoing_history_provider = None
         self._reply_in_flight = threading.Event()
         self._reply_conversation = ""
 
-    def set_outgoing_history_provider(self, provider) -> None:
-        self._outgoing_history_provider = provider
+    def _trace(self, stage: str, message: str, *args) -> None:
+        if bool(self.config.get("diagnostic_logging", False)):
+            logger.info(
+                "[WechatDesktop][trace:%s] " + message,
+                stage,
+                *args,
+            )
 
     @property
     def reply_in_flight(self) -> bool:
@@ -136,7 +139,8 @@ class WechatUiaDriver:
             return self._observation(error=f"WeChat UI Automation unavailable: {exc}", uia_available=False)
 
     def _message_limit(self) -> int:
-        return max(1, min(int(self.config.get("uia_message_limit", 5)), 5))
+        # Zero asks the UIA client for every message node currently visible.
+        return 0
 
     @staticmethod
     def _row_key(row) -> str:
@@ -147,11 +151,13 @@ class WechatUiaDriver:
 
     @classmethod
     def _target_key(cls, message: UiaChatMessage, index: int) -> str:
-        stable = message.runtime_id or repr(
+        # UIA runtime IDs identify recyclable controls, not WeChat messages.
+        # Build the short-lived reply-target key from message data instead.
+        stable = repr(
             (
-                message.direction,
                 message.message_type,
                 message.content,
+                message.bounds,
                 int(index),
             )
         )
@@ -163,77 +169,36 @@ class WechatUiaDriver:
         is_group: bool,
         owner: str,
     ) -> tuple[int, Optional[UiaChatMessage]]:
-        """Return exactly one latest, structurally unanswered UIA bubble."""
-        if is_group:
-            candidates = [
-                index
-                for index, message in enumerate(messages)
-                if message.direction == "incoming"
-                and self._mentions_owner(message.content, owner)
-            ]
-        else:
-            last_outgoing = max(
-                (
-                    index
-                    for index, message in enumerate(messages)
-                    if message.direction == "outgoing"
-                ),
-                default=-1,
-            )
-            candidates = [
-                index
-                for index, message in enumerate(messages)
-                if index > last_outgoing and message.direction == "incoming"
-            ]
-        if not candidates:
+        """Classify visible nodes newest-first without using message direction."""
+        if not messages:
             return -1, None
-        target_index = candidates[-1]
-        if any(
-            message.direction == "unknown"
-            for message in messages[target_index + 1 :]
-        ):
-            return -1, None
-        if any(
-            message.direction == "outgoing"
-            for message in messages[target_index + 1 :]
-        ):
-            return -1, None
-        return target_index, messages[target_index]
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not is_group or self._mentions_owner(message.content, owner):
+                return index, message
+        return -1, None
 
-    @staticmethod
     def _history_snapshot(
-        messages: list[UiaChatMessage], target_index: int, is_group: bool
+        self,
+        messages: list[UiaChatMessage],
+        target_index: int,
+        is_group: bool,
     ) -> list[dict]:
+        context_messages = [
+            message
+            for index, message in enumerate(messages)
+            if index != target_index
+        ]
         history = []
-        for index, message in enumerate(messages):
-            if index == target_index or message.direction not in {"incoming", "outgoing"}:
-                continue
+        for message in context_messages:
             history.append(
                 {
-                    "sender_name": (
-                        message.sender_name
-                        if is_group and message.direction == "incoming"
-                        else ""
-                    ),
+                    "sender_name": message.sender_name if is_group else "",
                     "content": message.content,
-                    "direction": message.direction,
                     "content_type": message.message_type,
                 }
             )
         return history
-
-    @staticmethod
-    def _resolve_private_unread_tail(
-        messages: list[UiaChatMessage], unread_count: int
-    ) -> list[UiaChatMessage]:
-        """Use the session-row unread marker only for the newest private bubble."""
-        if unread_count <= 0 or not messages or messages[-1].direction != "unknown":
-            return messages
-        resolved = list(messages)
-        resolved[-1] = replace(
-            resolved[-1], direction="incoming", confidence="high"
-        )
-        return resolved
 
     @staticmethod
     def _mentions_owner(content: str, owner: str) -> bool:
@@ -243,17 +208,6 @@ class WechatUiaDriver:
         target = unicodedata.normalize("NFKC", str(owner)).strip()
         compact = value.replace("\u2005", " ").replace("\u00a0", " ")
         return f"@{target}" in compact
-
-    def _remember(self, event_id: str) -> bool:
-        if event_id in self._seen_ids:
-            return False
-        self._seen_ids.add(event_id)
-        self._seen_order.append(event_id)
-        if len(self._seen_order) > 10000:
-            expired = self._seen_order[:1000]
-            self._seen_order = self._seen_order[1000:]
-            self._seen_ids.difference_update(expired)
-        return True
 
     def _event(
         self,
@@ -266,12 +220,7 @@ class WechatUiaDriver:
         ordinal: int,
         target_key: str,
     ) -> Optional[WechatDesktopEvent]:
-        owner = self.client.get_owner_info().nick_name
-        event_id = hashlib.sha256(
-            f"wechat-uia4x\0{owner}\0{conversation_id}\0{target_key}".encode("utf-8")
-        ).hexdigest()
-        if not self._remember(event_id):
-            return None
+        event_id = uuid.uuid4().hex
         sender = message.sender_name or ("群成员" if is_group else conversation)
         event = WechatDesktopEvent(
             kind="message",
@@ -281,12 +230,10 @@ class WechatUiaDriver:
             sender_name=sender,
             content_type=message.message_type,
             content=message.content,
-            direction=message.direction,
             is_group=is_group,
             is_at=is_at,
             source_type="group" if is_group else "private",
             bounds=message.bounds,
-            confidence=message.confidence,
             history=history,
             target_key=target_key,
             observed_at=time.time() + ordinal / 1_000_000.0,
@@ -299,12 +246,23 @@ class WechatUiaDriver:
         with self._operation_lock:
             try:
                 rows = self.client.get_visible_conversations()
+                self._trace(
+                    "01-sessions",
+                    "visible=%s unread=%s mentioned=%s",
+                    len(rows),
+                    sum(row.not_read_number > 0 for row in rows),
+                    sum(bool(row.mentions_self) for row in rows),
+                )
                 current_rows = {self._row_key(row): row for row in rows}
                 self._conversation_selectors = dict(current_rows)
                 first_scan = not self._rows
                 previous_rows = self._rows
                 self._rows = current_rows
                 if first_scan and not bool(self.config.get("bootstrap_existing_messages", False)):
+                    self._trace(
+                        "02-baseline",
+                        "existing sessions recorded without reply candidates",
+                    )
                     return self._observation(
                         visible_conversations=len(rows), unread_conversations=sum(row.not_read_number > 0 for row in rows)
                     ), []
@@ -313,8 +271,23 @@ class WechatUiaDriver:
                 for row_key, row in current_rows.items():
                     previous = previous_rows.get(row_key)
                     changed = previous is None or previous.row_signature != row.row_signature
-                    if row.not_read_number > 0 or changed:
+                    # A private conversation is only a discovery candidate
+                    # while its session row says it has unread messages. The
+                    # message itself is read only after entering the chat.
+                    if row.not_read_number > 0 or (
+                        row.mentions_self and changed
+                    ):
                         candidates.append((row_key, row))
+                        self._trace(
+                            "02-candidate",
+                            "conversation=%s unread=%s mentioned=%s changed=%s runtime=%s row=%s",
+                            row.conversation_title,
+                            row.not_read_number,
+                            bool(row.mentions_self),
+                            changed,
+                            row.runtime_id or "<empty>",
+                            row.row_index,
+                        )
                 if candidates:
                     self.client.focus_window()
 
@@ -324,17 +297,44 @@ class WechatUiaDriver:
                     name = row.conversation_title
                     is_group = row_key in self._known_group_keys or name in self._known_groups
                     if is_group and not row.mentions_self:
+                        self._trace(
+                            "02-skip",
+                            "conversation=%s reason=known_group_without_session_mention",
+                            name,
+                        )
                         continue
                     if not is_group:
-                        if not self.client.locate_conversation(
+                        located = self.client.locate_conversation(
                             name, row.runtime_id, row.row_index
-                        ):
+                        )
+                        self._trace(
+                            "03-enter",
+                            "conversation=%s located=%s runtime=%s row=%s",
+                            name,
+                            located,
+                            row.runtime_id or "<empty>",
+                            row.row_index,
+                        )
+                        if not located:
                             continue
                         header = self.client.get_title()
                         is_group = header.header_type == "group"
+                        self._trace(
+                            "03-header",
+                            "conversation=%s title=%s type=%s members=%s",
+                            name,
+                            header.title,
+                            header.header_type,
+                            header.chat_number,
+                        )
                         if is_group:
                             self._known_group_keys.add(row_key)
                             if not row.mentions_self:
+                                self._trace(
+                                    "02-skip",
+                                    "conversation=%s reason=group_without_session_mention",
+                                    name,
+                                )
                                 continue
 
                     messages = self.client.get_chat_history(
@@ -343,34 +343,51 @@ class WechatUiaDriver:
                         runtime_id=row.runtime_id,
                         row_index=row.row_index,
                     )
-                    owner = self.client.get_owner_info().nick_name
-                    if not is_group:
-                        messages = self._resolve_private_unread_tail(
-                            messages, row.not_read_number
-                        )
-                    if (
-                        is_group
-                        and bool(
-                            self.config.get(
-                                "uia_history_sender_resolution_enabled", True
-                            )
-                        )
-                        and any(item.direction == "unknown" for item in messages)
-                    ):
-                        if self._outgoing_history_provider is not None:
-                            self.client.seed_outgoing_texts(
-                                name, self._outgoing_history_provider(name)
-                            )
-                        messages = self.client.resolve_group_message_directions(
-                            name, messages, owner
-                        )
-                    self._message_tails[row_key] = list(messages)
+                    self._trace(
+                        "04-history",
+                        "conversation=%s group=%s visible_messages=%s",
+                        name,
+                        is_group,
+                        len(messages),
+                    )
+                    owner_info = self.client.get_owner_info()
+                    owner = owner_info.nick_name
+                    self._trace(
+                        "05-owner",
+                        "conversation=%s available=%s source=%s name=%s",
+                        name,
+                        bool(owner),
+                        owner_info.source,
+                        owner or "<empty>",
+                    )
                     target_index, message = self._select_reply_target(
                         messages, is_group, owner
                     )
                     if message is None:
+                        reason = (
+                            "owner_name_unavailable"
+                            if is_group and not owner
+                            else "no_visible_owner_mention"
+                            if is_group
+                            else "no_visible_message"
+                        )
+                        self._trace(
+                            "06-target",
+                            "conversation=%s selected=False reason=%s visible_messages=%s",
+                            name,
+                            reason,
+                            len(messages),
+                        )
                         self._emitted_targets.pop(row_key, None)
                         continue
+                    self._trace(
+                        "06-target",
+                        "conversation=%s selected=True index=%s type=%s chars=%s",
+                        name,
+                        target_index,
+                        message.message_type,
+                        len(str(message.content or "")),
+                    )
                     target_key = self._target_key(message, target_index)
                     if self._emitted_targets.get(row_key) == target_key:
                         continue
@@ -400,6 +417,7 @@ class WechatUiaDriver:
                     unread_conversations=sum(row.not_read_number > 0 for row in rows),
                 ), events
             except Exception as exc:
+                self._trace("06-error", "observation_failed error=%s", exc)
                 return self._observation(
                     error=f"WeChat UI Automation unavailable: {exc}",
                     uia_available=False,
@@ -424,31 +442,9 @@ class WechatUiaDriver:
                 row_index=row_index,
             )
             owner = self.client.get_owner_info().nick_name
-            if not event.is_group and messages:
-                # The unread badge is normally cleared by selecting the row.
-                # Reapply the already-established direction only when the same
-                # last bubble is still present; target-key validation below
-                # rejects any replacement.
-                messages = self._resolve_private_unread_tail(messages, 1)
-            if (
-                event.is_group
-                and bool(
-                    self.config.get(
-                        "uia_history_sender_resolution_enabled", True
-                    )
-                )
-                and any(item.direction == "unknown" for item in messages)
-            ):
-                if self._outgoing_history_provider is not None:
-                    self.client.seed_outgoing_texts(
-                        title, self._outgoing_history_provider(title)
-                    )
-                messages = self.client.resolve_group_message_directions(
-                    title, messages, owner
-                )
             index, target = self._select_reply_target(messages, event.is_group, owner)
             if target is None:
-                return False, "target message is already answered or no longer visible"
+                return False, "reply target is no longer visible"
             if self._target_key(target, index) != event.target_key:
                 return False, "a newer reply target replaced this message"
             return True, ""
@@ -460,21 +456,7 @@ class WechatUiaDriver:
         result = self.client.send_message(
             title, text, runtime_id=runtime_id, row_index=row_index
         )
-        try:
-            tail = self.client.get_chat_history(
-                title,
-                self._message_limit(),
-                runtime_id=runtime_id,
-                row_index=row_index,
-            )
-            for index in range(len(tail) - 1, -1, -1):
-                if tail[index].content == text:
-                    tail[index] = replace(tail[index], direction="outgoing")
-                    break
-            self._message_tails[conversation] = tail
-            self._emitted_targets.pop(conversation, None)
-        except Exception:
-            pass
+        self._emitted_targets.pop(conversation, None)
         return {
             **result,
             "accepted_by": "uia",
@@ -488,18 +470,6 @@ class WechatUiaDriver:
         result = self.client.send_file(
             title, [path], runtime_id=runtime_id, row_index=row_index
         )
-        try:
-            tail = self.client.get_chat_history(
-                title,
-                self._message_limit(),
-                runtime_id=runtime_id,
-                row_index=row_index,
-            )
-            if tail:
-                tail[-1] = replace(tail[-1], direction="outgoing")
-            self._message_tails[conversation] = tail
-        except Exception:
-            pass
         return {
             **result,
             "accepted_by": "uia",

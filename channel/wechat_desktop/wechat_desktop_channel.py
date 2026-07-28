@@ -27,7 +27,6 @@ from plugins import Event, EventContext, PluginManager
 
 
 DEFAULT_CONFIG = {
-    "uia_message_limit": 5,
     "uia_focus_settle_ms": 350,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
@@ -53,7 +52,6 @@ DEFAULT_CONFIG = {
     "auto_reply_private_all": False,
     "auto_reply_groups_all": False,
     "auto_reply_blacklist": [],
-    "conversation_history_limit": 5,
     "conversation_history_retention_days": 90,
     "learn_from_official_accounts": False,
     "official_account_knowledge_max_chars": 4000,
@@ -116,9 +114,6 @@ class WechatDesktopChannel(ChatChannel):
         self._queue_thread = None
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
-        self._driver.set_outgoing_history_provider(
-            self._store.list_outgoing_texts_by_name
-        )
         self._policy = WechatDesktopPolicy(self.config, self._store)
         normalized_history = self._store.normalize_outgoing_history(
             _normalize_auto_reply_text
@@ -259,14 +254,13 @@ class WechatDesktopChannel(ChatChannel):
             }
         for event in events:
             self._preserve_event_evidence(event)
-            is_new = self._store.record_event(event)
+            recorded = self._store.record_event(event)
             self._trace(
                 "07-event",
-                "id=%s new=%s kind=%s direction=%s conversation=%s sender=%s source=%s group=%s at=%s type=%s chars=%s",
+                "id=%s recorded=%s kind=%s conversation=%s sender=%s source=%s group=%s at=%s type=%s chars=%s",
                 event.event_id[:10],
-                is_new,
+                recorded,
                 event.kind,
-                event.direction,
                 event.conversation_name,
                 event.sender_name,
                 event.source_type,
@@ -275,48 +269,17 @@ class WechatDesktopChannel(ChatChannel):
                 event.content_type,
                 len(str(event.content or "")),
             )
-            if not is_new:
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=duplicate_event",
-                    event.event_id[:10],
-                )
-                continue
             if event.kind == "message" and not (
                 first_poll
                 and baseline_history_exists.get(event.conversation_id, False)
             ):
-                if (
-                    event.direction == "outgoing"
-                    and event.content_type == "text"
-                ):
-                    self._store.append_conversation_history(
-                        conversation_id=event.conversation_id,
-                        conversation_name=event.conversation_name,
-                        sender_name=event.sender_name,
-                        direction=event.direction,
-                        content_type=event.content_type,
-                        content=_normalize_auto_reply_text(event.content),
-                        source_type=event.source_type,
-                        created_at=event.observed_at,
-                        source_event_id=event.event_id,
-                    )
-                else:
-                    self._store.append_event_history(event)
+                self._store.append_event_history(event)
             if event.kind != "message":
                 self._trace(
                     "08-request",
                     "id=%s kind=%s ignored_no_approval_flow",
                     event.event_id[:10],
                     event.kind,
-                )
-                self._store.mark_event_processed(event.event_id)
-                continue
-            if event.direction != "incoming":
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=outgoing_message",
-                    event.event_id[:10],
                 )
                 self._store.mark_event_processed(event.event_id)
                 continue
@@ -609,16 +572,14 @@ class WechatDesktopChannel(ChatChannel):
             )
             history_lines = []
             for item in history_items:
-                if item.get("direction") == "outgoing":
-                    speaker = "我"
-                elif event.is_group:
+                if event.is_group:
                     speaker = str(
                         item.get("sender_name")
                         or item.get("sender")
                         or "群成员"
                     )
                 else:
-                    speaker = "对方"
+                    speaker = "历史消息"
                 history_lines.append(
                     f"{speaker}: {item.get('content') or '[非文字消息]'}"
                 )
@@ -656,7 +617,6 @@ class WechatDesktopChannel(ChatChannel):
             isgroup=event.is_group,
             msg=msg,
             no_need_at=True,
-            wechat_desktop_confidence=event.confidence,
             wechat_desktop_evidence=event.evidence_path,
             wechat_desktop_source_type=event.source_type,
             wechat_desktop_auto_reply=True,
@@ -780,7 +740,6 @@ class WechatDesktopChannel(ChatChannel):
             else target_name
         )
         is_group = bool(context.get("isgroup", False))
-        confidence = str(context.get("wechat_desktop_confidence", "medium"))
         source_type = str(
             context.get("wechat_desktop_source_type", "unknown")
         ).strip().lower()
@@ -815,17 +774,16 @@ class WechatDesktopChannel(ChatChannel):
                 return
             can_auto = (
                 not paused
-                and self._policy.can_auto_send(target_name, is_group, "text", confidence)
+                and self._policy.can_auto_send(target_name, is_group, "text")
             )
             self._trace(
                 "10-reply-ready",
-                "target=%s chars=%s paused=%s can_auto=%s group=%s confidence=%s",
+                "target=%s chars=%s paused=%s can_auto=%s group=%s",
                 target_name,
                 len(reply_text),
                 paused,
                 can_auto,
                 is_group,
-                confidence,
             )
             if can_auto:
                 try:
@@ -900,7 +858,7 @@ class WechatDesktopChannel(ChatChannel):
         if reply.type in (ReplyType.IMAGE, ReplyType.IMAGE_URL):
             can_auto = (
                 not paused
-                and self._policy.can_auto_send(target_name, is_group, "image", confidence)
+                and self._policy.can_auto_send(target_name, is_group, "image")
             )
             if can_auto:
                 try:
@@ -959,7 +917,6 @@ class WechatDesktopChannel(ChatChannel):
                 conversation,
                 is_group,
                 "text",
-                "high",
             )
         )
         if not can_auto:

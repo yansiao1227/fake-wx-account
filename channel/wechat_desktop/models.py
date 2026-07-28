@@ -14,7 +14,6 @@ class OwnerInfo:
     nick_name: str
     wx_id: str = ""
     source: str = "unknown"
-    confidence: str = "low"
 
 
 @dataclass(frozen=True)
@@ -47,7 +46,6 @@ class UiaChatMessage:
     direction: str = "unknown"
     runtime_id: str = ""
     bounds: Optional[Tuple[int, int, int, int]] = None
-    confidence: str = "medium"
 
 
 @dataclass
@@ -65,7 +63,6 @@ class WechatDesktopEvent:
     source_type: str = "unknown"
     evidence_path: str = ""
     bounds: Optional[Tuple[int, int, int, int]] = None
-    confidence: str = "medium"
     history: List[Dict[str, Any]] = field(default_factory=list)
     target_key: str = ""
     observed_at: float = field(default_factory=time.time)

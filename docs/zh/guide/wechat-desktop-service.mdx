@@ -98,6 +98,14 @@ conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --standard-targ
 conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --send-smoke
 ```
 
+如需诊断会话列表控件，可以将其 UIA 树输出为 JSON。默认输出会脱敏会话名称和
+消息预览；只有本地诊断确有需要时才使用 `--include-content`：
+
+```powershell
+conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py
+conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py --output .\tmp\wechat-conversations.json
+```
+
 诊断气泡 UIA 边界时可增加 `--geometry-summary`。该选项不输出消息正文；不要将
 `--include-content` 生成的报告直接对外发送。
 

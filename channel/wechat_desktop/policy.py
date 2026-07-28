@@ -43,7 +43,7 @@ class WechatDesktopPolicy:
             return prefix_hit
         return bool(event.is_at or prefix_hit)
 
-    def can_auto_send(self, target: str, is_group: bool, content_type: str, confidence: str) -> bool:
+    def can_auto_send(self, target: str, is_group: bool, content_type: str) -> bool:
         if bool(self.config.get("shadow_mode", True)):
             return False
         if self.is_blocked(target):
@@ -51,10 +51,7 @@ class WechatDesktopPolicy:
         if not self.is_allowlisted(target, is_group):
             return False
         if content_type != "text":
-            return bool(self.config.get("auto_send_images", False)) and confidence == "high"
-        confidence = str(confidence or "").strip().lower()
-        if confidence != "high":
-            return False
+            return bool(self.config.get("auto_send_images", False))
         return self.store.allow_rate(
             int(self.config.get("max_send_per_minute", 5)),
             int(self.config.get("max_send_per_hour", 60)),

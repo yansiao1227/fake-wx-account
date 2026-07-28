@@ -76,6 +76,33 @@ class ClickableGeometryControl(GeometryControl):
             self.on_click()
 
 
+def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):
+    client = WechatUiaClient({})
+    root = GeometryControl((0, 0, 1000, 800))
+    popup_results = iter([("", ""), ("颜料盒bot", "wxid_bot")])
+    popup_calls = []
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_walk", lambda _root: iter(()))
+
+    def read_popup(_root):
+        popup_calls.append(True)
+        return next(popup_results)
+
+    monkeypatch.setattr(client, "_read_owner_profile_popup", read_popup)
+
+    assert client.get_owner_info() == OwnerInfo("", source="unknown")
+    assert client.get_owner_info() == OwnerInfo(
+        "颜料盒bot", wx_id="wxid_bot", source="uia"
+    )
+    assert client.get_owner_info().nick_name == "颜料盒bot"
+    assert len(popup_calls) == 2
+
+
 def test_message_direction_uses_bubble_child_not_full_width_row():
     left_bubble = GeometryControl(
         (120, 120, 360, 180), "hello", "mmui::ChatTextBubble"
@@ -283,6 +310,7 @@ class FakeClient:
         self.headers = {}
         self.history_calls = []
         self.focus_calls = 0
+        self.owner_calls = 0
         self.seeded_outgoing = {}
         self.direction_resolution_calls = []
         self.resolved_histories = {}
@@ -291,7 +319,8 @@ class FakeClient:
         return {42}
 
     def get_owner_info(self):
-        return OwnerInfo("小牛", source="config", confidence="medium")
+        self.owner_calls += 1
+        return OwnerInfo("小牛", source="config")
 
     def get_owner_window_process_id(self):
         return 42
@@ -377,7 +406,6 @@ def incoming(content, runtime_id):
         content,
         direction="incoming",
         runtime_id=runtime_id,
-        confidence="high",
     )
 
 
@@ -387,7 +415,6 @@ def outgoing(content, runtime_id):
         content,
         direction="outgoing",
         runtime_id=runtime_id,
-        confidence="high",
     )
 
 
@@ -434,7 +461,7 @@ def test_group_selects_only_latest_mention_and_uses_other_bubbles_as_history():
         incoming("@小牛 第二条", "3"),
     ]
     driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True, "uia_message_limit": 5},
+        {"bootstrap_existing_messages": True},
         client=client,
         shell_hook=FakeHook(),
     )
@@ -443,6 +470,7 @@ def test_group_selects_only_latest_mention_and_uses_other_bubbles_as_history():
 
     assert [event.content for event in events] == ["@小牛 第二条"]
     assert events[0].is_at is True
+    assert client.owner_calls >= 1
     assert [item["content"] for item in events[0].history] == [
         "@小牛 第一条",
         "这是后续普通消息",
@@ -496,7 +524,7 @@ def test_group_marker_without_locatable_mention_fails_closed():
     assert events == []
 
 
-def test_group_outgoing_after_mention_means_it_is_already_answered():
+def test_group_selects_first_at_message_without_using_direction():
     client = FakeClient()
     client.rows = [row("项目群", unread=0, mention=True, preview_prefix=False)]
     client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
@@ -510,7 +538,8 @@ def test_group_outgoing_after_mention_means_it_is_already_answered():
 
     _, events = driver.observe_events()
 
-    assert events == []
+    assert [event.content for event in events] == ["@小牛 请确认"]
+    assert [item["content"] for item in events[0].history] == ["已确认"]
 
 
 def test_same_name_conversations_use_runtime_id_instead_of_title():
@@ -570,10 +599,8 @@ def test_private_message_after_outgoing_is_the_only_reply_target():
     _, events = driver.observe_events()
 
     assert [event.content for event in events] == ["new"]
-    assert [item["direction"] for item in events[0].history] == [
-        "incoming",
-        "outgoing",
-    ]
+    assert [item["content"] for item in events[0].history] == ["old", "answered"]
+    assert all("direction" not in item for item in events[0].history)
 
 
 def test_private_latest_outgoing_means_nothing_needs_reply():
@@ -621,8 +648,71 @@ def test_private_unread_marker_classifies_only_latest_unknown_bubble():
     _, events = driver.observe_events()
 
     assert [event.content for event in events] == ["newest"]
-    assert events[0].confidence == "high"
-    assert events[0].history == []
+    assert [item["content"] for item in events[0].history] == ["older"]
+    assert "direction" not in events[0].history[0]
+
+
+def test_private_context_keeps_every_visible_message_before_reply_target():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [
+        incoming(f"context-{index}", f"runtime-{index}")
+        for index in range(12)
+    ] + [incoming("reply-target", "runtime-target")]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+
+    _, events = driver.observe_events()
+
+    assert [event.content for event in events] == ["reply-target"]
+    assert [item["content"] for item in events[0].history] == [
+        f"context-{index}" for index in range(12)
+    ]
+
+
+def test_private_row_change_without_unread_does_not_open_or_enqueue_chat():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=0, signature="changed")]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [incoming("already-read", "runtime-1")]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+
+    _, events = driver.observe_events()
+
+    assert events == []
+    assert client.history_calls == []
+
+
+def test_reply_target_key_does_not_use_recyclable_runtime_id():
+    first = incoming("same message", "runtime-a")
+    second = incoming("same message", "runtime-b")
+
+    assert WechatUiaDriver._target_key(first, 3) == WechatUiaDriver._target_key(
+        second, 3
+    )
+
+
+def test_reused_runtime_id_produces_new_private_message_event():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1, signature="first")]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [incoming("first", "recycled-runtime")]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+
+    _, first_events = driver.observe_events()
+    client.rows = [row("Alice", unread=1, signature="second")]
+    client.histories["Alice"] = [incoming("second", "recycled-runtime")]
+    _, second_events = driver.observe_events()
+
+    assert [event.content for event in first_events] == ["first"]
+    assert [event.content for event in second_events] == ["second"]
+    assert first_events[0].event_id != second_events[0].event_id
 
 
 def test_reply_queue_is_global_fifo_and_rejects_duplicates():
@@ -700,31 +790,23 @@ def test_driver_revalidation_rejects_target_replaced_during_generation():
     assert "newer" in reason
 
 
-def test_group_revalidation_reuses_history_direction_resolution():
+def test_group_revalidation_uses_first_visible_at_message_without_direction():
     client = FakeClient()
     client.rows = [row("项目群", unread=1, mention=True, preview_prefix=True)]
     client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
     unknown_message = UiaChatMessage(
         "", "@小牛 请确认", direction="unknown", runtime_id="1"
     )
-    resolved_message = incoming("@小牛 请确认", "1")
     client.histories["项目群"] = [unknown_message]
-    client.resolved_histories["项目群"] = [resolved_message]
     driver = WechatUiaDriver(
         {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
     )
-    driver.set_outgoing_history_provider(lambda name: ["此前由我发送"])
 
     _, events = driver.observe_events()
     valid, reason = driver.validate_reply_target(events[0])
 
     assert valid is True
     assert reason == ""
-    assert client.seeded_outgoing["项目群"] == ["此前由我发送"]
-    assert client.direction_resolution_calls == [
-        ("项目群", "小牛"),
-        ("项目群", "小牛"),
-    ]
 
 
 def test_expired_queue_token_rejects_late_result():

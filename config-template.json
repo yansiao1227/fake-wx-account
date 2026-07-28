@@ -39,7 +39,6 @@
   "self_evolution_enabled": true,
   "mcp_tool_retrieval_enabled": false,
   "wechat_desktop": {
-    "uia_message_limit": 5,
     "uia_focus_settle_ms": 350,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
@@ -65,7 +64,6 @@
     "auto_reply_private_all": false,
     "auto_reply_groups_all": false,
     "auto_reply_blacklist": [],
-    "conversation_history_limit": 5,
     "conversation_history_retention_days": 90,
     "learn_from_official_accounts": false,
     "official_account_knowledge_max_chars": 4000,

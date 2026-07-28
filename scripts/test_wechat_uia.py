@@ -352,7 +352,6 @@ def main() -> int:
         report["owner"] = {
             "available": bool(owner.nick_name),
             "source": owner.source,
-            "confidence": owner.confidence,
         }
         conversations = client.get_visible_conversations()
         conversations_by_title = {}

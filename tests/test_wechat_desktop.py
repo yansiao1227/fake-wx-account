@@ -63,7 +63,7 @@ def test_image_event_fingerprint_uses_bytes_not_capture_path(tmp_path):
     assert first.fingerprint() == second.fingerprint()
 
 
-def test_policy_requires_allowlist_high_confidence_and_non_shadow(tmp_path):
+def test_policy_requires_allowlist_and_non_shadow(tmp_path):
     store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
     config = {
         "shadow_mode": False,
@@ -73,12 +73,11 @@ def test_policy_requires_allowlist_high_confidence_and_non_shadow(tmp_path):
         "max_send_per_hour": 10,
     }
     policy = WechatDesktopPolicy(config, store)
-    assert policy.can_auto_send("Alice", False, "text", "high") is True
-    assert policy.can_auto_send("Mallory", False, "text", "high") is False
-    assert policy.can_auto_send("Alice", False, "image", "high") is False
-    assert policy.can_auto_send("Alice", False, "text", "medium") is False
-    assert policy.can_auto_send("Alice", False, "text", "high") is True
-    assert policy.can_auto_send("Alice", False, "text", "high") is False
+    assert policy.can_auto_send("Alice", False, "text") is True
+    assert policy.can_auto_send("Mallory", False, "text") is False
+    assert policy.can_auto_send("Alice", False, "image") is False
+    assert policy.can_auto_send("Alice", False, "text") is True
+    assert policy.can_auto_send("Alice", False, "text") is False
 
 
 def test_policy_can_allow_all_private_and_group_conversations(tmp_path):
@@ -97,8 +96,8 @@ def test_policy_can_allow_all_private_and_group_conversations(tmp_path):
     )
     assert policy.is_allowlisted("Any contact", False) is True
     assert policy.is_allowlisted("Any group", True) is True
-    assert policy.can_auto_send("Any contact", False, "text", "high") is True
-    assert policy.can_auto_send("Any group", True, "text", "high") is True
+    assert policy.can_auto_send("Any contact", False, "text") is True
+    assert policy.can_auto_send("Any group", True, "text") is True
 
 
 def test_policy_blacklist_overrides_allow_all(tmp_path):
@@ -114,8 +113,8 @@ def test_policy_blacklist_overrides_allow_all(tmp_path):
         store,
     )
     assert policy.is_blocked("腾讯新闻") is True
-    assert policy.can_auto_send("腾讯新闻", False, "text", "medium") is False
-    assert policy.can_auto_send("Alice", False, "text", "high") is True
+    assert policy.can_auto_send("腾讯新闻", False, "text") is False
+    assert policy.can_auto_send("Alice", False, "text") is True
 
 
 def test_conversation_history_persists_and_deduplicates_recent_outgoing(tmp_path):

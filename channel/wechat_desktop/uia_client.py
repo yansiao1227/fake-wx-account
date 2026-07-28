@@ -15,6 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
+from common.log import logger
 from channel.wechat_desktop.models import (
     ConversationInfo,
     HeaderInfo,
@@ -351,12 +352,24 @@ class WechatUiaClient:
 
     def get_owner_info(self) -> OwnerInfo:
         configured = _text(self.config.get("self_display_name"))
-        if self._owner_cache and (
+        if self._owner_cache and self._owner_cache.nick_name and (
             not configured or self._owner_cache.nick_name == configured
         ):
+            if bool(self.config.get("diagnostic_logging", False)):
+                logger.info(
+                    "[WechatDesktop][trace:05-owner] source=cache name=%s",
+                    self._owner_cache.nick_name,
+                )
             return self._owner_cache
         discovered = ""
         wx_id = ""
+        discovery_method = "none"
+        if bool(self.config.get("diagnostic_logging", False)):
+            logger.info(
+                "[WechatDesktop][trace:05-owner] lookup_start configured=%s cached=%s",
+                bool(configured),
+                bool(self._owner_cache and self._owner_cache.nick_name),
+            )
         with self.operation_lock, self._uia_root() as root:
             root_bounds = _bounds(root)
             left_limit = root_bounds[0] + max(100, (root_bounds[2] - root_bounds[0]) // 5) if root_bounds else 0
@@ -372,20 +385,38 @@ class WechatUiaClient:
                 in_sidebar = bool(bounds and left_limit and bounds[0] <= left_limit)
                 if profile_hint and in_sidebar and name and name not in {"头像", "微信"}:
                     discovered = name
+                    discovery_method = "sidebar"
                     break
             if not discovered:
+                if bool(self.config.get("diagnostic_logging", False)):
+                    logger.info(
+                        "[WechatDesktop][trace:05-owner] sidebar_missing; opening_profile_popup"
+                    )
                 discovered, wx_id = self._read_owner_profile_popup(root)
+                if discovered:
+                    discovery_method = "profile_popup"
         if discovered and configured and discovered != configured:
             raise RuntimeError(
                 "self_display_name does not match the account exposed by WeChat UIA"
             )
         if discovered:
-            owner = OwnerInfo(discovered, wx_id=wx_id, source="uia", confidence="high")
+            owner = OwnerInfo(discovered, wx_id=wx_id, source="uia")
         elif configured:
-            owner = OwnerInfo(configured, source="config", confidence="medium")
+            owner = OwnerInfo(configured, source="config")
         else:
-            owner = OwnerInfo("", source="unknown", confidence="low")
-        self._owner_cache = owner
+            owner = OwnerInfo("", source="unknown")
+        # A transiently unavailable UI tree must not permanently disable group
+        # mention matching. Cache only a usable account identity so later group
+        # observations retry the profile-popup discovery path.
+        self._owner_cache = owner if owner.nick_name else None
+        if bool(self.config.get("diagnostic_logging", False)):
+            logger.info(
+                "[WechatDesktop][trace:05-owner] lookup_result available=%s source=%s method=%s name=%s",
+                bool(owner.nick_name),
+                owner.source,
+                discovery_method if owner.source == "uia" else owner.source,
+                owner.nick_name or "<empty>",
+            )
         return owner
 
     def _read_owner_profile_popup(self, root) -> tuple[str, str]:
@@ -681,7 +712,6 @@ class WechatUiaClient:
                 replace(
                     message,
                     direction=direction,
-                    confidence="high",
                 )
             )
         return resolved
@@ -968,11 +998,12 @@ class WechatUiaClient:
     def get_chat_history(
         self,
         conversation: Optional[str] = None,
-        limit: int = 5,
+        limit: int = 0,
         runtime_id: str = "",
         row_index: int = -1,
     ) -> list[UiaChatMessage]:
-        bounded_limit = max(1, min(int(limit), 5))
+        requested_limit = int(limit)
+        bounded_limit = 0 if requested_limit <= 0 else min(requested_limit, 20)
         if conversation and not self.locate_conversation(
             conversation, runtime_id=runtime_id, row_index=row_index
         ):
@@ -1011,10 +1042,9 @@ class WechatUiaClient:
                         direction=direction,
                         runtime_id=_runtime_id(item),
                         bounds=item_bounds,
-                        confidence="high" if direction != "unknown" else "medium",
                     )
                 )
-        return messages[-bounded_limit:]
+        return messages if bounded_limit == 0 else messages[-bounded_limit:]
 
     @contextmanager
     def _clipboard(self, unicode_text: Optional[str] = None, files: Optional[Iterable[str]] = None):
@@ -1239,11 +1269,9 @@ class WechatUiaClient:
                     return {
                         "success": True,
                         "verified": True,
-                        "confidence": "high" if item.direction == "outgoing" else "medium",
                     }
         return {
             "success": True,
             "verified": False,
-            "confidence": "medium",
             "message": "UI action completed but the outgoing bubble was not verified",
         }
