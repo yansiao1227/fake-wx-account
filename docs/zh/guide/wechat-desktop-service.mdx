@@ -1,0 +1,125 @@
+---
+title: "微信桌面版项目启动与关闭"
+description: "在 Windows 和 cowagent-wechat Conda 环境中管理 CowAgent"
+---
+
+# 微信桌面版项目启动与关闭
+
+当前项目的推荐入口是项目根目录下的 `cow.ps1`。脚本固定使用 Conda 环境
+`cowagent-wechat`，并在当前终端以前台方式运行 CowAgent。运行日志直接打印到
+终端，默认不会自动打开浏览器。
+
+## 启动前准备
+
+1. 使用 Windows PowerShell 进入项目目录：
+
+   ```powershell
+   Set-Location D:\workshop\repositories\fake-wx-account
+   ```
+
+2. 确认 Conda 可以在当前终端中使用，并且环境存在：
+
+   ```powershell
+   conda env list
+   ```
+
+3. 使用微信桌面自动化时，只登录并保留一个微信 4.x 主窗口。微信处于风控、
+   白屏或要求重新验证时，不要启动自动化。
+
+## 常用命令
+
+### 启动
+
+```powershell
+.\cow.ps1 start
+```
+
+启动后必须保持当前 PowerShell 窗口打开，运行日志会持续显示在终端中。按
+`Ctrl+C` 即可结束项目。Web 控制台仍监听 `http://127.0.0.1:9899`，但不会自动
+打开；确有需要时可以手动访问。重复执行启动命令不会创建第二个实例。
+
+### 查看状态
+
+```powershell
+.\cow.ps1 status
+```
+
+状态命令会显示服务是否运行、PID、监听端口和当前紧急停止热键。
+
+### 重启
+
+```powershell
+.\cow.ps1 restart
+```
+
+重启会先停止当前 CowAgent 进程，再使用同一个 Conda 环境重新启动。
+
+### 正常停止
+
+```powershell
+.\cow.ps1 stop
+```
+
+停止后，微信桌面通道不再接收新事件，内存中的待回复队列不会在下次启动时恢复。
+
+### 紧急热键停止
+
+自动化期间鼠标或窗口不便操作时，按 `Ctrl+Alt+Shift+Q`。热键可以在
+`config.json` 中修改或关闭：
+
+```json
+{
+  "emergency_stop_hotkey_enabled": true,
+  "emergency_stop_hotkey": "ctrl+alt+shift+q"
+}
+```
+
+## 查看日志
+
+`.\cow.ps1 start` 会直接在当前终端打印标准输出和错误日志，不再创建后台日志
+文件。日志可能包含会话名称或消息诊断信息，对外转发前应先检查并脱敏。
+
+正常结束当前前台进程请按 `Ctrl+C`。如果需要从另一个终端结束它，可以执行
+`.\cow.ps1 stop`，也可以使用紧急停止热键。
+
+## 微信 UIA 冒烟测试
+
+默认脱敏检查 UIA 树、账号、Shell Hook 以及“颜料盒”和“测试群”两个会话：
+
+```powershell
+conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --standard-targets
+```
+
+测试群可以在消息任意位置包含 `[有人@我]` 来模拟会话级 @ 标记；脚本使用包含
+判断，不要求该关键字位于消息开头。只有显式传入 `--send-smoke` 才会向两个测试
+会话各发送一条带时间戳的消息：
+
+```powershell
+conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --send-smoke
+```
+
+诊断气泡 UIA 边界时可增加 `--geometry-summary`。该选项不输出消息正文；不要将
+`--include-content` 生成的报告直接对外发送。
+
+## 常见问题
+
+- 找不到 Conda：打开 Anaconda Prompt，或运行 `conda init powershell` 后重启
+  PowerShell。
+- 找不到 `cowagent-wechat`：通过 `conda env list` 确认环境名称。
+- 端口 `9899` 被其他程序占用：`cow.ps1` 会拒绝停止不属于本项目的进程；应先确认
+  占用者，不要直接强制结束未知进程。
+- 微信处于风控状态：立即执行 `.\cow.ps1 stop`，完成微信验证并确认客户端恢复正常
+  后再启动。
+- 项目启动后不要运行真实发送型 UIA 测试；只读冒烟测试也应在微信状态稳定时手动
+  执行。
+
+## 命令速查
+
+| 操作 | 命令 |
+| --- | --- |
+| 启动并查看日志 | `.\cow.ps1 start` |
+| 停止 | `.\cow.ps1 stop` |
+| 重启 | `.\cow.ps1 restart` |
+| 状态 | `.\cow.ps1 status` |
+| 紧急停止 | `Ctrl+Alt+Shift+Q` |
+| Web 控制台（手动打开） | `http://127.0.0.1:9899` |

@@ -95,6 +95,12 @@ cow skill install <name>           # install a skill
 cow install-browser                # install browser automation
 ```
 
+For this Windows WeChat-only workspace, run `./cow.ps1 start` in PowerShell.
+It stays in the foreground, prints logs in that terminal, and does not open a
+browser automatically. Use `Ctrl+C` to stop, or `./cow.ps1 stop` from another
+terminal. The other management commands are `restart` and `status`.
+See the [Chinese startup and shutdown guide](docs/zh/guide/wechat-desktop-service.mdx).
+
 > 💻 Desktop client: download the **[CowAgent Desktop client](https://cowagent.ai/download/)** (macOS / Windows) — the backend is bundled, ready to use out of the box.
 
 <br/>

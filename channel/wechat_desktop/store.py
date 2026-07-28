@@ -242,6 +242,23 @@ class WechatDesktopStore:
                 ).fetchall()
         return [dict(row) for row in reversed(rows)]
 
+    def list_outgoing_texts_by_name(
+        self, conversation_name: str, limit: int = 20
+    ) -> List[str]:
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT content FROM conversation_history
+                 WHERE conversation_name=?
+                   AND direction='outgoing'
+                   AND content_type='text'
+                 ORDER BY created_at DESC
+                 LIMIT ?
+                """,
+                (str(conversation_name), max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [str(row["content"]) for row in rows if row["content"]]
+
     def normalize_outgoing_history(self, normalizer) -> int:
         """Rewrite previously stored outgoing drafting wrappers in place."""
         changed = 0

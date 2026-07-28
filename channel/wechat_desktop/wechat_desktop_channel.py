@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
     "uia_send_interval_ms_min": 2000,
     "uia_send_interval_ms_max": 5000,
     "uia_conversation_cooldown_seconds": 5,
+    "uia_history_sender_resolution_enabled": True,
+    "uia_history_settle_ms_min": 800,
+    "uia_history_settle_ms_max": 1300,
     "shell_hook_reconcile_seconds": 15,
     "shell_hook_debounce_ms": 250,
     "auto_reply_private_all": False,
@@ -113,6 +116,9 @@ class WechatDesktopChannel(ChatChannel):
         self._queue_thread = None
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
+        self._driver.set_outgoing_history_provider(
+            self._store.list_outgoing_texts_by_name
+        )
         self._policy = WechatDesktopPolicy(self.config, self._store)
         normalized_history = self._store.normalize_outgoing_history(
             _normalize_auto_reply_text

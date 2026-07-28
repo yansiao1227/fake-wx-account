@@ -40,8 +40,12 @@ class WechatUiaDriver:
         self._seen_order: list[str] = []
         self._known_groups = {str(x) for x in config.get("auto_reply_groups", [])}
         self._known_group_keys: set[str] = set()
+        self._outgoing_history_provider = None
         self._reply_in_flight = threading.Event()
         self._reply_conversation = ""
+
+    def set_outgoing_history_provider(self, provider) -> None:
+        self._outgoing_history_provider = provider
 
     @property
     def reply_in_flight(self) -> bool:
@@ -219,6 +223,19 @@ class WechatUiaDriver:
         return history
 
     @staticmethod
+    def _resolve_private_unread_tail(
+        messages: list[UiaChatMessage], unread_count: int
+    ) -> list[UiaChatMessage]:
+        """Use the session-row unread marker only for the newest private bubble."""
+        if unread_count <= 0 or not messages or messages[-1].direction != "unknown":
+            return messages
+        resolved = list(messages)
+        resolved[-1] = replace(
+            resolved[-1], direction="incoming", confidence="high"
+        )
+        return resolved
+
+    @staticmethod
     def _mentions_owner(content: str, owner: str) -> bool:
         if not owner:
             return False
@@ -326,8 +343,28 @@ class WechatUiaDriver:
                         runtime_id=row.runtime_id,
                         row_index=row.row_index,
                     )
-                    self._message_tails[row_key] = list(messages)
                     owner = self.client.get_owner_info().nick_name
+                    if not is_group:
+                        messages = self._resolve_private_unread_tail(
+                            messages, row.not_read_number
+                        )
+                    if (
+                        is_group
+                        and bool(
+                            self.config.get(
+                                "uia_history_sender_resolution_enabled", True
+                            )
+                        )
+                        and any(item.direction == "unknown" for item in messages)
+                    ):
+                        if self._outgoing_history_provider is not None:
+                            self.client.seed_outgoing_texts(
+                                name, self._outgoing_history_provider(name)
+                            )
+                        messages = self.client.resolve_group_message_directions(
+                            name, messages, owner
+                        )
+                    self._message_tails[row_key] = list(messages)
                     target_index, message = self._select_reply_target(
                         messages, is_group, owner
                     )
@@ -387,6 +424,28 @@ class WechatUiaDriver:
                 row_index=row_index,
             )
             owner = self.client.get_owner_info().nick_name
+            if not event.is_group and messages:
+                # The unread badge is normally cleared by selecting the row.
+                # Reapply the already-established direction only when the same
+                # last bubble is still present; target-key validation below
+                # rejects any replacement.
+                messages = self._resolve_private_unread_tail(messages, 1)
+            if (
+                event.is_group
+                and bool(
+                    self.config.get(
+                        "uia_history_sender_resolution_enabled", True
+                    )
+                )
+                and any(item.direction == "unknown" for item in messages)
+            ):
+                if self._outgoing_history_provider is not None:
+                    self.client.seed_outgoing_texts(
+                        title, self._outgoing_history_provider(title)
+                    )
+                messages = self.client.resolve_group_message_directions(
+                    title, messages, owner
+                )
             index, target = self._select_reply_target(messages, event.is_group, owner)
             if target is None:
                 return False, "target message is already answered or no longer visible"

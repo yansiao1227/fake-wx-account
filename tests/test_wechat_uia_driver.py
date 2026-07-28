@@ -1,5 +1,6 @@
 import threading
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from channel.wechat_desktop.fifo_queue import WechatReplyQueue
@@ -42,18 +43,37 @@ def test_send_button_uses_real_click_and_restores_cursor(monkeypatch):
 
 
 class GeometryControl:
-    def __init__(self, bounds, name="", class_name="", children=None):
+    def __init__(
+        self,
+        bounds,
+        name="",
+        class_name="",
+        children=None,
+        automation_id="",
+    ):
         self.BoundingRectangle = SimpleNamespace(
             left=bounds[0], top=bounds[1], right=bounds[2], bottom=bounds[3]
         )
         self.Name = name
         self.ClassName = class_name
-        self.AutomationId = ""
+        self.AutomationId = automation_id
         self.ControlTypeName = "CustomControl"
         self._children = list(children or [])
 
     def GetChildren(self):
         return list(self._children)
+
+
+class ClickableGeometryControl(GeometryControl):
+    def __init__(self, *args, on_click=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.click_count = 0
+        self.on_click = on_click
+
+    def Click(self):
+        self.click_count += 1
+        if self.on_click:
+            self.on_click()
 
 
 def test_message_direction_uses_bubble_child_not_full_width_row():
@@ -81,6 +101,180 @@ def test_message_direction_fails_closed_for_centered_control():
     assert WechatUiaClient._message_direction(centered, (100, 50, 900, 700))[0] == "unknown"
 
 
+def test_message_sender_uses_geometry_direction_for_self_and_private_peer():
+    owner = "当前账号"
+    header = HeaderInfo("颜料盒", "private", 1)
+    incoming_bubble = GeometryControl(
+        (120, 120, 360, 180), "对方消息", "mmui::ChatTextBubble"
+    )
+    incoming_row = GeometryControl(
+        (100, 100, 900, 200),
+        "对方消息",
+        "mmui::ChatTextItemView",
+        [incoming_bubble],
+    )
+    outgoing_bubble = GeometryControl(
+        (640, 220, 880, 280), "自己的消息", "mmui::ChatTextBubble"
+    )
+    outgoing_row = GeometryControl(
+        (100, 200, 900, 300),
+        "自己的消息",
+        "mmui::ChatTextItemView",
+        [outgoing_bubble],
+    )
+    list_bounds = (100, 50, 900, 700)
+
+    incoming_direction = WechatUiaClient._message_direction(
+        incoming_row, list_bounds
+    )[0]
+    outgoing_direction = WechatUiaClient._message_direction(
+        outgoing_row, list_bounds
+    )[0]
+
+    assert incoming_direction == "incoming"
+    assert WechatUiaClient._message_sender(
+        incoming_direction, header, owner, incoming_row, "对方消息"
+    ) == "颜料盒"
+    assert outgoing_direction == "outgoing"
+    assert WechatUiaClient._message_sender(
+        outgoing_direction, header, owner, outgoing_row, "自己的消息"
+    ) == owner
+
+
+def test_message_sender_reads_group_member_only_for_incoming_message():
+    member = GeometryControl((130, 100, 220, 120), "群成员甲", "Text")
+    bubble = GeometryControl((120, 130, 420, 190), "群消息", "ChatTextBubble")
+    row = GeometryControl(
+        (100, 90, 900, 210), "群消息", "mmui::ChatTextItemView", [member, bubble]
+    )
+
+    assert WechatUiaClient._message_sender(
+        "incoming", HeaderInfo("测试群", "group", 3), "当前账号", row, "群消息"
+    ) == "群成员甲"
+    assert WechatUiaClient._message_sender(
+        "outgoing", HeaderInfo("测试群", "group", 3), "当前账号", row, "群消息"
+    ) == "当前账号"
+
+
+def test_history_member_filter_selects_unique_self_candidate():
+    assert WechatUiaClient._choose_self_member([["我发送的消息"]], []) == 0
+
+
+def test_history_message_content_removes_full_or_time_only_suffix():
+    assert WechatUiaClient._history_message_content(
+        "正文 2026年7月28日 12:36"
+    ) == "正文"
+    assert WechatUiaClient._history_message_content(
+        "[smoke] 2026-07-28 12:36:31 +0800 12:36"
+    ) == "[smoke] 2026-07-28 12:36:31 +0800"
+
+
+def test_history_member_filter_uses_known_outgoing_anchor_for_same_name():
+    histories = [["另一个同名成员的消息"], ["CowAgent 已发送的回复"]]
+    assert WechatUiaClient._choose_self_member(
+        histories, ["CowAgent 已发送的回复"]
+    ) == 1
+    assert WechatUiaClient._choose_self_member(histories, []) is None
+
+
+def test_history_direction_resolution_fails_closed_for_duplicate_content():
+    messages = [
+        UiaChatMessage("", "仅对方发送", direction="unknown", runtime_id="1"),
+        UiaChatMessage("", "仅自己发送", direction="unknown", runtime_id="2"),
+        UiaChatMessage("", "双方相同正文", direction="unknown", runtime_id="3"),
+        UiaChatMessage("", "双方相同正文", direction="unknown", runtime_id="4"),
+    ]
+    resolved = WechatUiaClient._apply_self_history_directions(
+        messages, ["仅自己发送", "双方相同正文"]
+    )
+
+    assert [item.direction for item in resolved] == [
+        "incoming",
+        "outgoing",
+        "unknown",
+        "unknown",
+    ]
+
+
+def test_history_direction_resolution_fails_closed_for_empty_filter_result():
+    messages = [
+        UiaChatMessage("", "无法确认方向", direction="unknown", runtime_id="1")
+    ]
+
+    assert WechatUiaClient._apply_self_history_directions(messages, []) == messages
+
+
+def _selection_tree(active_title, messages, row):
+    header = GeometryControl(
+        (400, 100, 700, 130),
+        active_title,
+        "Text",
+        automation_id="current_chat_name_label",
+    )
+    message_list = GeometryControl(
+        (400, 140, 900, 700),
+        class_name="List",
+        children=messages,
+        automation_id="chat_message_list",
+    )
+    root = GeometryControl((0, 0, 1000, 800), children=[header, message_list, row])
+    return root, header, message_list
+
+
+def test_locate_conversation_does_not_click_populated_active_chat(monkeypatch):
+    row = ClickableGeometryControl(
+        (0, 100, 300, 160),
+        "颜料盒",
+        "mmui::ChatSessionCell",
+        automation_id="session_item_颜料盒",
+    )
+    message = GeometryControl(
+        (400, 200, 900, 260), "已有消息", "mmui::ChatTextItemView"
+    )
+    root, _, _ = _selection_tree("颜料盒", [message], row)
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+
+    assert client.locate_conversation("颜料盒") is True
+    assert row.click_count == 0
+
+
+def test_locate_conversation_clicks_when_active_chat_is_blank(monkeypatch):
+    message = GeometryControl(
+        (400, 200, 900, 260), "恢复后的消息", "mmui::ChatTextItemView"
+    )
+    row = None
+
+    def activate():
+        header.Name = "颜料盒"
+        message_list._children[:] = [message]
+
+    row = ClickableGeometryControl(
+        (0, 100, 300, 160),
+        "颜料盒",
+        "mmui::ChatSessionCell",
+        automation_id="session_item_颜料盒",
+        on_click=activate,
+    )
+    root, header, message_list = _selection_tree("颜料盒", [], row)
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_paced_wait", lambda *args, **kwargs: None)
+
+    assert client.locate_conversation("颜料盒") is True
+    assert row.click_count == 1
+
+
 class FakeClient:
     def __init__(self):
         self.operation_lock = threading.RLock()
@@ -89,6 +283,9 @@ class FakeClient:
         self.headers = {}
         self.history_calls = []
         self.focus_calls = 0
+        self.seeded_outgoing = {}
+        self.direction_resolution_calls = []
+        self.resolved_histories = {}
 
     def allowed_process_ids(self):
         return {42}
@@ -126,6 +323,13 @@ class FakeClient:
             self.selected_key = runtime_id or name
         self.history_calls.append(name)
         return list(self.histories.get(runtime_id or name, []))[-limit:]
+
+    def seed_outgoing_texts(self, conversation, texts):
+        self.seeded_outgoing[conversation] = list(texts)
+
+    def resolve_group_message_directions(self, conversation, messages, owner):
+        self.direction_resolution_calls.append((conversation, owner))
+        return list(self.resolved_histories.get(conversation, messages))
 
     def send_message(self, who, text, runtime_id="", row_index=-1):
         return {"success": True, "verified": True}
@@ -200,6 +404,16 @@ def test_session_parser_redacts_preview_and_reads_markers():
     assert "secret" not in parsed.row_signature
     assert parsed.preview_sender == "项目成员"
     assert parsed.preview_has_sender_prefix is True
+
+
+def test_session_parser_mention_marker_can_appear_inside_preview():
+    parsed = parse_session_accessible_name(
+        "测试群",
+        "测试群\n成员: 这是一条模拟消息 [有人@我] 后面仍有内容\n12:45",
+        "session_item_测试群",
+    )
+
+    assert parsed.mentions_self is True
 
 
 def test_session_preview_without_sender_prefix_is_not_marked_as_incoming_sender():
@@ -299,20 +513,6 @@ def test_group_outgoing_after_mention_means_it_is_already_answered():
     assert events == []
 
 
-def test_group_outgoing_bubble_is_not_enqueued_even_without_sender_prefix():
-    client = FakeClient()
-    client.rows = [row("项目群", unread=0, mention=True, preview_prefix=False)]
-    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
-    client.histories["项目群"] = [outgoing("@小牛 自己发送的测试", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True, "auto_reply_groups": ["项目群"]},
-        client=client,
-        shell_hook=FakeHook(),
-    )
-    _, events = driver.observe_events()
-    assert events == []
-
-
 def test_same_name_conversations_use_runtime_id_instead_of_title():
     client = FakeClient()
     client.rows = [
@@ -392,7 +592,7 @@ def test_private_latest_outgoing_means_nothing_needs_reply():
 
 def test_unknown_geometry_is_never_coerced_to_incoming():
     client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
+    client.rows = [row("Alice", unread=0)]
     client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
     client.histories["Alice"] = [
         UiaChatMessage("", "ambiguous", direction="unknown", runtime_id="1")
@@ -404,6 +604,25 @@ def test_unknown_geometry_is_never_coerced_to_incoming():
     _, events = driver.observe_events()
 
     assert events == []
+
+
+def test_private_unread_marker_classifies_only_latest_unknown_bubble():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=2)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [
+        UiaChatMessage("", "older", direction="unknown", runtime_id="1"),
+        UiaChatMessage("", "newest", direction="unknown", runtime_id="2"),
+    ]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+
+    _, events = driver.observe_events()
+
+    assert [event.content for event in events] == ["newest"]
+    assert events[0].confidence == "high"
+    assert events[0].history == []
 
 
 def test_reply_queue_is_global_fifo_and_rejects_duplicates():
@@ -479,6 +698,33 @@ def test_driver_revalidation_rejects_target_replaced_during_generation():
 
     assert valid is False
     assert "newer" in reason
+
+
+def test_group_revalidation_reuses_history_direction_resolution():
+    client = FakeClient()
+    client.rows = [row("项目群", unread=1, mention=True, preview_prefix=True)]
+    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
+    unknown_message = UiaChatMessage(
+        "", "@小牛 请确认", direction="unknown", runtime_id="1"
+    )
+    resolved_message = incoming("@小牛 请确认", "1")
+    client.histories["项目群"] = [unknown_message]
+    client.resolved_histories["项目群"] = [resolved_message]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+    driver.set_outgoing_history_provider(lambda name: ["此前由我发送"])
+
+    _, events = driver.observe_events()
+    valid, reason = driver.validate_reply_target(events[0])
+
+    assert valid is True
+    assert reason == ""
+    assert client.seeded_outgoing["项目群"] == ["此前由我发送"]
+    assert client.direction_resolution_calls == [
+        ("项目群", "小牛"),
+        ("项目群", "小牛"),
+    ]
 
 
 def test_expired_queue_token_rejects_late_result():

@@ -1334,9 +1334,12 @@ class WebChannel(ChatChannel):
         else:
             logger.info(f"[WebChannel] 🔒 Listening on {host} only (local access). For public access, set web_host to 0.0.0.0 and configure web_password")
 
-        # In desktop mode the Electron shell renders the UI, so don't pop a
-        # browser window (also avoids issues when running detached/headless).
-        if os.environ.get("COW_DESKTOP") != "1":
+        # Browser opening is opt-in.  The WeChat automation launcher runs in
+        # the foreground and streams logs in the terminal by default.
+        if (
+            os.environ.get("COW_OPEN_BROWSER") == "1"
+            and os.environ.get("COW_DESKTOP") != "1"
+        ):
             try:
                 import webbrowser
                 webbrowser.open(f"http://localhost:{port}")

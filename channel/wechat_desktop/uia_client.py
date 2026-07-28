@@ -9,7 +9,9 @@ import random
 import re
 import threading
 import time
+from collections import Counter
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -123,6 +125,8 @@ class WechatUiaClient:
         self._stop_event = threading.Event()
         self._last_send_at = 0.0
         self._last_conversation_send: dict[str, float] = {}
+        self._known_outgoing_texts: dict[str, list[str]] = {}
+        self.last_direction_resolution: dict = {}
 
     def cancel_waits(self):
         self._stop_event.set()
@@ -169,6 +173,21 @@ class WechatUiaClient:
         if remaining > 0 and self._stop_event.wait(remaining):
             raise RuntimeError("WeChat UI Automation is stopping")
 
+    def remember_outgoing_text(self, conversation: str, text: str) -> None:
+        value = _text(text)
+        if not value:
+            return
+        key = _text(conversation)
+        items = self._known_outgoing_texts.setdefault(key, [])
+        if value in items:
+            items.remove(value)
+        items.append(value)
+        del items[:-20]
+
+    def seed_outgoing_texts(self, conversation: str, texts: Iterable[str]) -> None:
+        for text in texts:
+            self.remember_outgoing_text(conversation, text)
+
     @staticmethod
     def _require_windows():
         if os.name != "nt":
@@ -179,7 +198,6 @@ class WechatUiaClient:
         WechatUiaClient._require_windows()
         import win32api
         import win32con
-        import win32api
         import win32gui
         import win32process
 
@@ -447,6 +465,29 @@ class WechatUiaClient:
                 )
         return rows
 
+    @classmethod
+    def _active_conversation_has_content(cls, root, target: str) -> bool:
+        """Return whether *target* is already open with a populated chat pane."""
+        current_title = ""
+        message_list = None
+        for control in cls._walk(root):
+            automation_id = _text(control.AutomationId)
+            if automation_id.endswith("current_chat_name_label"):
+                current_title = _text(control.Name)
+            elif automation_id == MESSAGE_LIST_ID:
+                message_list = control
+        if current_title != _text(target) or message_list is None:
+            return False
+        try:
+            return any(
+                _text(item.Name)
+                and "Chat" in _text(item.ClassName)
+                and "ItemView" in _text(item.ClassName)
+                for item in message_list.GetChildren()
+            )
+        except Exception:
+            return False
+
     def locate_conversation(
         self,
         who: str,
@@ -457,6 +498,10 @@ class WechatUiaClient:
         if not target:
             return False
         with self.operation_lock, self._uia_root() as root:
+            # Selecting an already active session toggles some WeChat builds
+            # from the populated detail pane to a blank/inactive state.
+            if self._active_conversation_has_content(root, target):
+                return True
             target_id = f"{SESSION_PREFIX}{target}"
             session_rows = [
                 control
@@ -488,21 +533,37 @@ class WechatUiaClient:
             if control is None and not runtime_id and len(candidates) == 1:
                 control = candidates[0]
             if control is not None:
-                try:
-                    pattern = control.GetSelectionItemPattern()
-                    if pattern:
-                        pattern.Select()
-                    else:
+                # Recent WeChat 4.x builds expose SelectionItemPattern on a
+                # session row but Select() only changes UIA selection state;
+                # it does not activate the detail pane.  Use a real click,
+                # restore the cursor, and verify the chat UI before
+                # proceeding.  One bounded retry handles a dropped click
+                # during window activation.
+                for _ in range(2):
+                    old_cursor = None
+                    try:
+                        import win32api
+
+                        old_cursor = win32api.GetCursorPos()
                         control.Click()
-                except Exception:
-                    control.Click()
-                self._paced_wait(
-                    "uia_selection_settle_ms_min",
-                    "uia_selection_settle_ms_max",
-                    int(self.config.get("uia_selection_settle_ms", 250)),
-                    500,
-                )
-                return True
+                    finally:
+                        if old_cursor is not None:
+                            try:
+                                win32api.SetCursorPos(old_cursor)
+                            except Exception:
+                                pass
+                    self._paced_wait(
+                        "uia_selection_settle_ms_min",
+                        "uia_selection_settle_ms_max",
+                        int(self.config.get("uia_selection_settle_ms", 250)),
+                        500,
+                    )
+                    has_message_list = any(
+                        _text(item.AutomationId) == MESSAGE_LIST_ID
+                        for item in self._walk(root)
+                    )
+                    if has_message_list:
+                        return True
         return False
 
     def get_title(self) -> HeaderInfo:
@@ -529,6 +590,318 @@ class WechatUiaClient:
         if "file" in value or "文件" in value:
             return "file"
         return "text"
+
+    @classmethod
+    def _message_sender(
+        cls,
+        direction: str,
+        header: HeaderInfo,
+        owner: str,
+        item,
+        content: str,
+    ) -> str:
+        """Map structural direction to sender without comparing display names."""
+        if direction == "outgoing":
+            return _text(owner)
+        if direction != "incoming":
+            return ""
+        if header.header_type == "private":
+            return _text(header.title)
+        if header.header_type == "group":
+            try:
+                for child in item.GetChildren():
+                    candidate = _text(child.Name)
+                    if candidate and candidate != content and len(candidate) <= 80:
+                        return candidate
+            except Exception:
+                pass
+        return ""
+
+    @staticmethod
+    def _history_message_content(value: str) -> str:
+        """Remove the timestamp appended by WeChat's history result rows."""
+        text = _text(value)
+        return re.sub(
+            r"\s+(?:\d{4}年\d{1,2}月\d{1,2}日\s+)?\d{1,2}:\d{2}$",
+            "",
+            text,
+        ).strip()
+
+    @staticmethod
+    def _choose_self_member(
+        candidate_histories: list[list[str]], outgoing_anchors: Iterable[str]
+    ) -> Optional[int]:
+        """Choose the current account among same-name member candidates."""
+        if len(candidate_histories) == 1:
+            return 0
+        anchors = {_text(item) for item in outgoing_anchors if _text(item)}
+        if not anchors:
+            return None
+        matches = [
+            index
+            for index, history in enumerate(candidate_histories)
+            if any(anchor in set(history) for anchor in anchors)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _apply_self_history_directions(
+        messages: list[UiaChatMessage], self_history: Iterable[str]
+    ) -> list[UiaChatMessage]:
+        """Classify messages from a member-filter result, failing on ambiguity."""
+        self_counts = Counter(_text(item) for item in self_history if _text(item))
+        if not self_counts:
+            # An empty filtered list can also mean that WeChat did not finish
+            # rendering the history view.  It is not proof that every visible
+            # bubble came from somebody else.
+            return messages
+        total_counts = Counter(
+            _text(message.content)
+            for message in messages
+            if message.direction == "unknown" and _text(message.content)
+        )
+        resolved = []
+        for message in messages:
+            if message.direction != "unknown":
+                resolved.append(message)
+                continue
+            content = _text(message.content)
+            total = total_counts.get(content, 0)
+            own = self_counts.get(content, 0)
+            if total and own == total:
+                direction = "outgoing"
+            elif total and own == 0:
+                direction = "incoming"
+            else:
+                # Identical content appears on both sides, so occurrence order
+                # cannot be proven from the filtered history list.
+                resolved.append(message)
+                continue
+            resolved.append(
+                replace(
+                    message,
+                    direction=direction,
+                    confidence="high",
+                )
+            )
+        return resolved
+
+    @staticmethod
+    def _click_and_restore(control) -> None:
+        import win32api
+
+        cursor = win32api.GetCursorPos()
+        try:
+            control.Click()
+        finally:
+            win32api.SetCursorPos(cursor)
+
+    @staticmethod
+    def _visible_process_windows(process_id: int) -> list[int]:
+        import win32gui
+        import win32process
+
+        windows = []
+
+        def collect(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if int(pid) == int(process_id):
+                windows.append(int(hwnd))
+            return True
+
+        win32gui.EnumWindows(collect, None)
+        return windows
+
+    def _history_member_candidates(
+        self, history_hwnd: int, owner: str
+    ) -> list:
+        import uiautomation as auto
+        import win32process
+
+        with auto.UIAutomationInitializerInThread():
+            root = auto.ControlFromHandle(history_hwnd)
+            member_button = next(
+                (
+                    control
+                    for control in self._walk(root)
+                    if _text(control.Name) == "群成员"
+                ),
+                None,
+            )
+            if member_button is None:
+                return []
+            self._click_and_restore(member_button)
+        self._paced_wait(
+            "uia_history_settle_ms_min",
+            "uia_history_settle_ms_max",
+            800,
+            1300,
+        )
+        _, process_id = win32process.GetWindowThreadProcessId(history_hwnd)
+        with auto.UIAutomationInitializerInThread():
+            for hwnd in self._visible_process_windows(process_id):
+                root = auto.ControlFromHandle(hwnd)
+                member_list = next(
+                    (
+                        control
+                        for control in self._walk(root, 300)
+                        if _text(control.AutomationId) == "chatroom_member_list"
+                    ),
+                    None,
+                )
+                if member_list is None:
+                    continue
+                return [
+                    item
+                    for item in member_list.GetChildren()
+                    if _text(item.ClassName) == "mmui::XTableCell"
+                    and _text(item.Name) == _text(owner)
+                ]
+        return []
+
+    def _filtered_history_for_member(
+        self, history_hwnd: int, owner: str, candidate_index: int
+    ) -> tuple[int, list[str]]:
+        import uiautomation as auto
+        import win32process
+
+        candidates = self._history_member_candidates(history_hwnd, owner)
+        candidate_count = len(candidates)
+        if not 0 <= int(candidate_index) < candidate_count:
+            return candidate_count, []
+        self._click_and_restore(candidates[int(candidate_index)])
+        self._paced_wait(
+            "uia_history_settle_ms_min",
+            "uia_history_settle_ms_max",
+            800,
+            1300,
+        )
+        _, process_id = win32process.GetWindowThreadProcessId(history_hwnd)
+        with auto.UIAutomationInitializerInThread():
+            for hwnd in self._visible_process_windows(process_id):
+                root = auto.ControlFromHandle(hwnd)
+                message_list = next(
+                    (
+                        control
+                        for control in self._walk(root, 1000)
+                        if _text(control.AutomationId)
+                        in {"chat_log_message_list", "search_message_list"}
+                    ),
+                    None,
+                )
+                if message_list is None:
+                    continue
+                return candidate_count, [
+                    self._history_message_content(_text(item.Name))
+                    for item in message_list.GetChildren()
+                    if _text(item.ClassName).casefold() != "mmui::chatitemview"
+                    and "Chat" in _text(item.ClassName)
+                    and "ItemView" in _text(item.ClassName)
+                    and _text(item.Name)
+                ]
+        return candidate_count, []
+
+    def resolve_group_message_directions(
+        self,
+        conversation: str,
+        messages: list[UiaChatMessage],
+        owner: str,
+    ) -> list[UiaChatMessage]:
+        """Resolve unknown directions through the history member filter."""
+        self.last_direction_resolution = {
+            "conversation": _text(conversation),
+            "status": "not_started",
+        }
+        if not owner or not any(item.direction == "unknown" for item in messages):
+            self.last_direction_resolution["status"] = "not_needed"
+            return messages
+        import win32con
+        import win32gui
+
+        with self.operation_lock:
+            owner_hwnd = self.get_owner_window_handle()
+            process_id = self.get_owner_window_process_id()
+            with self._uia_root() as root:
+                history_button = next(
+                    (
+                        control
+                        for control in self._walk(root)
+                        if _text(control.Name) == "聊天记录"
+                        and _text(control.ControlTypeName) == "ButtonControl"
+                    ),
+                    None,
+                )
+                if history_button is None:
+                    self.last_direction_resolution["status"] = "history_button_missing"
+                    return messages
+                self._click_and_restore(history_button)
+            self._paced_wait(
+                "uia_history_settle_ms_min",
+                "uia_history_settle_ms_max",
+                1000,
+                1600,
+            )
+            history_hwnd = next(
+                (
+                    hwnd
+                    for hwnd in self._visible_process_windows(process_id)
+                    if hwnd != owner_hwnd
+                    and "聊天记录" in win32gui.GetWindowText(hwnd)
+                ),
+                None,
+            )
+            if history_hwnd is None:
+                self.last_direction_resolution["status"] = "history_window_missing"
+                return messages
+            try:
+                # Selecting a member closes the popover, so the first filtered
+                # read also supplies the candidate count; reopen it only for
+                # subsequent candidates.
+                candidate_count, first_history = self._filtered_history_for_member(
+                    history_hwnd, owner, 0
+                )
+                if candidate_count == 0:
+                    self.last_direction_resolution.update(
+                        status="owner_member_missing", candidate_count=0
+                    )
+                    return messages
+                histories = [first_history]
+                for index in range(1, candidate_count):
+                    _, history = self._filtered_history_for_member(
+                        history_hwnd, owner, index
+                    )
+                    histories.append(history)
+                self_index = self._choose_self_member(
+                    histories,
+                    self._known_outgoing_texts.get(_text(conversation), []),
+                )
+                self.last_direction_resolution.update(
+                    candidate_count=candidate_count,
+                    filtered_history_counts=[len(history) for history in histories],
+                    status="resolved" if self_index is not None else "self_ambiguous",
+                )
+                if self_index is None:
+                    return messages
+                resolved = self._apply_self_history_directions(
+                    messages, histories[self_index]
+                )
+                if not histories[self_index]:
+                    self.last_direction_resolution["status"] = "filtered_history_empty"
+                return resolved
+            finally:
+                for hwnd in self._visible_process_windows(process_id):
+                    if hwnd == owner_hwnd or not win32gui.IsWindow(hwnd):
+                        continue
+                    title = win32gui.GetWindowText(hwnd)
+                    class_name = win32gui.GetClassName(hwnd)
+                    if "聊天记录" in title or class_name.endswith("QWindowToolSaveBits"):
+                        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                try:
+                    win32gui.SetForegroundWindow(owner_hwnd)
+                except Exception:
+                    pass
 
     @classmethod
     def _message_direction(cls, item, list_bounds) -> tuple[str, Optional[tuple[int, int, int, int]]]:
@@ -621,16 +994,15 @@ class WechatUiaClient:
                 content = _text(item.Name)
                 if "Chat" not in class_name or "ItemView" not in class_name or not content:
                     continue
+                # Generic ChatItemView rows are time separators and system
+                # notices.  Concrete messages use ChatTextItemView,
+                # ChatImageItemView, ChatFileItemView, and similar subclasses.
+                if class_name.casefold() == "mmui::chatitemview":
+                    continue
                 direction, item_bounds = self._message_direction(item, list_bounds)
-                sender = owner if direction == "outgoing" else ""
-                if direction == "incoming" and header.header_type == "private":
-                    sender = header.title
-                if direction == "incoming" and header.header_type == "group":
-                    for child in item.GetChildren():
-                        candidate = _text(child.Name)
-                        if candidate and candidate != content and len(candidate) <= 80:
-                            sender = candidate
-                            break
+                sender = self._message_sender(
+                    direction, header, owner, item, content
+                )
                 messages.append(
                     UiaChatMessage(
                         sender_name=sender,
@@ -818,6 +1190,8 @@ class WechatUiaClient:
             now = time.monotonic()
             self._last_send_at = now
             self._last_conversation_send[str(who)] = now
+            if result.get("verified"):
+                self.remember_outgoing_text(who, text)
             return result
 
     def send_file(

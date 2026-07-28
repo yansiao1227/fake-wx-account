@@ -160,6 +160,24 @@ def test_conversation_history_persists_and_deduplicates_recent_outgoing(tmp_path
     assert [item["content"] for item in history_without_event] == ["hi", "see you"]
 
 
+def test_outgoing_text_anchors_are_scoped_to_conversation_name(tmp_path):
+    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
+    store.append_conversation_history(
+        "group-1", "同名群", "我", "outgoing", "text", "第一条回复", "group"
+    )
+    store.append_conversation_history(
+        "group-1", "同名群", "我", "outgoing", "text", "第二条回复", "group"
+    )
+    store.append_conversation_history(
+        "group-2", "另一个群", "我", "outgoing", "text", "不应返回", "group"
+    )
+
+    assert store.list_outgoing_texts_by_name("同名群") == [
+        "第二条回复",
+        "第一条回复",
+    ]
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -365,7 +383,8 @@ def test_web_desktop_endpoints_require_loopback_or_password(monkeypatch):
     monkeypatch.setattr(web_channel, "_require_auth", lambda: None)
     monkeypatch.setattr(web_channel, "_is_password_enabled", lambda: False)
     monkeypatch.setattr(web_channel, "conf", lambda: {"web_host": "0.0.0.0"})
-    monkeypatch.setattr(web_channel.web, "HTTPError", DummyHTTPError)
+    # Some tests replace the web.py module with a minimal process-wide stub.
+    monkeypatch.setattr(web_channel.web, "HTTPError", DummyHTTPError, raising=False)
 
     with pytest.raises(DummyHTTPError) as exc:
         web_channel._require_wechat_desktop_security()

@@ -18,10 +18,6 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 $EnvironmentName = "cowagent-wechat"
 $Port = 9899
-$RunDir = Join-Path $ProjectRoot "tmp\run"
-$PidFile = Join-Path $RunDir "cowagent.pid"
-$StdoutLog = Join-Path $RunDir "cowagent.stdout.log"
-$StderrLog = Join-Path $RunDir "cowagent.stderr.log"
 $AppPath = Join-Path $ProjectRoot "app.py"
 
 function Get-EnvironmentPython {
@@ -82,49 +78,38 @@ function Start-CowAgent {
     $existing = Get-CowAgentProcess
     if ($existing) {
         Assert-ProjectProcess $existing $python
-        Write-Host "CowAgent is already running: http://127.0.0.1:$Port (PID $($existing.ProcessId))"
+        Write-Host "CowAgent is already running on port $Port (PID $($existing.ProcessId))"
         Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
         return
     }
-    New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
-    $startOptions = @{
-        FilePath = $python
-        ArgumentList = @($AppPath)
-        WorkingDirectory = $ProjectRoot
-        WindowStyle = "Hidden"
-        RedirectStandardOutput = $StdoutLog
-        RedirectStandardError = $StderrLog
-        PassThru = $true
+    Write-Host "Starting CowAgent in the current terminal (foreground mode)"
+    Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
+    Write-Host "Press Ctrl+C to stop. Browser auto-open is disabled."
+    $previousOpenBrowser = $env:COW_OPEN_BROWSER
+    $env:COW_OPEN_BROWSER = "0"
+    Push-Location $ProjectRoot
+    try {
+        & $python $AppPath
+        $exitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        $env:COW_OPEN_BROWSER = $previousOpenBrowser
     }
-    $process = Start-Process @startOptions
-    Set-Content -LiteralPath $PidFile -Value $process.Id -Encoding ascii
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
-        Start-Sleep -Milliseconds 500
-        if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue) {
-            Write-Host "CowAgent started: http://127.0.0.1:$Port (PID $($process.Id))"
-            Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
-            Write-Host "Logs: $StdoutLog"
-            return
-        }
-        if ($process.HasExited) {
-            throw "CowAgent exited during startup; inspect '$StderrLog'"
-        }
+    if ($exitCode -ne 0) {
+        throw "CowAgent exited with code $exitCode"
     }
-    throw "CowAgent did not listen on port $Port within 15 seconds"
 }
 
 function Stop-CowAgent {
     $python = Get-EnvironmentPython
     $process = Get-CowAgentProcess
     if (-not $process) {
-        Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
         Write-Host "CowAgent is not running"
         return
     }
     Assert-ProjectProcess $process $python
     Stop-Process -Id $process.ProcessId
     Wait-Process -Id $process.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
     Write-Host "CowAgent stopped (PID $($process.ProcessId))"
 }
 
@@ -138,7 +123,7 @@ switch ($Command) {
     "status" {
         $process = Get-CowAgentProcess
         if ($process) {
-            Write-Host "CowAgent is running: http://127.0.0.1:$Port (PID $($process.ProcessId))"
+            Write-Host "CowAgent is running on port $Port (PID $($process.ProcessId))"
             Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
         } else {
             Write-Host "CowAgent is stopped"

@@ -314,6 +314,7 @@
                 "group": "安装部署",
                 "pages": [
                   "zh/guide/quick-start",
+                  "zh/guide/wechat-desktop-service",
                   "zh/guide/desktop",
                   "zh/guide/manual-install",
                   "zh/guide/upgrade"
