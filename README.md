@@ -1,6 +1,6 @@
 # fake-wx-account
 
-本项目基于开源项目 [CowAgent](https://github.com/zhayujie/CowAgent) 修改，主要用于在 Windows 上通过 UI Automation（UIA）接入微信 4.x 桌面客户端。
+本项目基于开源项目 [CowAgent](https://github.com/zhayujie/CowAgent) 修改，主要用于在 Windows 上通过 UI Automation（UIA）接入微信 4.1.9.30 桌面客户端。
 
 CowAgent 的完整能力、架构、通用部署方式和使用文档请查看：
 
