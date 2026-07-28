@@ -1,0 +1,61 @@
+---
+title: Desktop WeChat Automation
+description: Control one WeChat 4.x window with Windows UI Automation
+---
+
+The `wechat_desktop` channel controls a locally logged-in WeChat 4.x client through Windows UI Automation. It does not use screenshots, OCR, a vision model, or a separate automation server.
+
+## Install
+
+Use Windows 10/11 and Python 3.13+:
+
+```powershell
+python -m pip install -r requirements-windows.txt
+```
+
+Start and sign in to exactly one desktop WeChat instance, then configure:
+
+```json
+{
+  "channel_type": "web,wechat_desktop",
+  "wechat_desktop": {
+    "uia_message_limit": 5,
+    "shell_hook_reconcile_seconds": 15,
+    "self_display_name": "Your WeChat display name",
+    "shadow_mode": true,
+    "auto_reply_contacts": ["File Transfer"],
+    "auto_reply_groups": ["Test group"]
+  }
+}
+```
+
+`self_display_name` is used when WeChat does not expose the current account through UIA. Automatic sending stops if it conflicts with an account name exposed by the client.
+
+## Message processing
+
+Windows Shell Hook taskbar-flash events wake the observer. A session-row check runs every 15 seconds to catch foreground messages and suppressed notifications. The channel reads at most five already visible message bubbles and never scrolls for older history.
+
+Each changed conversation is read as one snapshot of at most five visible UIA bubbles. Private chats select only the latest incoming bubble after the last outgoing bubble. Group chats select only the latest incoming bubble that explicitly mentions the owner. Every other bubble is context, not a separate reply task. Direction comes exclusively from bubble/avatar geometry; private chats do not depend on display names.
+
+Incoming targets enter one global in-memory FIFO. Only one target can run through the Agent and reply path at a time. A newer target from the same queued conversation replaces the older target; if the target changes during generation, token checks and a final UIA revalidation discard the stale result. Replies are sent directly through UIA without approval. The queue is intentionally discarded when CowAgent stops.
+
+Shell Hook reconciliation, focus, conversation selection, paste, and send operations use bounded interruptible pacing. Sends are spaced by 2–5 seconds globally and at least 5 seconds per conversation by default. Uncertain sends are never retried automatically.
+
+For groups, the session row must report `[有人@我]`, and each individual bubble must itself contain `@<self_display_name>`. Later non-mentioned bubbles are not queued merely because an earlier message mentioned the account.
+
+Conversation titles are display labels, not identifiers. Duplicate names are separated with each UIA row's RuntimeId and visible-row index. In group previews, a `sender:` prefix identifies the latest message as coming from another member; a preview without that prefix is not treated as a new incoming message from that row alone.
+
+If WeChat is in the background it is restored before inspection. An empty UIA tree triggers at most three taskbar recovery attempts. All UIA reads and sends share one operation lock.
+
+## Smoke test
+
+The default report is redacted and does not take screenshots:
+
+```powershell
+python scripts/test_wechat_uia.py
+python scripts/test_wechat_uia.py --conversation "File Transfer"
+```
+
+Add `--include-content` only when local message text is safe to print. Sending occurs only when both `--send-to` and `--text` are supplied.
+
+During automation, the global `Ctrl+Alt+Shift+Q` hotkey stops CowAgent without requiring the mouse.

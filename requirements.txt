@@ -1,0 +1,25 @@
+numpy>=1.21
+aiohttp>=3.11,<4
+requests>=2.28.2
+chardet>=5.1.0
+Pillow
+python-dotenv>=1.0.0
+PyYAML>=6.0
+croniter>=2.0.0
+click>=8.0
+qrcode
+json-repair
+
+# zhipuai
+zai-sdk
+# tongyi qwen sdk
+dashscope
+
+# Used by Xunfei model/voice integrations.
+websocket-client>=1.4.0
+# Used by the official Weixin CDN encryption helpers.
+pycryptodome
+
+# Python 3.13 removed cgi; legacy-cgi restores it for the PyPI web.py release.
+web.py==0.62
+legacy-cgi; python_version >= "3.13"

@@ -1,0 +1,61 @@
+---
+title: 桌面微信自动化
+description: 使用 Windows UI Automation 操作单个微信 4.x 窗口
+---
+
+`wechat_desktop` 通道直接通过 Windows UI Automation 操作本机已登录的微信 4.x，不使用截图、OCR、视觉大模型或独立自动化服务器。
+
+## 安装
+
+使用 Windows 10/11 和 Python 3.13+：
+
+```powershell
+python -m pip install -r requirements-windows.txt
+```
+
+启动并登录且只登录一个桌面微信实例，然后配置：
+
+```json
+{
+  "channel_type": "web,wechat_desktop",
+  "wechat_desktop": {
+    "uia_message_limit": 5,
+    "shell_hook_reconcile_seconds": 15,
+    "self_display_name": "自己的微信昵称",
+    "shadow_mode": true,
+    "auto_reply_contacts": ["文件传输助手"],
+    "auto_reply_groups": ["测试群"]
+  }
+}
+```
+
+微信没有通过 UIA 暴露当前账号时使用 `self_display_name`。如果配置昵称与 UIA 读取结果不一致，自动发送会停止。
+
+## 消息处理
+
+Windows Shell Hook 的任务栏闪烁事件负责唤醒观察器，同时每 15 秒只检查一次会话行，以补偿前台消息或系统未触发闪烁的情况。通道最多读取当前已经显示的 5 个消息气泡，不向上滚动读取旧历史。
+
+每次会话变化都会读取一份最近 5 个可见气泡的 UIA 快照。私聊只选择最后一个右侧气泡之后的最新左侧消息；群聊只选择最新一条明确 `@自己` 的左侧消息。目标之外的气泡只作为历史交给模型，不会分别创建回复。气泡方向只由 UI 树中的气泡或头像左右位置决定，私聊不依赖用户名。
+
+需要回复的消息进入一个全局内存 FIFO。无论消息来自同一联系人还是不同联系人，每次只允许一条消息进入 Agent 和回复流程。同一会话在等待期间收到更新消息时，新的目标会替换旧目标；生成期间目标发生变化时，旧结果会被令牌和发送前 UIA 复核拦截。生成结果直接通过 UIA 发送，不经过审批。CowAgent 停止时会丢弃尚未处理的内存队列。
+
+群聊必须同时满足：会话行显示 `[有人@我]`，并且具体消息气泡自身包含 `@自己的昵称`。不能因为前一条消息 @ 了自己，就把后续没有 @ 的普通消息一起入队。
+
+会话标题只用于展示，不能作为唯一 ID。同名联系人通过会话行的 UIA RuntimeId 和可见行序号区分。群聊预览带 `发送者:` 前缀时表示最近消息来自其他成员；没有该前缀时，不能只凭会话行变化把它当作新的入站消息。
+
+微信在后台时会先恢复到前台。UIA 树为 0 个节点时最多点击任务栏微信按钮恢复 3 次。所有读取和发送操作共用同一把 UIA 操作锁。
+
+Shell Hook、聚焦、选择会话、粘贴和发送之间采用可中断的保守等待区间；全局两次发送默认间隔 2–5 秒，同一会话默认至少间隔 5 秒。发送结果不明确时不会自动重试。
+
+## 冒烟测试
+
+默认报告会脱敏，也不会截图：
+
+```powershell
+python scripts/test_wechat_uia.py
+python scripts/test_wechat_uia.py --conversation "文件传输助手"
+```
+
+只有确认聊天内容可以输出时才添加 `--include-content`。只有同时提供 `--send-to` 和 `--text` 才会发送消息。
+
+自动化期间可在任意窗口按 `Ctrl+Alt+Shift+Q` 停止 CowAgent，无需操作鼠标。

@@ -1,0 +1,875 @@
+"""Synchronous WeChat 4.x client built on Windows UI Automation."""
+
+from __future__ import annotations
+
+import hashlib
+import ctypes
+import os
+import random
+import re
+import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+from channel.wechat_desktop.models import (
+    ConversationInfo,
+    HeaderInfo,
+    OwnerInfo,
+    UiaChatMessage,
+)
+
+
+SESSION_PREFIX = "session_item_"
+MESSAGE_LIST_ID = "chat_message_list"
+INPUT_ID = "chat_input_field"
+MENTION_MARKERS = ("[有人@我]", "有人@我", "[Someone mentioned me]")
+
+
+def _text(value) -> str:
+    return str(value or "").strip()
+
+
+def _bounds(control) -> Optional[tuple[int, int, int, int]]:
+    try:
+        rect = control.BoundingRectangle
+        return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+    except Exception:
+        return None
+
+
+def _runtime_id(control) -> str:
+    try:
+        value = control.GetRuntimeId()
+        if value:
+            return ".".join(str(item) for item in value)
+    except Exception:
+        pass
+    try:
+        value = control.GetPropertyValue(30000)
+        if value:
+            return ".".join(str(item) for item in value)
+    except Exception:
+        pass
+    return ""
+
+
+def parse_session_accessible_name(
+    title: str,
+    accessible_name: str,
+    automation_id: str = "",
+    runtime_id: str = "",
+    row_index: int = -1,
+) -> ConversationInfo:
+    """Parse only stable, localized session-row markers.
+
+    The complete accessible name is retained only as a hash so previews do not
+    leak into status responses or diagnostics.
+    """
+    value = _text(accessible_name)
+    unread = 0
+    patterns = (
+        r"\[(\d+)\s*条\]",
+        r"(?:未读|新消息)\s*[:：]?\s*(\d+)",
+        r"(\d+)\s*条新消息",
+        r"(\d+)\s*(?:new|unread)\s+messages?",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, re.IGNORECASE)
+        if match:
+            unread = int(match.group(1))
+            break
+    preview_sender = ""
+    preview_has_sender_prefix = False
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    preview = next(
+        (
+            line
+            for line in lines[1:]
+            if not re.fullmatch(r"\d{1,2}:\d{2}", line)
+            and line not in {"免打扰", "消息免打扰", "置顶", "已置顶"}
+        ),
+        "",
+    )
+    preview = re.sub(r"^\[\d+\s*条\]\s*", "", preview)
+    sender_match = re.match(r"^([^:：]{1,80})[:：]\s*.+$", preview)
+    if sender_match:
+        preview_sender = sender_match.group(1).strip()
+        preview_has_sender_prefix = bool(preview_sender)
+    mentions = any(marker.casefold() in value.casefold() for marker in MENTION_MARKERS)
+    return ConversationInfo(
+        conversation_title=_text(title),
+        is_do_not_disturb=any(x in value for x in ("免打扰", "消息免打扰")),
+        is_top=any(x in value for x in ("置顶", "已置顶")),
+        not_read_number=unread,
+        mentions_self=mentions,
+        row_signature=hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        automation_id=_text(automation_id),
+        runtime_id=_text(runtime_id),
+        row_index=int(row_index),
+        preview_sender=preview_sender,
+        preview_has_sender_prefix=preview_has_sender_prefix,
+    )
+
+
+class WechatUiaClient:
+    """Minimal, bounded replacement for the SDK methods used by CowAgent."""
+
+    def __init__(self, config: Optional[dict] = None):
+        self.config = dict(config or {})
+        self.operation_lock = threading.RLock()
+        self._owner_cache: Optional[OwnerInfo] = None
+        self._stop_event = threading.Event()
+        self._last_send_at = 0.0
+        self._last_conversation_send: dict[str, float] = {}
+
+    def cancel_waits(self):
+        self._stop_event.set()
+
+    def resume_waits(self):
+        self._stop_event.clear()
+
+    def _paced_wait(
+        self,
+        minimum_key: str,
+        maximum_key: str,
+        default_minimum: int,
+        default_maximum: int,
+    ) -> None:
+        minimum = max(0, min(int(self.config.get(minimum_key, default_minimum)), 10000))
+        maximum = max(
+            minimum,
+            min(int(self.config.get(maximum_key, default_maximum)), 10000),
+        )
+        delay_ms = random.randint(minimum, maximum) if maximum > minimum else minimum
+        if delay_ms and self._stop_event.wait(delay_ms / 1000.0):
+            raise RuntimeError("WeChat UI Automation is stopping")
+
+    def _wait_for_send_slot(self, conversation: str) -> None:
+        now = time.monotonic()
+        minimum = max(
+            0,
+            int(self.config.get("uia_send_interval_ms_min", 2000)),
+        )
+        maximum = max(
+            minimum,
+            int(self.config.get("uia_send_interval_ms_max", 5000)),
+        )
+        interval = random.randint(minimum, maximum) / 1000.0
+        cooldown = max(
+            0.0,
+            float(self.config.get("uia_conversation_cooldown_seconds", 5)),
+        )
+        due = max(
+            self._last_send_at + interval,
+            self._last_conversation_send.get(str(conversation), 0.0) + cooldown,
+        )
+        remaining = due - now
+        if remaining > 0 and self._stop_event.wait(remaining):
+            raise RuntimeError("WeChat UI Automation is stopping")
+
+    @staticmethod
+    def _require_windows():
+        if os.name != "nt":
+            raise RuntimeError("WeChat desktop automation requires Windows")
+
+    @staticmethod
+    def _enumerate_main_windows() -> list[tuple[int, int]]:
+        WechatUiaClient._require_windows()
+        import win32api
+        import win32con
+        import win32api
+        import win32gui
+        import win32process
+
+        windows: list[tuple[int, int]] = []
+
+        def callback(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            native_class = win32gui.GetClassName(hwnd)
+            if native_class != "mmui::MainWindow" and not (
+                native_class.startswith("Qt")
+                and native_class.endswith("QWindowIcon")
+            ):
+                return True
+            _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+            try:
+                process = win32api.OpenProcess(
+                    win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+                    False,
+                    process_id,
+                )
+                executable = win32process.GetModuleFileNameEx(process, 0)
+                process.Close()
+            except Exception:
+                executable = ""
+            if not executable or Path(executable).name.casefold() == "weixin.exe":
+                windows.append((int(hwnd), int(process_id)))
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return windows
+
+    def _window(self) -> tuple[int, int]:
+        windows = self._enumerate_main_windows()
+        if not windows:
+            raise RuntimeError("No logged-in WeChat 4.x main window was found")
+        if len(windows) != 1:
+            raise RuntimeError(
+                f"Exactly one WeChat 4.x main window is required; found {len(windows)}"
+            )
+        return windows[0]
+
+    def get_owner_window_handle(self) -> int:
+        return self._window()[0]
+
+    def get_owner_window_process_id(self) -> int:
+        return self._window()[1]
+
+    def allowed_process_ids(self) -> set[int]:
+        try:
+            return {self.get_owner_window_process_id()}
+        except Exception:
+            return set()
+
+    @staticmethod
+    def _walk(root, max_nodes: int = 4000) -> Iterator:
+        queue = list(root.GetChildren())
+        count = 0
+        while queue and count < max(1, int(max_nodes)):
+            control = queue.pop(0)
+            count += 1
+            yield control
+            try:
+                queue.extend(control.GetChildren())
+            except Exception:
+                pass
+
+    @contextmanager
+    def _uia_root(self):
+        try:
+            import uiautomation as auto
+        except ImportError as exc:
+            raise RuntimeError("uiautomation is not installed") from exc
+        hwnd = self.get_owner_window_handle()
+        with auto.UIAutomationInitializerInThread():
+            yield auto.ControlFromHandle(hwnd)
+
+    def probe_tree(self) -> int:
+        with self.operation_lock, self._uia_root() as root:
+            return sum(1 for _ in self._walk(root))
+
+    def focus_window(self) -> None:
+        self._require_windows()
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+
+        hwnd = self.get_owner_window_handle()
+        if win32gui.GetForegroundWindow() != hwnd:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                current_thread = win32api.GetCurrentThreadId()
+                foreground = win32gui.GetForegroundWindow()
+                foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
+                ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, True)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                finally:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, False)
+        self._paced_wait(
+            "uia_focus_settle_ms_min",
+            "uia_focus_settle_ms_max",
+            int(self.config.get("uia_focus_settle_ms", 350)),
+            700,
+        )
+        self._recover_empty_tree(hwnd)
+
+    def _click_taskbar_button(self) -> bool:
+        try:
+            import uiautomation as auto
+            import win32gui
+
+            taskbar = win32gui.FindWindow("Shell_TrayWnd", None)
+            if not taskbar:
+                return False
+            with auto.UIAutomationInitializerInThread():
+                root = auto.ControlFromHandle(taskbar)
+                for control in self._walk(root, 1000):
+                    name = _text(control.Name).casefold()
+                    if name in {"微信", "weixin", "wechat"} or "微信" in name:
+                        try:
+                            control.GetInvokePattern().Invoke()
+                        except Exception:
+                            control.Click()
+                        return True
+        except Exception:
+            return False
+        return False
+
+    def _recover_empty_tree(self, hwnd: int) -> bool:
+        try:
+            if self.probe_tree() > 0:
+                return False
+        except Exception:
+            return False
+        attempts = max(0, min(int(self.config.get("uia_recovery_attempts", 3)), 3))
+        settle = max(0, min(int(self.config.get("uia_recovery_settle_ms", 500)), 3000))
+        for _ in range(attempts):
+            self._click_taskbar_button()
+            if settle:
+                if self._stop_event.wait(settle / 1000.0):
+                    raise RuntimeError("WeChat UI Automation is stopping")
+            if self.probe_tree() > 0:
+                return True
+        raise RuntimeError(
+            f"WeChat UI Automation tree remained empty after {attempts} recovery attempts"
+        )
+
+    def get_owner_info(self) -> OwnerInfo:
+        configured = _text(self.config.get("self_display_name"))
+        if self._owner_cache and (
+            not configured or self._owner_cache.nick_name == configured
+        ):
+            return self._owner_cache
+        discovered = ""
+        wx_id = ""
+        with self.operation_lock, self._uia_root() as root:
+            root_bounds = _bounds(root)
+            left_limit = root_bounds[0] + max(100, (root_bounds[2] - root_bounds[0]) // 5) if root_bounds else 0
+            for control in self._walk(root):
+                aid = _text(control.AutomationId).casefold()
+                cls = _text(control.ClassName).casefold()
+                name = _text(control.Name)
+                bounds = _bounds(control)
+                profile_hint = any(
+                    key in aid
+                    for key in ("self_avatar", "owner_avatar", "profile", "account", "userinfo")
+                ) or ("avatar" in cls and any(key in aid for key in ("self", "owner")))
+                in_sidebar = bool(bounds and left_limit and bounds[0] <= left_limit)
+                if profile_hint and in_sidebar and name and name not in {"头像", "微信"}:
+                    discovered = name
+                    break
+            if not discovered:
+                discovered, wx_id = self._read_owner_profile_popup(root)
+        if discovered and configured and discovered != configured:
+            raise RuntimeError(
+                "self_display_name does not match the account exposed by WeChat UIA"
+            )
+        if discovered:
+            owner = OwnerInfo(discovered, wx_id=wx_id, source="uia", confidence="high")
+        elif configured:
+            owner = OwnerInfo(configured, source="config", confidence="medium")
+        else:
+            owner = OwnerInfo("", source="unknown", confidence="low")
+        self._owner_cache = owner
+        return owner
+
+    def _read_owner_profile_popup(self, root) -> tuple[str, str]:
+        """Open the unlabelled top-left avatar and read its semantic popup."""
+        try:
+            import uiautomation as auto
+            import win32api
+            import win32con
+
+            bounds = _bounds(root)
+            if not bounds:
+                return "", ""
+            old_cursor = win32api.GetCursorPos()
+            try:
+                auto.Click(bounds[0] + 38, bounds[1] + 68)
+                time.sleep(
+                    max(
+                        0,
+                        min(int(self.config.get("uia_selection_settle_ms", 150)), 1000),
+                    )
+                    / 1000.0
+                )
+            finally:
+                win32api.SetCursorPos(old_cursor)
+
+            popup = next(
+                (
+                    item
+                    for item in auto.GetRootControl().GetChildren()
+                    if _text(item.ClassName) == "mmui::ProfileUniquePop"
+                ),
+                None,
+            )
+            if popup is None:
+                return "", ""
+            display_name = ""
+            wx_id = ""
+            for control in self._walk(popup, 500):
+                automation_id = _text(control.AutomationId)
+                if automation_id.endswith("display_name_text"):
+                    display_name = _text(control.Name)
+                elif "ProfileTextView" in _text(control.ClassName):
+                    candidate = _text(control.Name)
+                    if candidate and candidate != display_name:
+                        wx_id = candidate
+            return display_name, wx_id
+        except Exception:
+            return "", ""
+        finally:
+            try:
+                import win32api
+                import win32con
+
+                win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+                win32api.keybd_event(
+                    win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0
+                )
+            except Exception:
+                pass
+
+    def get_visible_conversations(self) -> list[ConversationInfo]:
+        rows: list[ConversationInfo] = []
+        with self.operation_lock, self._uia_root() as root:
+            for control in self._walk(root):
+                automation_id = _text(control.AutomationId)
+                if not automation_id.startswith(SESSION_PREFIX):
+                    continue
+                title = automation_id[len(SESSION_PREFIX) :]
+                rows.append(
+                    parse_session_accessible_name(
+                        title,
+                        _text(control.Name),
+                        automation_id,
+                        runtime_id=_runtime_id(control),
+                        row_index=len(rows),
+                    )
+                )
+        return rows
+
+    def locate_conversation(
+        self,
+        who: str,
+        runtime_id: str = "",
+        row_index: int = -1,
+    ) -> bool:
+        target = _text(who)
+        if not target:
+            return False
+        with self.operation_lock, self._uia_root() as root:
+            target_id = f"{SESSION_PREFIX}{target}"
+            session_rows = [
+                control
+                for control in self._walk(root)
+                if _text(control.AutomationId).startswith(SESSION_PREFIX)
+            ]
+            candidates = [
+                control
+                for control in session_rows
+                if _text(control.AutomationId) == target_id
+            ]
+            control = next(
+                (
+                    item
+                    for item in candidates
+                    if runtime_id and _runtime_id(item) == runtime_id
+                ),
+                None,
+            )
+            # A supplied RuntimeId is the identity of this exact session row.
+            # Never fall back to another row with the same title: that could
+            # send to the wrong person when duplicate display names reorder.
+            if runtime_id and control is None:
+                return False
+            if control is None and 0 <= int(row_index) < len(session_rows):
+                indexed = session_rows[int(row_index)]
+                if _text(indexed.AutomationId) == target_id:
+                    control = indexed
+            if control is None and not runtime_id and len(candidates) == 1:
+                control = candidates[0]
+            if control is not None:
+                try:
+                    pattern = control.GetSelectionItemPattern()
+                    if pattern:
+                        pattern.Select()
+                    else:
+                        control.Click()
+                except Exception:
+                    control.Click()
+                self._paced_wait(
+                    "uia_selection_settle_ms_min",
+                    "uia_selection_settle_ms_max",
+                    int(self.config.get("uia_selection_settle_ms", 250)),
+                    500,
+                )
+                return True
+        return False
+
+    def get_title(self) -> HeaderInfo:
+        title = ""
+        count = 1
+        with self.operation_lock, self._uia_root() as root:
+            for control in self._walk(root):
+                automation_id = _text(control.AutomationId)
+                if automation_id.endswith("current_chat_name_label"):
+                    title = _text(control.Name)
+                elif automation_id.endswith("current_chat_count_label"):
+                    match = re.search(r"(\d+)", _text(control.Name))
+                    if match:
+                        count = max(1, int(match.group(1)))
+        return HeaderInfo(title, "group" if count > 1 else ("private" if title else "unknown"), count)
+
+    @staticmethod
+    def _message_type(class_name: str, content: str) -> str:
+        value = f"{class_name} {content}".casefold()
+        if "image" in value or content in {"[图片]", "[Image]"}:
+            return "image"
+        if "voice" in value or content in {"[语音]", "[Voice]"}:
+            return "voice"
+        if "file" in value or "文件" in value:
+            return "file"
+        return "text"
+
+    @classmethod
+    def _message_direction(cls, item, list_bounds) -> tuple[str, Optional[tuple[int, int, int, int]]]:
+        """Classify a message using UI geometry only, never display names.
+
+        WeChat often exposes ChatItemView as a full-width row.  The visible
+        bubble/avatar descendants, however, remain aligned to one side.  Vote
+        using those bounded descendants and fail closed when geometry is
+        ambiguous.
+        """
+        if not list_bounds:
+            return "unknown", _bounds(item)
+        list_left, _, list_right, _ = list_bounds
+        width = max(1, list_right - list_left)
+        center = (list_left + list_right) / 2.0
+        threshold = max(12.0, width * 0.06)
+        content = _text(item.Name)
+        candidates = []
+        item_bounds = _bounds(item)
+        controls = [item]
+        try:
+            controls.extend(cls._walk(item, 200))
+        except Exception:
+            pass
+        for control in controls:
+            bounds = _bounds(control)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            candidate_width = right - left
+            if candidate_width <= 0 or bottom <= top or candidate_width >= width * 0.82:
+                continue
+            midpoint = (left + right) / 2.0
+            if abs(midpoint - center) <= threshold:
+                continue
+            class_name = _text(control.ClassName).casefold()
+            name = _text(control.Name)
+            weight = 1.0
+            if name and name == content:
+                weight += 4.0
+            if any(token in class_name for token in ("bubble", "avatar", "message", "content", "text")):
+                weight += 2.0
+            weight += min(2.0, candidate_width / max(1.0, width * 0.25))
+            side = "incoming" if midpoint < center else "outgoing"
+            candidates.append((side, weight, bounds))
+        if not candidates and item_bounds:
+            midpoint = (item_bounds[0] + item_bounds[2]) / 2.0
+            if midpoint < center - threshold:
+                return "incoming", item_bounds
+            if midpoint > center + threshold:
+                return "outgoing", item_bounds
+            return "unknown", item_bounds
+        incoming_score = sum(weight for side, weight, _ in candidates if side == "incoming")
+        outgoing_score = sum(weight for side, weight, _ in candidates if side == "outgoing")
+        if incoming_score == outgoing_score or max(incoming_score, outgoing_score) < 1.0:
+            return "unknown", item_bounds
+        winning = "incoming" if incoming_score > outgoing_score else "outgoing"
+        if min(incoming_score, outgoing_score) and max(incoming_score, outgoing_score) < min(incoming_score, outgoing_score) * 1.5:
+            return "unknown", item_bounds
+        winning_bounds = [bounds for side, _, bounds in candidates if side == winning]
+        anchor = max(winning_bounds, key=lambda value: (value[2] - value[0]) * (value[3] - value[1]))
+        return winning, anchor
+
+    def get_chat_history(
+        self,
+        conversation: Optional[str] = None,
+        limit: int = 5,
+        runtime_id: str = "",
+        row_index: int = -1,
+    ) -> list[UiaChatMessage]:
+        bounded_limit = max(1, min(int(limit), 5))
+        if conversation and not self.locate_conversation(
+            conversation, runtime_id=runtime_id, row_index=row_index
+        ):
+            raise RuntimeError(f"Conversation is not visible: {conversation}")
+        owner = self.get_owner_info().nick_name
+        header = self.get_title()
+        messages: list[UiaChatMessage] = []
+        with self.operation_lock, self._uia_root() as root:
+            message_list = None
+            for control in self._walk(root):
+                if _text(control.AutomationId) == MESSAGE_LIST_ID:
+                    message_list = control
+                    break
+            if message_list is None:
+                raise RuntimeError("WeChat message list is unavailable")
+            list_bounds = _bounds(message_list)
+            for item in message_list.GetChildren():
+                class_name = _text(item.ClassName)
+                content = _text(item.Name)
+                if "Chat" not in class_name or "ItemView" not in class_name or not content:
+                    continue
+                direction, item_bounds = self._message_direction(item, list_bounds)
+                sender = owner if direction == "outgoing" else ""
+                if direction == "incoming" and header.header_type == "private":
+                    sender = header.title
+                if direction == "incoming" and header.header_type == "group":
+                    for child in item.GetChildren():
+                        candidate = _text(child.Name)
+                        if candidate and candidate != content and len(candidate) <= 80:
+                            sender = candidate
+                            break
+                messages.append(
+                    UiaChatMessage(
+                        sender_name=sender,
+                        content=content,
+                        message_type=self._message_type(class_name, content),
+                        direction=direction,
+                        runtime_id=_runtime_id(item),
+                        bounds=item_bounds,
+                        confidence="high" if direction != "unknown" else "medium",
+                    )
+                )
+        return messages[-bounded_limit:]
+
+    @contextmanager
+    def _clipboard(self, unicode_text: Optional[str] = None, files: Optional[Iterable[str]] = None):
+        import win32clipboard
+        import win32con
+
+        saved = []
+        win32clipboard.OpenClipboard()
+        try:
+            for fmt in (win32con.CF_UNICODETEXT, win32con.CF_TEXT, win32con.CF_HDROP):
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(fmt):
+                        saved.append((fmt, win32clipboard.GetClipboardData(fmt)))
+                except Exception:
+                    pass
+            win32clipboard.EmptyClipboard()
+            if files is not None:
+                win32clipboard.SetClipboardData(win32con.CF_HDROP, tuple(files))
+            else:
+                win32clipboard.SetClipboardText(str(unicode_text or ""), win32con.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+        try:
+            yield
+        finally:
+            try:
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                for fmt, value in saved:
+                    try:
+                        if fmt == win32con.CF_UNICODETEXT:
+                            win32clipboard.SetClipboardText(value, fmt)
+                        else:
+                            win32clipboard.SetClipboardData(fmt, value)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _input_value(control) -> str:
+        try:
+            pattern = control.GetValuePattern()
+            return str(pattern.Value or "") if pattern else ""
+        except Exception:
+            return ""
+
+    def _wait_for_input_value(self, control, predicate, timeout: float) -> bool:
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            if predicate(self._input_value(control)):
+                return True
+            time.sleep(0.05)
+        return predicate(self._input_value(control))
+
+    def _click_send_button(self, send_button):
+        """Click the visible Send button while restoring the user's cursor.
+
+        WeChat 4.x exposes InvokePattern on this button, but some releases
+        acknowledge Invoke() without actually sending. A real button click is
+        therefore the primary operation.
+        """
+        import win32api
+
+        cursor = None
+        try:
+            cursor = win32api.GetCursorPos()
+        except Exception:
+            pass
+        try:
+            send_button.Click(simulateMove=False, waitTime=0.1)
+        finally:
+            if cursor is not None:
+                try:
+                    win32api.SetCursorPos(cursor)
+                except Exception:
+                    pass
+
+    def _paste_and_send(self, expected_text: str = ""):
+        import win32api
+        import win32con
+
+        # Conversation selection and clipboard setup can take long enough for
+        # another window to steal focus. Reassert WeChat immediately before
+        # keyboard input and the physical Send-button click.
+        self.focus_window()
+        with self._uia_root() as root:
+            control = next(
+                (
+                    item
+                    for item in self._walk(root)
+                    if _text(item.AutomationId) == INPUT_ID
+                ),
+                None,
+            )
+            if control is None:
+                raise RuntimeError("WeChat chat input is unavailable")
+            control.SetFocus()
+            # The desktop channel owns the input for this atomic operation.
+            # Replace any stale draft left by an earlier failed UI action so
+            # replies can never be concatenated accidentally.
+            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+            win32api.keybd_event(ord("A"), 0, 0, 0)
+            win32api.keybd_event(ord("A"), 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+            win32api.keybd_event(ord("V"), 0, 0, 0)
+            win32api.keybd_event(ord("V"), 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            if expected_text and not self._wait_for_input_value(
+                control,
+                lambda value: value == expected_text,
+                1.0,
+            ):
+                raise RuntimeError("WeChat did not accept the pasted reply text")
+            self._paced_wait(
+                "uia_paste_settle_ms_min",
+                "uia_paste_settle_ms_max",
+                150,
+                300,
+            )
+            send_button = next(
+                (
+                    item
+                    for item in self._walk(root)
+                    if _text(item.ClassName) == "mmui::XOutlineButton"
+                    and _text(item.Name) in {"发送", "Send"}
+                ),
+                None,
+            )
+            if send_button is not None:
+                self._paced_wait(
+                    "uia_pre_send_settle_ms_min",
+                    "uia_pre_send_settle_ms_max",
+                    100,
+                    250,
+                )
+                self._click_send_button(send_button)
+            else:
+                win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
+                win32api.keybd_event(
+                    win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0
+                )
+            if expected_text and not self._wait_for_input_value(
+                control,
+                lambda value: not value,
+                1.5,
+            ):
+                raise RuntimeError("WeChat Send button did not clear the reply input")
+
+    def send_message(
+        self,
+        who: str,
+        message: str,
+        runtime_id: str = "",
+        row_index: int = -1,
+    ) -> dict:
+        text = str(message or "")
+        if not text:
+            raise ValueError("text is empty")
+        with self.operation_lock:
+            self._wait_for_send_slot(who)
+            self.focus_window()
+            if not self.locate_conversation(who, runtime_id, row_index):
+                raise RuntimeError(f"Conversation is not visible: {who}")
+            before = self.get_chat_history(limit=5)
+            with self._clipboard(unicode_text=text):
+                self._paste_and_send(expected_text=text)
+            result = self._verify_send(who, before, text=text)
+            now = time.monotonic()
+            self._last_send_at = now
+            self._last_conversation_send[str(who)] = now
+            return result
+
+    def send_file(
+        self,
+        who: str,
+        files: Iterable[str],
+        runtime_id: str = "",
+        row_index: int = -1,
+    ) -> dict:
+        paths = [str(Path(path).resolve()) for path in files]
+        if not paths or any(not Path(path).is_file() for path in paths):
+            raise ValueError("one or more files do not exist")
+        with self.operation_lock:
+            self._wait_for_send_slot(who)
+            self.focus_window()
+            if not self.locate_conversation(who, runtime_id, row_index):
+                raise RuntimeError(f"Conversation is not visible: {who}")
+            before = self.get_chat_history(limit=5)
+            with self._clipboard(files=paths):
+                self._paste_and_send()
+            result = self._verify_send(who, before, expected_type="file")
+            now = time.monotonic()
+            self._last_send_at = now
+            self._last_conversation_send[str(who)] = now
+            return result
+
+    def _verify_send(
+        self,
+        who: str,
+        before: list[UiaChatMessage],
+        text: str = "",
+        expected_type: str = "",
+    ) -> dict:
+        before_ids = {item.runtime_id for item in before if item.runtime_id}
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            time.sleep(0.15)
+            after = self.get_chat_history(limit=5)
+            for item in reversed(after):
+                is_new = not item.runtime_id or item.runtime_id not in before_ids
+                matches = (text and item.content == text) or (
+                    expected_type and item.message_type in {expected_type, "image"}
+                )
+                if is_new and matches and item.direction in {"outgoing", "unknown"}:
+                    return {
+                        "success": True,
+                        "verified": True,
+                        "confidence": "high" if item.direction == "outgoing" else "medium",
+                    }
+        return {
+            "success": True,
+            "verified": False,
+            "confidence": "medium",
+            "message": "UI action completed but the outgoing bubble was not verified",
+        }
