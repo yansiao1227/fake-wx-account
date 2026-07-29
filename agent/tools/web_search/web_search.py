@@ -1,12 +1,13 @@
-"""Web Search tool. Supports four backends with a unified response format:
+"""Web Search tool. Supports five backends with a unified response format:
   - bocha   (https://open.bochaai.com)
   - zhipu   (https://docs.bigmodel.cn/cn/guide/tools/web-search)
   - qianfan (https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy)
   - linkai  (https://link-ai.tech, fallback)
+  - ddgs    (keyless metasearch fallback)
 
 Provider selection
   - strategy 'auto' (default): pick the first configured provider in the
-    canonical order [bocha, zhipu, qianfan, linkai]. When the caller passes
+    canonical order [bocha, qianfan, zhipu, linkai, ddgs]. When the caller passes
     an explicit `provider` it overrides the pick; an invalid/unconfigured
     one silently falls back to the auto order.
   - strategy 'fixed': use the configured provider; if its credential is
@@ -17,13 +18,24 @@ Credentials
   - zhipu   : conf.zhipu_ai_api_key            ->  env ZHIPUAI_API_KEY
   - qianfan : conf.qianfan_api_key             ->  env QIANFAN_API_KEY
   - linkai  : conf.linkai_api_key              ->  env LINKAI_API_KEY
+  - ddgs    : no credential required; requires the ``ddgs`` Python package
 """
 
 import json
 import os
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
+
+try:
+    from ddgs import DDGS
+    from ddgs.exceptions import DDGSException
+except ImportError:  # Optional dependency; API-key providers still work.
+    DDGS = None
+
+    class DDGSException(Exception):
+        pass
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from common.log import logger
@@ -31,18 +43,23 @@ from config import conf
 
 
 DEFAULT_TIMEOUT = 30
+CITATION_POLICY = (
+    "When search results inform the answer, cite the supporting result URLs as "
+    "clickable source links. Do not present search-derived factual claims without citations."
+)
 
 # Canonical fallback order. Empirically ordered by Chinese real-time
 # quality + relevance: bocha (best overall), qianfan (best for hot news),
-# zhipu (strong on long-form articles), linkai (cloud aggregator, last
-# resort).
-PROVIDER_ORDER = ("bocha", "qianfan", "zhipu", "linkai")
+# zhipu (strong on long-form articles), linkai (cloud aggregator), then
+# DDGS as the keyless metasearch fallback.
+PROVIDER_ORDER = ("bocha", "qianfan", "zhipu", "linkai", "ddgs")
 
 PROVIDER_LABELS = {
     "bocha":   "Bocha",
     "zhipu":   "Zhipu",
     "qianfan": "Baidu Qianfan",
     "linkai":  "LinkAI",
+    "ddgs": "DDGS",
 }
 
 
@@ -73,8 +90,12 @@ def _get_api_key(provider: str) -> str:
 
 
 def configured_providers() -> List[str]:
-    """Return configured providers in canonical order."""
-    return [p for p in PROVIDER_ORDER if _get_api_key(p)]
+    """Return usable providers in canonical order.
+
+    Credentialed APIs are preferred. DDGS is intentionally last so it keeps
+    search available without replacing a configured API backend.
+    """
+    return [p for p in PROVIDER_ORDER if (p == "ddgs" and DDGS is not None) or _get_api_key(p)]
 
 
 def _configured_strategy() -> str:
@@ -89,7 +110,11 @@ class WebSearch(BaseTool):
     """Tool for searching the web across multiple providers."""
 
     name: str = "web_search"
-    description: str = "Search the web for real-time information. Returns titles, URLs, and snippets."
+    description: str = (
+        "Search the web for real-time information. Returns titles, URLs, and snippets. "
+        "When using these results in an answer, cite the supporting result URLs as "
+        "clickable source links; do not present search-derived factual claims without citations."
+    )
 
     params: dict = {
         "type": "object",
@@ -194,6 +219,13 @@ class WebSearch(BaseTool):
     # Entry point
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _attach_citation_policy(result: ToolResult) -> ToolResult:
+        """Keep the citation requirement visible after the tool call, not only in its schema."""
+        if result.status == "success" and isinstance(result.result, dict):
+            result.result.setdefault("citationPolicy", CITATION_POLICY)
+        return result
+
     def execute(self, args: Dict[str, Any]) -> ToolResult:
         query = (args.get("query") or "").strip()
         if not query:
@@ -225,18 +257,24 @@ class WebSearch(BaseTool):
 
         try:
             if provider == "bocha":
-                return self._search_bocha(query, count, freshness, summary)
-            if provider == "zhipu":
-                return self._search_zhipu(query, count, freshness)
-            if provider == "qianfan":
-                return self._search_qianfan(query, count, freshness)
-            if provider == "linkai":
-                return self._search_linkai(query, count, freshness)
-            return ToolResult.fail(f"Error: Unknown provider '{provider}'")
+                result = self._search_bocha(query, count, freshness, summary)
+            elif provider == "zhipu":
+                result = self._search_zhipu(query, count, freshness)
+            elif provider == "qianfan":
+                result = self._search_qianfan(query, count, freshness)
+            elif provider == "linkai":
+                result = self._search_linkai(query, count, freshness)
+            elif provider == "ddgs":
+                result = self._search_ddgs(query, count, freshness)
+            else:
+                return ToolResult.fail(f"Error: Unknown provider '{provider}'")
+            return self._attach_citation_policy(result)
         except requests.Timeout:
             return ToolResult.fail(f"Error: Search request timed out after {DEFAULT_TIMEOUT}s")
         except requests.ConnectionError:
             return ToolResult.fail("Error: Failed to connect to search API")
+        except DDGSException as e:
+            return ToolResult.fail(f"Error: DDGS search failed - {e}")
         except Exception as e:
             logger.error(f"[WebSearch] Unexpected error ({provider}): {e}", exc_info=True)
             return ToolResult.fail(f"Error: Search failed - {str(e)}")
@@ -484,4 +522,62 @@ class WebSearch(BaseTool):
         return ToolResult.success({
             "query": query, "backend": "linkai",
             "total": 1, "count": 1, "results": [{"content": str(raw)}],
+        })
+
+    # ------------------------------------------------------------------
+    # DDGS (keyless metasearch fallback)
+    # ------------------------------------------------------------------
+
+    def _search_ddgs(self, query: str, count: int, freshness: str) -> ToolResult:
+        if DDGS is None:
+            return ToolResult.fail(
+                "Error: ddgs library is required for keyless search. Install with: pip install ddgs"
+            )
+
+        timelimit = {
+            "oneDay": "d",
+            "oneWeek": "w",
+            "oneMonth": "m",
+            "oneYear": "y",
+        }.get(freshness)
+        kwargs: Dict[str, Any] = {
+            "region": (_tools_web_search_conf().get("ddgs_region") or "cn-zh").strip(),
+            "safesearch": "moderate",
+            "max_results": max(1, min(int(count or 10), 50)),
+            # DDGS "auto" may rotate engines between calls. Bing + Brave
+            # produced stable Chinese results in this deployment while DDGS
+            # still owns transport, parsing, aggregation, and ranking.
+            "backend": (_tools_web_search_conf().get("ddgs_backend") or "bing,brave").strip(),
+        }
+        if timelimit:
+            kwargs["timelimit"] = timelimit
+
+        logger.debug(
+            f"[WebSearch] ddgs: query='{query}', count={kwargs['max_results']}, "
+            f"freshness={freshness!r}"
+        )
+        rows = DDGS(timeout=DEFAULT_TIMEOUT).text(query, **kwargs) or []
+        results = []
+        for row in rows:
+            title = (row.get("title") or "").strip()
+            url = (row.get("href") or row.get("url") or "").strip()
+            if not title or not url:
+                continue
+            results.append({
+                "title": title,
+                "url": url,
+                "snippet": (row.get("body") or row.get("snippet") or "").strip(),
+                "siteName": row.get("source") or (urlparse(url).hostname or ""),
+                "datePublished": row.get("date") or "",
+            })
+
+        if not results:
+            return ToolResult.fail("Error: DDGS returned no results. Refine the query and try again.")
+
+        return ToolResult.success({
+            "query": query,
+            "backend": "ddgs",
+            "total": len(results),
+            "count": len(results),
+            "results": results,
         })

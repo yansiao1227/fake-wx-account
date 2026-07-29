@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import mimetypes
@@ -3030,13 +3031,14 @@ class ModelsHandler:
 
     # Canonical search provider order. Mirrors PROVIDER_ORDER in
     # agent/tools/web_search/web_search.py — keep them in sync.
-    _SEARCH_PROVIDERS = ("bocha", "qianfan", "zhipu", "linkai")
+    _SEARCH_PROVIDERS = ("bocha", "qianfan", "zhipu", "linkai", "ddgs")
 
     _SEARCH_PROVIDER_LABELS = {
         "bocha":   {"zh": "博查", "en": "Bocha"},
         "zhipu":   {"zh": "智谱", "en": "GLM"},
         "qianfan": {"zh": "百度千帆", "en": "ERNIE"},
         "linkai":  {"zh": "LinkAI", "en": "LinkAI"},
+        "ddgs": {"zh": "DDGS（免密钥）", "en": "DDGS (keyless)"},
     }
 
     @classmethod
@@ -3059,7 +3061,8 @@ class ModelsHandler:
         """Search is editable: pick auto (default) or pin a specific backend.
         Providers reuse model-vendor keys (zhipu/qianfan/linkai) so they show
         up as configured once the user adds those vendors; bocha keeps its
-        own key under tools.web_search."""
+        own key under tools.web_search; DDGS is available without a key when
+        its Python package is installed."""
         tools_cfg = local_config.get("tools") or {}
         ws_cfg = tools_cfg.get("web_search") or {} if isinstance(tools_cfg, dict) else {}
         if not isinstance(ws_cfg, dict):
@@ -3067,17 +3070,22 @@ class ModelsHandler:
 
         providers = []
         configured_ids = []
+        ddgs_available = importlib.util.find_spec("ddgs") is not None
         for pid in cls._SEARCH_PROVIDERS:
-            ok = cls._is_real_key(cls._search_provider_key(pid, local_config))
+            keyless = pid == "ddgs"
+            ok = (keyless and ddgs_available) or cls._is_real_key(
+                cls._search_provider_key(pid, local_config)
+            )
             raw_key = cls._search_provider_key(pid, local_config) if ok else ""
             providers.append({
                 "id": pid,
                 "label": cls._SEARCH_PROVIDER_LABELS.get(pid, pid),
                 "configured": ok,
-                # bocha owns its key under tools.web_search; the other three
-                # piggy-back on a model-vendor credential. Frontend uses
-                # this hint to decide which credential editor to surface.
+                # bocha owns its key under tools.web_search; three providers
+                # piggy-back on model-vendor credentials; DDGS is keyless.
+                # Frontend uses these hints to select a credential editor.
                 "needs_dedicated_key": pid == "bocha",
+                "keyless": keyless,
                 "api_key_masked": ConfigHandler._mask_key(raw_key) if raw_key else "",
             })
             if ok:
@@ -4285,8 +4293,7 @@ class SkillsHandler:
             from agent.skills.service import SkillService
             from agent.skills.manager import SkillManager
             from common import i18n
-            workspace_root = _get_workspace_root()
-            manager = SkillManager(custom_dir=os.path.join(workspace_root, "skills"))
+            manager = SkillManager()
             service = SkillService(manager)
             skills = service.query()
             if i18n.get_language() == i18n.ZH_HANT:
@@ -4311,8 +4318,7 @@ class SkillsHandler:
             name = body.get("name")
             if not action or not name:
                 return json.dumps({"status": "error", "message": "action and name are required"})
-            workspace_root = _get_workspace_root()
-            manager = SkillManager(custom_dir=os.path.join(workspace_root, "skills"))
+            manager = SkillManager()
             service = SkillService(manager)
             if action == "open":
                 service.open({"name": name})

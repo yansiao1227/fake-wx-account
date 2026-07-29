@@ -10,6 +10,7 @@ from common.log import logger
 from agent.skills.types import Skill, SkillEntry, SkillSnapshot
 from agent.skills.loader import SkillLoader
 from agent.skills.formatter import format_skill_entries_for_prompt
+from agent.skills.paths import get_project_skills_dir
 
 SKILLS_CONFIG_FILE = "skills_config.json"
 
@@ -26,13 +27,16 @@ class SkillManager:
         """
         Initialize the skill manager.
 
-        :param builtin_dir: Built-in skills directory (project root ``skills/``)
-        :param custom_dir: Custom skills directory (workspace ``skills/``)
+        :param builtin_dir: Optional read-only skills directory loaded first
+        :param custom_dir: Managed skills directory; defaults to project ``skills/``
         :param config: Configuration dictionary
         """
-        project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        self.builtin_dir = builtin_dir or os.path.join(project_root, 'skills')
-        self.custom_dir = custom_dir or os.path.join(project_root, 'workspace', 'skills')
+        # Project skills are the canonical, writable registry.  ``builtin_dir``
+        # remains available for callers that explicitly need a lower-priority
+        # read-only source, but it is disabled by default to avoid scanning the
+        # project directory twice.
+        self.builtin_dir = builtin_dir if builtin_dir is not None else ""
+        self.custom_dir = custom_dir if custom_dir is not None else get_project_skills_dir()
         self.config = config or {}
         self._skills_config_path = os.path.join(self.custom_dir, SKILLS_CONFIG_FILE)
 
@@ -312,39 +316,6 @@ class SkillManager:
             resolved_skills=resolved_skills,
             version=version,
         )
-    
-    def sync_skills_to_workspace(self, target_workspace_dir: str):
-        """
-        Sync all loaded skills to a target workspace directory.
-        
-        This is useful for sandbox environments where skills need to be copied.
-        
-        :param target_workspace_dir: Target workspace directory
-        """
-        import shutil
-        
-        target_skills_dir = os.path.join(target_workspace_dir, 'skills')
-        
-        # Remove existing skills directory
-        if os.path.exists(target_skills_dir):
-            shutil.rmtree(target_skills_dir)
-        
-        # Create new skills directory
-        os.makedirs(target_skills_dir, exist_ok=True)
-        
-        # Copy each skill
-        for entry in self.skills.values():
-            skill_name = entry.skill.name
-            source_dir = entry.skill.base_dir
-            target_dir = os.path.join(target_skills_dir, skill_name)
-            
-            try:
-                shutil.copytree(source_dir, target_dir)
-                logger.debug(f"Synced skill '{skill_name}' to {target_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to sync skill '{skill_name}': {e}")
-        
-        logger.info(f"Synced {len(self.skills)} skills to {target_skills_dir}")
     
     def get_skill_by_key(self, skill_key: str) -> Optional[SkillEntry]:
         """

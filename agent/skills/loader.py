@@ -227,7 +227,7 @@ class SkillLoader:
 
         Precedence (lowest to highest):
         1. builtin  — project root ``skills/``, shipped with the codebase
-        2. custom   — workspace ``skills/``, installed via cloud console or skill creator
+        2. custom   — canonical project ``skills/`` registry
 
         Same-name custom skills override builtin ones.
 

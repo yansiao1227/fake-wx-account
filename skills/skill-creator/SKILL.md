@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: Create, install, or update skills in the workspace. Use when (1) installing a skill from a URL or remote source, (2) creating a new skill from scratch, (3) updating or restructuring existing skills. Always use this skill for any skill installation or creation task.
+description: Create, install, or update skills in the project skills directory. Use when (1) installing a skill from a URL or remote source, (2) creating a new skill from scratch, or (3) updating or restructuring existing skills. Always use this skill for any skill installation or creation task.
 license: Complete terms in LICENSE.txt
 ---
 
@@ -95,7 +95,7 @@ Do NOT create auxiliary documentation files:
 
 ## Installing a Skill
 
-Install target directory: `<workspace>/skills/<name>/` (the `<workspace>` is from the "工作空间" section).
+Install target directory: `<project-root>/skills/<name>/`, where `<project-root>` is the repository root containing `app.py`.
 
 ### Step 1 — Obtain skill content
 
@@ -110,8 +110,8 @@ Install target directory: `<workspace>/skills/<name>/` (the `<workspace>` is fro
 
 1. Locate the SKILL.md (may be at top level or inside a subdirectory)
 2. Extract `name` from YAML frontmatter
-3. Copy the **entire skill directory** (SKILL.md and all sibling files/folders such as `references/`, `scripts/`, `assets/`, etc.) into `<workspace>/skills/<name>/`
-4. If an install/setup file exists (e.g. INSTALL.md), follow its instructions — the final result must still end up in `<workspace>/skills/<name>/`
+3. Copy the **entire skill directory** (SKILL.md and all sibling files/folders such as `references/`, `scripts/`, `assets/`, etc.) into `<project-root>/skills/<name>/`
+4. If an install/setup file exists (e.g. INSTALL.md), follow its instructions — the final result must still end up in `<project-root>/skills/<name>/`
 
 ## Skill Creation Process (from scratch)
 
@@ -199,12 +199,12 @@ scripts/init_skill.py <skill-name> --path <output-directory> [--resources script
 Examples:
 
 ```bash
-scripts/init_skill.py my-skill --path <workspace>/skills
-scripts/init_skill.py my-skill --path <workspace>/skills --resources scripts,references
-scripts/init_skill.py my-skill --path <workspace>/skills --resources scripts --examples
+scripts/init_skill.py my-skill --path <project-root>/skills
+scripts/init_skill.py my-skill --path <project-root>/skills --resources scripts,references
+scripts/init_skill.py my-skill --path <project-root>/skills --resources scripts --examples
 ```
 
-Where `<workspace>` is your workspace directory shown in the "工作空间" section of the system prompt.
+Where `<project-root>` is the repository root containing `app.py`.
 
 The script:
 
@@ -215,7 +215,7 @@ The script:
 
 After initialization, customize the SKILL.md and add resources as needed. If you used `--examples`, replace or delete placeholder files.
 
-**Important**: Always create skills in workspace skills directory (`<workspace>/skills`), NOT in project directory. Check the "工作空间" section for the actual workspace path.
+**Important**: Always create skills in the project skills directory (`<project-root>/skills`), not under the agent workspace or user home directory.
 
 ### Step 4: Edit the Skill
 
@@ -378,7 +378,7 @@ scripts/quick_validate.py <path/to/skill-folder>
 Example:
 
 ```bash
-scripts/quick_validate.py <workspace>/skills/weather-api
+scripts/quick_validate.py <project-root>/skills/weather-api
 ```
 
 Validation checks:

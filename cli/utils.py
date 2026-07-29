@@ -19,13 +19,13 @@ def get_workspace_dir() -> str:
 
 
 def get_skills_dir() -> str:
-    """Get the custom skills directory."""
-    return os.path.join(get_workspace_dir(), "skills")
+    """Get the canonical project skills directory."""
+    return os.path.join(get_project_root(), "skills")
 
 
 def get_builtin_skills_dir() -> str:
-    """Get the builtin skills directory."""
-    return os.path.join(get_project_root(), "skills")
+    """Backward-compatible alias for the canonical skills directory."""
+    return get_skills_dir()
 
 
 def load_config_json() -> dict:
@@ -57,7 +57,7 @@ def get_cli_language() -> str:
 
 
 def load_skills_config() -> dict:
-    """Load skills_config.json from the custom skills directory."""
+    """Load skills_config.json from the project skills directory."""
     path = os.path.join(get_skills_dir(), "skills_config.json")
     if not os.path.exists(path):
         return {}

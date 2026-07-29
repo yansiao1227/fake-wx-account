@@ -279,7 +279,7 @@ def main():
         print("  - Max 40 characters")
         print("  - Must match directory name exactly")
         print("\nExamples:")
-        print("  init_skill.py my-new-skill --path workspace/skills")
+        print("  init_skill.py my-new-skill --path <project-root>/skills")
         print("  init_skill.py my-api-helper --path /path/to/skills")
         print("  init_skill.py custom-skill --path /custom/location")
         sys.exit(1)

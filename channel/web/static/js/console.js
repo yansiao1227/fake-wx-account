@@ -5512,9 +5512,8 @@ function _searchProviderLabel(cap, providerId) {
 
 // Search card body: strategy picker + (when fixed) provider picker + a
 // status row that surfaces which providers are ready and how to add the
-// missing ones. Three of the four backends piggy-back on model-vendor
-// credentials (zhipu / qianfan / linkai); bocha owns its own key under
-// tools.web_search and gets its own minimal credential modal.
+// missing ones. Zhipu / qianfan / linkai piggy-back on model-vendor
+// credentials; bocha owns its own key; DDGS is keyless.
 function renderSearchCapability(def, cap, body) {
     const providers = cap.providers || [];
     const configuredIds = cap.configured_providers || [];
@@ -5657,6 +5656,7 @@ function _renderSearchSummary(body, cap) {
             ev.preventDefault();
             const pid = el.getAttribute('data-search-edit-provider');
             const meta = (cap.providers || []).find(p => p.id === pid);
+            if (meta && meta.keyless) return;
             _launchSearchProviderConfig(pid, meta);
         });
     });

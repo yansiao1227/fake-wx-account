@@ -75,14 +75,11 @@ Instructions, examples, and usage patterns...
 | `metadata.cow.requires.config` | Required config paths |
 | `metadata.cow.os` | Supported OS (e.g., `["darwin", "linux"]`) |
 
-## Skill Loading Order
+## Skill Location
 
-Skills are loaded from two locations (higher precedence overrides lower):
-
-1. **Builtin skills** (lower): `<project_root>/skills/` — shipped with the codebase
-2. **Custom skills** (higher): `~/cow/skills/` — installed via `cow skill install` or skill creator
-
-Skills with the same name in the custom directory override builtin ones.
+All skills are loaded from the canonical project directory: `<project-root>/skills/`.
+The CLI, web console, cloud management service, and skill creator all install
+and manage skills in this same directory.
 
 ## Create & Contribute
 

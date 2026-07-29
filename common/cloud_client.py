@@ -57,10 +57,7 @@ class CloudClient(LinkAIClient):
             try:
                 from agent.skills.manager import SkillManager
                 from agent.skills.service import SkillService
-                from config import conf
-                from common.utils import expand_path
-                workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-                manager = SkillManager(custom_dir=os.path.join(workspace_root, "skills"))
+                manager = SkillManager()
                 self._skill_service = SkillService(manager)
                 logger.debug("[CloudClient] SkillService initialised")
             except Exception as e:

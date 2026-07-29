@@ -64,8 +64,9 @@ class MemoryConfig:
         return index_dir / "index.db"
     
     def get_skills_dir(self) -> Path:
-        """Get skills directory"""
-        return self.get_workspace() / "skills"
+        """Get the canonical project skills directory."""
+        from agent.skills.paths import get_project_skills_dir
+        return Path(get_project_skills_dir())
     
     def get_agent_workspace(self, agent_name: Optional[str] = None) -> Path:
         """

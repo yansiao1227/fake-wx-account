@@ -30,7 +30,7 @@ class Agent:
         :param context_reserve_tokens: Reserve tokens for new requests (default: None, auto-calculated)
         :param memory_manager: Optional MemoryManager instance for memory operations
         :param name: [Deprecated] The name of the agent (no longer used in single-agent system)
-        :param workspace_dir: Optional workspace directory for workspace-specific skills
+        :param workspace_dir: Optional workspace directory for memory and generated files
         :param skill_manager: Optional SkillManager instance (will be created if None and enable_skills=True)
         :param enable_skills: Whether to enable skills support (default: True)
         :param runtime_info: Optional runtime info dict (with _get_current_time callable for dynamic time)
@@ -67,8 +67,7 @@ class Agent:
                 # Auto-create skill manager
                 try:
                     from agent.skills import SkillManager
-                    custom_dir = os.path.join(workspace_dir, "skills") if workspace_dir else None
-                    self.skill_manager = SkillManager(custom_dir=custom_dir)
+                    self.skill_manager = SkillManager()
                     logger.debug(f"Initialized SkillManager with {len(self.skill_manager.skills)} skills")
                 except Exception as e:
                     logger.warning(f"Failed to initialize SkillManager: {e}")

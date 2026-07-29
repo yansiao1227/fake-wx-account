@@ -451,10 +451,10 @@ class AgentInitializer:
                 logger.warning(f"[AgentInitializer] Failed to inject scheduler dependencies: {e}")
     
     def _initialize_skill_manager(self, workspace_root: str, session_id: Optional[str] = None):
-        """Initialize skill manager"""
+        """Initialize the project-owned skill manager."""
         try:
             from agent.skills import SkillManager
-            skill_manager = SkillManager(custom_dir=os.path.join(workspace_root, "skills"))
+            skill_manager = SkillManager()
             return skill_manager
         except Exception as e:
             logger.warning(f"[AgentInitializer] Failed to initialize SkillManager: {e}")

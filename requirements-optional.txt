@@ -19,8 +19,16 @@ google-generativeai
 pypdf
 python-docx
 openpyxl
+pandas
+xlrd
+pyxlsb
+defusedxml
+lxml
 python-pptx
 
 # i18n: Traditional Chinese (zh-Hant) high-quality conversion
 # Built-in fallback provides basic conversion without this dependency
 opencc-python-reimplemented
+
+# keyless metasearch fallback for web_search
+ddgs>=9.14.4
