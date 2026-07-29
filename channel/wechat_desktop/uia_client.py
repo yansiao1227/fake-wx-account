@@ -1080,6 +1080,7 @@ class WechatUiaClient:
         import win32con
 
         saved = []
+        clipboard_error = ""
         win32clipboard.OpenClipboard()
         try:
             for fmt in (win32con.CF_UNICODETEXT, win32con.CF_TEXT, win32con.CF_HDROP):
@@ -1092,10 +1093,21 @@ class WechatUiaClient:
             if files is not None:
                 win32clipboard.SetClipboardData(win32con.CF_HDROP, tuple(files))
             else:
-                win32clipboard.SetClipboardText(str(unicode_text or ""), win32con.CF_UNICODETEXT)
+                expected = str(unicode_text or "")
+                win32clipboard.SetClipboardText(expected, win32con.CF_UNICODETEXT)
+                actual = str(
+                    win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT) or ""
+                )
+                if actual != expected:
+                    clipboard_error = (
+                        "clipboard verification failed: "
+                        f"expected_chars={len(expected)} actual_chars={len(actual)}"
+                    )
         finally:
             win32clipboard.CloseClipboard()
         try:
+            if clipboard_error:
+                raise RuntimeError(clipboard_error)
             yield
         finally:
             try:
@@ -1117,11 +1129,18 @@ class WechatUiaClient:
 
     @staticmethod
     def _input_value(control) -> str:
+        _available, value = WechatUiaClient._try_input_value(control)
+        return value
+
+    @staticmethod
+    def _try_input_value(control) -> tuple[bool, str]:
         try:
             pattern = control.GetValuePattern()
-            return str(pattern.Value or "") if pattern else ""
+            if pattern is None:
+                return False, ""
+            return True, str(pattern.Value or "")
         except Exception:
-            return ""
+            return False, ""
 
     def _wait_for_input_value(self, control, predicate, timeout: float) -> bool:
         deadline = time.time() + max(0.0, timeout)
@@ -1141,6 +1160,67 @@ class WechatUiaClient:
             .replace("\u00a0", " ")
             .replace("\u2007", " ")
             .replace("\u202f", " ")
+        )
+
+    @staticmethod
+    def _split_message_text(value: str, limit: int) -> list[str]:
+        """Split long replies at readable boundaries without exceeding limit."""
+        text = str(value or "").strip()
+        limit = max(100, int(limit))
+        chunks = []
+        while len(text) > limit:
+            minimum_cut = max(1, int(limit * 0.6))
+            cut = -1
+            for marker in ("\n\n", "\n", "。", "！", "？", ";", "；", ",", "，"):
+                candidate = text.rfind(marker, minimum_cut, limit + 1)
+                if candidate >= minimum_cut:
+                    candidate += len(marker)
+                    cut = max(cut, candidate)
+            if cut < minimum_cut:
+                cut = limit
+            chunks.append(text[:cut].rstrip())
+            text = text[cut:].lstrip()
+        if text:
+            chunks.append(text)
+        return chunks
+
+    @staticmethod
+    def _keyboard_focus_state(control) -> Optional[bool]:
+        try:
+            return bool(control.HasKeyboardFocus)
+        except Exception:
+            return None
+
+    def _wait_for_keyboard_focus(self, control, timeout: float = 0.25) -> Optional[bool]:
+        state = self._keyboard_focus_state(control)
+        if state is None or state:
+            return state
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            time.sleep(0.025)
+            state = self._keyboard_focus_state(control)
+            if state is None or state:
+                return state
+        return self._keyboard_focus_state(control)
+
+    def _press_shortcut(self, win32api, win32con, key: int) -> None:
+        win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+        self._paced_wait(
+            "uia_key_event_settle_ms_min",
+            "uia_key_event_settle_ms_max",
+            20,
+            40,
+        )
+        win32api.keybd_event(key, 0, 0, 0)
+        win32api.keybd_event(key, 0, win32con.KEYEVENTF_KEYUP, 0)
+        self._paced_wait(
+            "uia_key_event_settle_ms_min",
+            "uia_key_event_settle_ms_max",
+            20,
+            40,
+        )
+        win32api.keybd_event(
+            win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0
         )
 
     def _click_send_button(self, send_button):
@@ -1172,59 +1252,94 @@ class WechatUiaClient:
 
         def paste_into(control) -> None:
             control.SetFocus()
-            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-            win32api.keybd_event(ord("A"), 0, 0, 0)
-            win32api.keybd_event(ord("A"), 0, win32con.KEYEVENTF_KEYUP, 0)
-            win32api.keybd_event(
-                win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0
+            self._paced_wait(
+                "uia_input_focus_settle_ms_min",
+                "uia_input_focus_settle_ms_max",
+                50,
+                100,
             )
-            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
-            win32api.keybd_event(ord("V"), 0, 0, 0)
-            win32api.keybd_event(ord("V"), 0, win32con.KEYEVENTF_KEYUP, 0)
-            win32api.keybd_event(
-                win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0
-            )
+            focus_state = self._wait_for_keyboard_focus(control)
+            if focus_state is False:
+                logger.warning(
+                    "[WechatDesktop] chat input did not report keyboard focus; "
+                    "retrying SetFocus before paste"
+                )
+                control.SetFocus()
+                self._paced_wait(
+                    "uia_input_focus_settle_ms_min",
+                    "uia_input_focus_settle_ms_max",
+                    50,
+                    100,
+                )
+            self._press_shortcut(win32api, win32con, ord("A"))
+            self._press_shortcut(win32api, win32con, ord("V"))
 
         # Conversation selection and clipboard setup can take long enough for
         # another window to steal focus. Reassert WeChat immediately before
         # keyboard input and the physical Send-button click.
-        self.focus_window()
-        with self._uia_root() as root:
-            control = next(
-                (
-                    item
-                    for item in self._walk(root)
-                    if _text(item.AutomationId) == INPUT_ID
-                ),
-                None,
-            )
-            if control is None:
-                raise RuntimeError("WeChat chat input is unavailable")
-            # The desktop channel owns the input for this atomic operation.
-            # Replace any stale draft left by an earlier failed UI action so
-            # replies can never be concatenated accidentally.
-            paste_into(control)
-            actual_text = ""
+        attempts = max(1, min(int(self.config.get("uia_paste_attempts", 3)), 5))
+        for attempt in range(1, attempts + 1):
+            self.focus_window()
+            with self._uia_root() as root:
+                control = next(
+                    (
+                        item
+                        for item in self._walk(root)
+                        if _text(item.AutomationId) == INPUT_ID
+                    ),
+                    None,
+                )
+                if control is None:
+                    raise RuntimeError("WeChat chat input is unavailable")
 
-            def capture_nonempty(value: str) -> bool:
-                nonlocal actual_text
-                actual_text = value
-                return bool(value)
-
-            if expected_text and not self._wait_for_input_value(
-                control, capture_nonempty, 1.0
-            ):
-                # A transient focus or clipboard miss is common enough to
-                # justify one bounded retry. Ctrl+A prevents concatenating a
-                # late first paste with the retry.
+                # The desktop channel owns the input for this atomic operation.
+                # Replace stale drafts and reacquire both the window and control
+                # on every attempt so a transient focus loss cannot poison retries.
                 paste_into(control)
-                if not self._wait_for_input_value(
-                    control, capture_nonempty, 1.0
-                ):
-                    raise RuntimeError("WeChat chat input remained empty after retry")
-            if expected_text:
-                if self._normalize_input_text(actual_text) != self._normalize_input_text(
+                value_available, _value = self._try_input_value(control)
+                actual_text = ""
+
+                def capture_nonempty(value: str) -> bool:
+                    nonlocal actual_text
+                    actual_text = value
+                    return bool(value)
+
+                accepted = (
+                    not expected_text
+                    or not value_available
+                    or self._wait_for_input_value(control, capture_nonempty, 1.25)
+                )
+                if not accepted:
+                    try:
+                        import win32gui
+
+                        foreground_hwnd = int(win32gui.GetForegroundWindow() or 0)
+                    except Exception:
+                        foreground_hwnd = 0
+                    logger.warning(
+                        "[WechatDesktop] paste attempt %s/%s left input empty: "
+                        "chars=%s foreground_hwnd=%s keyboard_focus=%s value_pattern=%s",
+                        attempt,
+                        attempts,
+                        len(expected_text),
+                        foreground_hwnd,
+                        self._keyboard_focus_state(control),
+                        value_available,
+                    )
+                    if attempt < attempts:
+                        self._paced_wait(
+                            "uia_paste_retry_ms_min",
+                            "uia_paste_retry_ms_max",
+                            150,
+                            300,
+                        )
+                    continue
+
+                if (
                     expected_text
+                    and value_available
+                    and self._normalize_input_text(actual_text)
+                    != self._normalize_input_text(expected_text)
                 ):
                     logger.warning(
                         "[WechatDesktop] pasted reply text differs from the source; "
@@ -1232,40 +1347,47 @@ class WechatUiaClient:
                         expected_text,
                         actual_text,
                     )
-            self._paced_wait(
-                "uia_paste_settle_ms_min",
-                "uia_paste_settle_ms_max",
-                150,
-                300,
-            )
-            send_button = next(
-                (
-                    item
-                    for item in self._walk(root)
-                    if _text(item.ClassName) == "mmui::XOutlineButton"
-                    and _text(item.Name) in {"发送", "Send"}
-                ),
-                None,
-            )
-            if send_button is not None:
                 self._paced_wait(
-                    "uia_pre_send_settle_ms_min",
-                    "uia_pre_send_settle_ms_max",
-                    100,
-                    250,
+                    "uia_paste_settle_ms_min",
+                    "uia_paste_settle_ms_max",
+                    150,
+                    300,
                 )
-                self._click_send_button(send_button)
-            else:
-                win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
-                win32api.keybd_event(
-                    win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0
+                send_button = next(
+                    (
+                        item
+                        for item in self._walk(root)
+                        if _text(item.ClassName) == "mmui::XOutlineButton"
+                        and _text(item.Name) in {"发送", "Send"}
+                    ),
+                    None,
                 )
-            if expected_text and not self._wait_for_input_value(
-                control,
-                lambda value: not value,
-                1.5,
-            ):
-                raise RuntimeError("WeChat Send button did not clear the reply input")
+                if send_button is not None:
+                    self._paced_wait(
+                        "uia_pre_send_settle_ms_min",
+                        "uia_pre_send_settle_ms_max",
+                        100,
+                        250,
+                    )
+                    self._click_send_button(send_button)
+                else:
+                    win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
+                    win32api.keybd_event(
+                        win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0
+                    )
+                if (
+                    expected_text
+                    and value_available
+                    and not self._wait_for_input_value(
+                        control, lambda value: not value, 1.5
+                    )
+                ):
+                    raise RuntimeError("WeChat Send button did not clear the reply input")
+                return
+
+        raise RuntimeError(
+            f"WeChat chat input remained empty after {attempts} attempts"
+        )
 
     def send_message(
         self,
@@ -1277,21 +1399,49 @@ class WechatUiaClient:
         text = str(message or "")
         if not text:
             raise ValueError("text is empty")
+        chunk_limit = max(
+            100,
+            min(int(self.config.get("uia_text_chunk_chars", 500)), 2000),
+        )
+        chunks = self._split_message_text(text, chunk_limit)
         with self.operation_lock:
-            self._wait_for_send_slot(who)
-            self.focus_window()
-            if not self.locate_conversation(who, runtime_id, row_index):
-                raise RuntimeError(f"Conversation is not visible: {who}")
-            before = self.get_chat_history(limit=5)
-            with self._clipboard(unicode_text=text):
-                self._paste_and_send(expected_text=text)
-            result = self._verify_send(who, before, text=text)
-            now = time.monotonic()
-            self._last_send_at = now
-            self._last_conversation_send[str(who)] = now
-            if result.get("verified"):
-                self.remember_outgoing_text(who, text)
-            return result
+            logger.info(
+                "[WechatDesktop] sending text: target=%s chars=%s chunks=%s "
+                "chunk_lengths=%s content_hash=%s",
+                who,
+                len(text),
+                len(chunks),
+                [len(chunk) for chunk in chunks],
+                hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+            )
+            results = []
+            for index, chunk in enumerate(chunks, 1):
+                try:
+                    self._wait_for_send_slot(who)
+                    self.focus_window()
+                    if not self.locate_conversation(who, runtime_id, row_index):
+                        raise RuntimeError(f"Conversation is not visible: {who}")
+                    before = self.get_chat_history(limit=5)
+                    with self._clipboard(unicode_text=chunk):
+                        self._paste_and_send(expected_text=chunk)
+                    result = self._verify_send(who, before, text=chunk)
+                    results.append(result)
+                    now = time.monotonic()
+                    self._last_send_at = now
+                    self._last_conversation_send[str(who)] = now
+                    if result.get("verified"):
+                        self.remember_outgoing_text(who, chunk)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"WeChat text chunk {index}/{len(chunks)} failed: {exc}"
+                    ) from exc
+            verified = all(result.get("verified") for result in results)
+            return {
+                "success": True,
+                "verified": verified,
+                "chunks": len(chunks),
+                "message": "" if verified else "one or more outgoing chunks were not verified",
+            }
 
     def send_file(
         self,

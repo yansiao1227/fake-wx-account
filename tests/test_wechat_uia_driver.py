@@ -203,6 +203,109 @@ def test_paste_retries_once_when_input_remains_empty(monkeypatch):
     assert state == {"value": "", "paste_count": 2, "click_count": 1}
 
 
+def test_long_message_split_prefers_readable_boundaries():
+    text = ("A" * 280) + "。" + ("B" * 280) + "\n\n" + ("C" * 280)
+
+    chunks = WechatUiaClient._split_message_text(text, 500)
+
+    assert len(chunks) == 2
+    assert all(len(chunk) <= 500 for chunk in chunks)
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_paste_retry_reacquires_window_and_input(monkeypatch):
+    import win32api
+
+    state = {"value": "", "paste_count": 0, "focus_count": 0, "root_count": 0}
+
+    class Input(GeometryControl):
+        HasKeyboardFocus = True
+
+        def SetFocus(self):
+            pass
+
+        def GetValuePattern(self):
+            return SimpleNamespace(Value=state["value"])
+
+    class Button(GeometryControl):
+        def Click(self, **_kwargs):
+            state["value"] = ""
+
+    input_control = Input((0, 0, 100, 50), automation_id="chat_input_field")
+    send_button = Button(
+        (100, 0, 150, 50), name="发送", class_name="mmui::XOutlineButton"
+    )
+    client = WechatUiaClient({"uia_paste_attempts": 3})
+
+    @contextmanager
+    def fake_root():
+        state["root_count"] += 1
+        yield object()
+
+    def keybd_event(key, _scan, flags, _extra):
+        if key == ord("V") and flags == 0:
+            state["paste_count"] += 1
+            if state["paste_count"] == 2:
+                state["value"] = "retry succeeded"
+
+    def focus_window():
+        state["focus_count"] += 1
+
+    monkeypatch.setattr(win32api, "keybd_event", keybd_event)
+    monkeypatch.setattr(client, "focus_window", focus_window)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_walk", lambda _root: iter((input_control, send_button)))
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(
+        client,
+        "_wait_for_input_value",
+        lambda control, predicate, _timeout: predicate(client._input_value(control)),
+    )
+
+    client._paste_and_send("retry succeeded")
+
+    assert state["paste_count"] == 2
+    assert state["focus_count"] == 2
+    assert state["root_count"] == 2
+
+
+def test_send_message_splits_and_verifies_each_chunk(monkeypatch):
+    client = WechatUiaClient({"uia_text_chunk_chars": 100})
+    pasted = []
+    verified = []
+
+    @contextmanager
+    def fake_clipboard(unicode_text=None, files=None):
+        assert files is None
+        pasted.append(unicode_text)
+        yield
+
+    monkeypatch.setattr(client, "_wait_for_send_slot", lambda _who: None)
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "_clipboard", fake_clipboard)
+    monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
+
+    def verify(_who, _before, text="", expected_type=""):
+        assert not expected_type
+        verified.append(text)
+        return {"success": True, "verified": True}
+
+    monkeypatch.setattr(client, "_verify_send", verify)
+
+    result = client.send_message("target", "X" * 240)
+
+    assert [len(chunk) for chunk in pasted] == [100, 100, 40]
+    assert verified == pasted
+    assert result == {
+        "success": True,
+        "verified": True,
+        "chunks": 3,
+        "message": "",
+    }
+
+
 class GeometryControl:
     def __init__(
         self,
