@@ -48,7 +48,10 @@ DEFAULT_CONFIG = {
     "uia_history_settle_ms_min": 800,
     "uia_history_settle_ms_max": 1300,
     "shell_hook_reconcile_seconds": 15,
+    "shell_hook_reconcile_enabled": False,
     "shell_hook_debounce_ms": 250,
+    "reply_monitor_interval_seconds": 1.0,
+    "active_conversation_burst_limit": 5,
     "auto_reply_private_all": False,
     "auto_reply_groups_all": False,
     "auto_reply_blacklist": [],
@@ -65,6 +68,9 @@ DEFAULT_CONFIG = {
     "shadow_mode": True,
     "auto_send_images": False,
     "analyze_incoming_images": True,
+    "uia_file_download_enabled": True,
+    "uia_file_download_timeout_seconds": 10,
+    "attachment_debounce_ms": 800,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
@@ -110,7 +116,11 @@ class WechatDesktopChannel(ChatChannel):
             self.config.update(configured)
         self._stop_event = threading.Event()
         self._driver = WechatUiaDriver(self.config)
-        self._reply_queue = WechatReplyQueue()
+        self._reply_queue = WechatReplyQueue(
+            int(self.config.get("active_conversation_burst_limit", 5))
+        )
+        self._pending_attachment_lock = threading.RLock()
+        self._pending_attachments = {}
         self._queue_thread = None
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
@@ -158,7 +168,9 @@ class WechatDesktopChannel(ChatChannel):
                 "[WechatDesktop] unable to bring WeChat to the foreground at startup: %s",
                 exc,
             )
-        self._reply_queue = WechatReplyQueue()
+        self._reply_queue = WechatReplyQueue(
+            int(self.config.get("active_conversation_burst_limit", 5))
+        )
         self._queue_thread = threading.Thread(
             target=self._consume_reply_queue,
             name="cow-wechat-reply-fifo",
@@ -197,7 +209,8 @@ class WechatDesktopChannel(ChatChannel):
         )
         self._trace(
             "00-startup",
-            "reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
+            "reconcile_enabled=%s reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
+            bool(self.config.get("shell_hook_reconcile_enabled", False)),
             self.config.get("shell_hook_reconcile_seconds"),
             bool(self.config.get("auto_reply_private_all")),
             self.config.get("group_reply_mode"),
@@ -218,6 +231,10 @@ class WechatDesktopChannel(ChatChannel):
 
     def stop(self):
         self._stop_event.set()
+        with self._pending_attachment_lock:
+            for _, timer in self._pending_attachments.values():
+                timer.cancel()
+            self._pending_attachments.clear()
         discarded = self._reply_queue.stop()
         close = getattr(self._driver, "close", None)
         if close:
@@ -361,30 +378,7 @@ class WechatDesktopChannel(ChatChannel):
                 event.conversation_name,
                 event.source_type,
             )
-            enqueue_result = self._reply_queue.enqueue(event)
-            if enqueue_result:
-                if enqueue_result.cancel_event_id:
-                    try:
-                        from agent.protocol import get_cancel_registry
-
-                        get_cancel_registry().cancel_request(
-                            enqueue_result.cancel_event_id
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[WechatDesktop] failed to cancel superseded event %s: %s",
-                            enqueue_result.cancel_event_id,
-                            exc,
-                        )
-                self._trace(
-                    "09-queued",
-                    "id=%s conversation=%s action=%s queue_depth=%s",
-                    event.event_id[:10],
-                    event.conversation_name,
-                    enqueue_result.action,
-                    self._reply_queue.status()["queue_depth"],
-                )
-                self._service.update_status(**self._reply_queue.status())
+            self._route_reply_event(event)
         self._bootstrapped = True
 
         if now - self._last_cleanup_at > 86400:
@@ -397,6 +391,130 @@ class WechatDesktopChannel(ChatChannel):
                 ),
             )
             self._last_cleanup_at = now
+
+    def _route_reply_event(self, event: WechatDesktopEvent):
+        """Debounce attachments and merge an immediately following message."""
+        pending_attachment = self._take_pending_attachment(event.conversation_id)
+        if pending_attachment is not None:
+            marker_name = (
+                "文件" if pending_attachment.content_type == "file" else "附件"
+            )
+            attachment_marker = f"[{marker_name}: {pending_attachment.content}]"
+            if not any(
+                str(item.get("content") or "") == attachment_marker
+                for item in event.history
+            ):
+                event.history.append(
+                    {
+                        "sender_name": pending_attachment.sender_name,
+                        "content": attachment_marker,
+                        "content_type": pending_attachment.content_type,
+                    }
+                )
+            self._trace(
+                "09-attachment-followup",
+                "attachment_id=%s followup_id=%s conversation=%s",
+                pending_attachment.event_id[:10],
+                event.event_id[:10],
+                event.conversation_name,
+            )
+
+        if event.content_type in {"file", "image"} and not getattr(
+            event, "_attachment_debounce_released", False
+        ):
+            self._defer_attachment_event(event)
+            return
+        self._enqueue_reply_event(event)
+
+    def _defer_attachment_event(self, event: WechatDesktopEvent):
+        wait_seconds = max(
+            0.05,
+            min(float(self.config.get("attachment_debounce_ms", 800)) / 1000.0, 5.0),
+        )
+        with self._pending_attachment_lock:
+            previous = self._pending_attachments.pop(event.conversation_id, None)
+            if previous is not None:
+                previous[1].cancel()
+                self._store.mark_event_processed(previous[0].event_id)
+            timer = threading.Timer(
+                wait_seconds,
+                self._release_debounced_attachment,
+                args=(event.conversation_id, event.event_id),
+            )
+            timer.daemon = True
+            self._pending_attachments[event.conversation_id] = (event, timer)
+            timer.start()
+        self._trace(
+            "09-attachment-debounce",
+            "id=%s conversation=%s milliseconds=%s",
+            event.event_id[:10],
+            event.conversation_name,
+            int(wait_seconds * 1000),
+        )
+
+    def _take_pending_attachment(self, conversation_id: str):
+        with self._pending_attachment_lock:
+            pending = self._pending_attachments.pop(conversation_id, None)
+            if pending is None:
+                return None
+            pending[1].cancel()
+            event = pending[0]
+        self._store.mark_event_processed(event.event_id)
+        return event
+
+    def _release_debounced_attachment(self, conversation_id: str, event_id: str):
+        if self._stop_event.is_set():
+            return
+        with self._pending_attachment_lock:
+            pending = self._pending_attachments.get(conversation_id)
+            if pending is None or pending[0].event_id != event_id:
+                return
+            event, _ = self._pending_attachments.pop(conversation_id)
+        setattr(event, "_attachment_debounce_released", True)
+        self._trace(
+            "09-attachment-released",
+            "id=%s conversation=%s",
+            event.event_id[:10],
+            event.conversation_name,
+        )
+        validation = self._driver.validate_reply_target(event)
+        if not validation.valid and validation.replacement_event is not None:
+            self._store.mark_event_processed(event.event_id)
+            self._trace(
+                "09-attachment-replaced",
+                "attachment_id=%s replacement_id=%s conversation=%s",
+                event.event_id[:10],
+                validation.replacement_event.event_id[:10],
+                event.conversation_name,
+            )
+            self._accept_replacement_event(validation.replacement_event)
+            return
+        self._enqueue_reply_event(event)
+
+    def _enqueue_reply_event(self, event: WechatDesktopEvent):
+        enqueue_result = self._reply_queue.enqueue(event)
+        if not enqueue_result:
+            return
+        if enqueue_result.cancel_event_id:
+            try:
+                from agent.protocol import get_cancel_registry
+
+                get_cancel_registry().cancel_request(enqueue_result.cancel_event_id)
+            except Exception as exc:
+                logger.warning(
+                    "[WechatDesktop] failed to cancel superseded event %s: %s",
+                    enqueue_result.cancel_event_id,
+                    exc,
+                )
+        self._trace(
+            "09-queued",
+            "id=%s conversation=%s action=%s queue_depth=%s",
+            event.event_id[:10],
+            event.conversation_name,
+            enqueue_result.action,
+            self._reply_queue.status()["queue_depth"],
+        )
+        self._service.update_status(**self._reply_queue.status())
 
     def _consume_reply_queue(self):
         while not self._stop_event.is_set():
@@ -617,6 +735,8 @@ class WechatDesktopChannel(ChatChannel):
                         "像本人聊天一样直接回复正文，尽量自然、简短、口语化。"
                         "不要出现“可以回复”“可以回”“建议回复”“回复如下”等"
                         "提示语，也不要用引号、Markdown 加粗或解释你正在代写。"
+                        "若上文包含本地文件，只在新消息确实要求处理该文件时读取；"
+                        "否则按普通聊天回复，不要擅自分析文件。"
                     ),
                 ]
             )
@@ -624,6 +744,12 @@ class WechatDesktopChannel(ChatChannel):
         if ctype == ContextType.IMAGE:
             ctype = ContextType.TEXT
             content = self._analyze_image(event)
+        if ctype == ContextType.FILE:
+            ctype = ContextType.TEXT
+            content = (
+                f"[微信文件已保存到本地: {event.content}]\n"
+                "请读取该文件，并根据文件内容自然回复发送者。"
+            )
         context = self._compose_context(
             ctype,
             content,
@@ -645,7 +771,9 @@ class WechatDesktopChannel(ChatChannel):
             context["wechat_desktop_reply_cycle"] = True
             context["wechat_desktop_queue_token"] = queue_token
             context["wechat_desktop_queue_terminal"] = "completed"
-            self._driver.begin_reply_cycle(event.conversation_name)
+            self._driver.begin_reply_cycle(
+                event.conversation_name, event.conversation_id
+            )
             try:
                 self.produce(context)
             except Exception:
@@ -659,6 +787,24 @@ class WechatDesktopChannel(ChatChannel):
             event.event_id[:10],
         )
         return False
+
+    def _accept_replacement_event(self, event: WechatDesktopEvent):
+        """Apply the same safety gates before queuing a send-time replacement."""
+        self._preserve_event_evidence(event)
+        recorded = self._store.record_event(event)
+        if recorded:
+            self._store.append_event_history(event)
+        if event.kind != "message" or event.source_type not in {"private", "group"}:
+            self._store.mark_event_processed(event.event_id)
+            return
+        if (
+            self._policy.is_blocked(event.conversation_name)
+            or self._policy.is_blocked(event.sender_name)
+            or (event.is_group and not self._policy.group_triggered(event))
+        ):
+            self._store.mark_event_processed(event.event_id)
+            return
+        self._route_reply_event(event)
 
     def _compose_context(self, ctype: ContextType, content, **kwargs):
         """Compose CowAgent context without relying on global channel allowlists."""
@@ -802,8 +948,13 @@ class WechatDesktopChannel(ChatChannel):
                 try:
                     event = getattr(msg, "event", None)
                     if event is not None:
-                        valid, reason = self._driver.validate_reply_target(event)
+                        validation = self._driver.validate_reply_target(event)
+                        valid, reason = validation
                         if not valid:
+                            if validation.replacement_event is not None:
+                                self._accept_replacement_event(
+                                    validation.replacement_event
+                                )
                             context["wechat_desktop_queue_terminal"] = "superseded"
                             self._trace(
                                 "11-send-superseded",

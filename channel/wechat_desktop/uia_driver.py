@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from common.log import logger
-from channel.wechat_desktop.models import UiaChatMessage, WechatDesktopEvent
+from channel.wechat_desktop.models import (
+    ReplyTargetValidation,
+    UiaChatMessage,
+    WechatDesktopEvent,
+)
 from channel.wechat_desktop.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia_client import WechatUiaClient
 
@@ -41,6 +45,8 @@ class WechatUiaDriver:
         self._known_group_keys: set[str] = set()
         self._reply_in_flight = threading.Event()
         self._reply_conversation = ""
+        self._reply_conversation_id = ""
+        self._last_reply_monitor_at = 0.0
 
     def _trace(self, stage: str, message: str, *args) -> None:
         if bool(self.config.get("diagnostic_logging", False)):
@@ -54,13 +60,23 @@ class WechatUiaDriver:
     def reply_in_flight(self) -> bool:
         return self._reply_in_flight.is_set()
 
-    def begin_reply_cycle(self, conversation: str):
+    def begin_reply_cycle(self, conversation: str, conversation_id: str = ""):
         self._reply_conversation = str(conversation or "")
+        self._reply_conversation_id = str(conversation_id or "")
+        self._last_reply_monitor_at = 0.0
         self._reply_in_flight.set()
 
     def end_reply_cycle(self):
         self._reply_conversation = ""
+        self._reply_conversation_id = ""
+        self._last_reply_monitor_at = 0.0
         self._reply_in_flight.clear()
+
+    def _is_reply_conversation(self, row_key: str, row) -> bool:
+        return self.reply_in_flight and (
+            row_key == self._reply_conversation_id
+            or row.conversation_title == self._reply_conversation
+        )
 
     def start(self) -> bool:
         resume_waits = getattr(self.client, "resume_waits", None)
@@ -89,20 +105,40 @@ class WechatUiaDriver:
     def wait_for_changes(self, stop_event: threading.Event) -> str:
         """Wait for a flash or the low-frequency reconciliation deadline."""
         self.start()
+        reconcile_enabled = bool(
+            self.config.get("shell_hook_reconcile_enabled", False)
+        )
         timeout = max(1.0, float(self.config.get("shell_hook_reconcile_seconds", 15)))
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if reconcile_enabled else None
         while not stop_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if self.reply_in_flight:
+                monitor_interval = max(
+                    0.25,
+                    min(
+                        float(
+                            self.config.get(
+                                "reply_monitor_interval_seconds", 1.0
+                            )
+                        ),
+                        5.0,
+                    ),
+                )
+                if now - self._last_reply_monitor_at >= monitor_interval:
+                    self._last_reply_monitor_at = now
+                    return "reply-monitor"
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and remaining <= 0:
                 return "reconcile"
-            if self._hook.wait(min(0.25, remaining)):
+            hook_wait = 0.25 if remaining is None else min(0.25, remaining)
+            if self._hook.wait(hook_wait):
                 signal = self._hook.consume(self._last_hook_at)
                 if signal.signaled:
                     self._last_hook_at = signal.created_at
                     if self._settle_hook_signal(stop_event):
                         return "stopped"
                     return signal.reason
-                if self._hook.error:
+                if self._hook.error and reconcile_enabled:
                     return "reconcile"
         return "stopped"
 
@@ -160,7 +196,6 @@ class WechatUiaDriver:
             (
                 message.message_type,
                 message.content,
-                message.bounds,
                 int(index),
             )
         )
@@ -194,14 +229,29 @@ class WechatUiaDriver:
         ]
         history = []
         for message in context_messages:
+            content = message.content
+            if message.message_type == "file" and message.file_path:
+                content = f"[文件: {message.file_path}]"
             history.append(
                 {
                     "sender_name": message.sender_name if is_group else "",
-                    "content": message.content,
+                    "content": content,
                     "content_type": message.message_type,
                 }
             )
         return history
+
+    def _resolve_message_files(
+        self, messages: list[UiaChatMessage]
+    ) -> list[UiaChatMessage]:
+        resolved_messages = []
+        for visible_message in messages:
+            if visible_message.message_type == "file":
+                file_path = self.client.fetch_message_file(visible_message)
+                if file_path:
+                    visible_message = replace(visible_message, file_path=file_path)
+            resolved_messages.append(visible_message)
+        return resolved_messages
 
     @staticmethod
     def _mentions_owner(content: str, owner: str) -> bool:
@@ -232,7 +282,7 @@ class WechatUiaDriver:
             sender_id=sender,
             sender_name=sender,
             content_type=message.message_type,
-            content=message.content,
+            content=message.file_path or message.content,
             is_group=is_group,
             is_at=is_at,
             source_type="group" if is_group else "private",
@@ -274,20 +324,24 @@ class WechatUiaDriver:
                 for row_key, row in current_rows.items():
                     previous = previous_rows.get(row_key)
                     changed = previous is None or previous.row_signature != row.row_signature
+                    active_reply_conversation = self._is_reply_conversation(
+                        row_key, row
+                    )
                     # A private conversation is only a discovery candidate
                     # while its session row says it has unread messages. The
                     # message itself is read only after entering the chat.
                     if row.not_read_number > 0 or (
                         row.mentions_self and changed
-                    ):
+                    ) or active_reply_conversation:
                         candidates.append((row_key, row))
                         self._trace(
                             "02-candidate",
-                            "conversation=%s unread=%s mentioned=%s changed=%s runtime=%s row=%s",
+                            "conversation=%s unread=%s mentioned=%s changed=%s reply_monitor=%s runtime=%s row=%s",
                             row.conversation_title,
                             row.not_read_number,
                             bool(row.mentions_self),
                             changed,
+                            active_reply_conversation,
                             row.runtime_id or "<empty>",
                             row.row_index,
                         )
@@ -298,8 +352,15 @@ class WechatUiaDriver:
                 ordinal = 0
                 for row_key, row in candidates:
                     name = row.conversation_title
+                    active_reply_conversation = self._is_reply_conversation(
+                        row_key, row
+                    )
                     is_group = row_key in self._known_group_keys or name in self._known_groups
-                    if is_group and not row.mentions_self:
+                    if (
+                        is_group
+                        and not row.mentions_self
+                        and not active_reply_conversation
+                    ):
                         self._trace(
                             "02-skip",
                             "conversation=%s reason=known_group_without_session_mention",
@@ -332,7 +393,10 @@ class WechatUiaDriver:
                         )
                         if is_group:
                             self._known_group_keys.add(row_key)
-                            if not row.mentions_self:
+                            if (
+                                not row.mentions_self
+                                and not active_reply_conversation
+                            ):
                                 self._trace(
                                     "02-skip",
                                     "conversation=%s reason=group_without_session_mention",
@@ -346,6 +410,7 @@ class WechatUiaDriver:
                         runtime_id=row.runtime_id,
                         row_index=row.row_index,
                     )
+                    messages = self._resolve_message_files(messages)
                     self._trace(
                         "04-history",
                         "conversation=%s group=%s visible_messages=%s",
@@ -432,34 +497,76 @@ class WechatUiaDriver:
             return conversation, "", -1
         return row.conversation_title, row.runtime_id, row.row_index
 
-    def validate_reply_target(self, event: WechatDesktopEvent) -> tuple[bool, str]:
-        """Re-read the UI immediately before send to reject stale LLM output."""
+    def validate_reply_target(self, event: WechatDesktopEvent) -> ReplyTargetValidation:
+        """Re-read the UI and return a replacement event when the target changed."""
         try:
-            if event.conversation_id not in self._conversation_selectors:
-                return False, "conversation row is no longer visible"
-            title, runtime_id, row_index = self._selector(event.conversation_id)
-            messages = self.client.get_chat_history(
-                title,
-                self._message_limit(),
-                runtime_id=runtime_id,
-                row_index=row_index,
-            )
-            owner = self.client.get_owner_info().nick_name
-            index, target = self._select_reply_target(messages, event.is_group, owner)
-            if target is None:
-                return False, "reply target is no longer visible"
-            if self._target_key(target, index) != event.target_key:
-                return False, "a newer reply target replaced this message"
-            return True, ""
+            with self._operation_lock:
+                return self._validate_reply_target_locked(event)
         except Exception as exc:
-            return False, str(exc)
+            return ReplyTargetValidation(False, str(exc))
+
+    def _validate_reply_target_locked(
+        self, event: WechatDesktopEvent
+    ) -> ReplyTargetValidation:
+        if event.conversation_id not in self._conversation_selectors:
+            return ReplyTargetValidation(
+                False, "conversation row is no longer visible"
+            )
+        title, runtime_id, row_index = self._selector(event.conversation_id)
+        messages = self.client.get_chat_history(
+            title,
+            self._message_limit(),
+            runtime_id=runtime_id,
+            row_index=row_index,
+        )
+        messages = self._resolve_message_files(messages)
+        if event.is_group and any(
+            self._target_key(message, message_index) == event.target_key
+            for message_index, message in enumerate(messages)
+        ):
+            # A later @ message must not invalidate an earlier group reply that
+            # is still queued in the active conversation's local FIFO.
+            return ReplyTargetValidation(True)
+        owner = self.client.get_owner_info().nick_name
+        index, target = self._select_reply_target(messages, event.is_group, owner)
+        if target is None:
+            return ReplyTargetValidation(False, "reply target is no longer visible")
+        target_key = self._target_key(target, index)
+        if target_key == event.target_key:
+            return ReplyTargetValidation(True)
+
+        replacement_event = None
+        if self._emitted_targets.get(event.conversation_id) != target_key:
+            row = self._conversation_selectors[event.conversation_id]
+            if (
+                event.is_group
+                and not target.sender_name
+                and row.preview_has_sender_prefix
+            ):
+                target = replace(target, sender_name=row.preview_sender)
+            replacement_event = self._event(
+                event.conversation_id,
+                title,
+                target,
+                self._history_snapshot(messages, index, event.is_group),
+                event.is_group,
+                bool(event.is_group),
+                0,
+                target_key,
+            )
+            if replacement_event is not None:
+                self._emitted_targets[event.conversation_id] = target_key
+        return ReplyTargetValidation(
+            False,
+            "a newer reply target replaced this message",
+            replacement_event,
+        )
 
     def send_text(self, conversation: str, text: str) -> dict:
         title, runtime_id, row_index = self._selector(conversation)
         result = self.client.send_message(
             title, text, runtime_id=runtime_id, row_index=row_index
         )
-        self._emitted_targets.pop(conversation, None)
         return {
             **result,
             "accepted_by": "uia",

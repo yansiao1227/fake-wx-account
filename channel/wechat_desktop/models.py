@@ -46,6 +46,7 @@ class UiaChatMessage:
     direction: str = "unknown"
     runtime_id: str = ""
     bounds: Optional[Tuple[int, int, int, int]] = None
+    file_path: str = ""
 
 
 @dataclass
@@ -92,3 +93,15 @@ class WechatDesktopEvent:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ReplyTargetValidation:
+    valid: bool
+    reason: str = ""
+    replacement_event: Optional[WechatDesktopEvent] = None
+
+    def __iter__(self):
+        # Preserve the existing ``valid, reason = ...`` call pattern.
+        yield self.valid
+        yield self.reason

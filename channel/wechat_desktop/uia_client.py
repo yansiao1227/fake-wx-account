@@ -7,6 +7,7 @@ import ctypes
 import os
 import random
 import re
+import shutil
 import threading
 import time
 import unicodedata
@@ -641,14 +642,51 @@ class WechatUiaClient:
 
     @staticmethod
     def _message_type(class_name: str, content: str) -> str:
-        value = f"{class_name} {content}".casefold()
-        if "image" in value or content in {"[图片]", "[Image]"}:
+        class_value = _text(class_name).casefold()
+        content_value = _text(content)
+        if "image" in class_value or content_value in {"[图片]", "[Image]"}:
             return "image"
-        if "voice" in value or content in {"[语音]", "[Voice]"}:
+        if "voice" in class_value or content_value in {"[语音]", "[Voice]"}:
             return "voice"
-        if "file" in value or "文件" in value:
+        if (
+            "file" in class_value
+            or content_value in {"[文件]", "[File]"}
+            or (
+                "chatbubbleitemview" in class_value
+                and WechatUiaClient._file_card_metadata(content_value)[0]
+            )
+        ):
             return "file"
         return "text"
+
+    @staticmethod
+    def _file_card_metadata(content: str) -> tuple[str, Optional[int]]:
+        """Extract the filename and displayed size from a WeChat file card."""
+        lines = [line.strip() for line in _text(content).splitlines() if line.strip()]
+        if len(lines) < 2 or lines[0].casefold() not in {"文件", "file"}:
+            return "", None
+        filename = Path(lines[1]).name.strip()
+        if not filename or not Path(filename).suffix:
+            return "", None
+        size = None
+        if len(lines) >= 3:
+            match = re.fullmatch(
+                r"([0-9]+(?:\.[0-9]+)?)\s*(B|K|KB|M|MB|G|GB)",
+                lines[2],
+                re.IGNORECASE,
+            )
+            if match:
+                units = {
+                    "B": 1,
+                    "K": 1024,
+                    "KB": 1024,
+                    "M": 1024 ** 2,
+                    "MB": 1024 ** 2,
+                    "G": 1024 ** 3,
+                    "GB": 1024 ** 3,
+                }
+                size = int(float(match.group(1)) * units[match.group(2).upper()])
+        return filename, size
 
     @classmethod
     def _message_sender(
@@ -1073,6 +1111,269 @@ class WechatUiaClient:
                     )
                 )
         return messages if bounded_limit == 0 else messages[-bounded_limit:]
+
+    @staticmethod
+    def _same_bounds(left, right, tolerance: int = 3) -> bool:
+        if not left or not right:
+            return False
+        return all(abs(int(a) - int(b)) <= tolerance for a, b in zip(left, right))
+
+    def _find_message_control(self, root, message: UiaChatMessage):
+        """Reacquire a visible message control without trusting recyclable IDs alone."""
+        candidates = []
+        for control in self._walk(root):
+            class_name = _text(control.ClassName)
+            if "Chat" not in class_name or "ItemView" not in class_name:
+                continue
+            if self._message_type(class_name, _text(control.Name)) != message.message_type:
+                continue
+            name_matches = _text(control.Name) == _text(message.content)
+            bounds_match = self._same_bounds(_bounds(control), message.bounds)
+            runtime_matches = bool(
+                message.runtime_id and _runtime_id(control) == message.runtime_id
+            )
+            if name_matches and (bounds_match or runtime_matches):
+                return control
+            if name_matches:
+                candidates.append(control)
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _copy_control_file_paths(self, control) -> list[str]:
+        """Copy a file bubble and return CF_HDROP paths, restoring the clipboard."""
+        import win32api
+        import win32clipboard
+        import win32con
+
+        saved = []
+        win32clipboard.OpenClipboard()
+        try:
+            for fmt in (win32con.CF_UNICODETEXT, win32con.CF_TEXT, win32con.CF_HDROP):
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(fmt):
+                        saved.append((fmt, win32clipboard.GetClipboardData(fmt)))
+                except Exception:
+                    pass
+            win32clipboard.EmptyClipboard()
+        finally:
+            win32clipboard.CloseClipboard()
+
+        paths = []
+        try:
+            self._click_and_restore(control)
+            self._paced_wait(
+                "uia_file_selection_settle_ms_min",
+                "uia_file_selection_settle_ms_max",
+                100,
+                200,
+            )
+            self._press_shortcut(win32api, win32con, ord("C"))
+            self._paced_wait(
+                "uia_file_clipboard_settle_ms_min",
+                "uia_file_clipboard_settle_ms_max",
+                200,
+                400,
+            )
+            win32clipboard.OpenClipboard()
+            try:
+                if win32clipboard.IsClipboardFormatAvailable(win32con.CF_HDROP):
+                    paths = [
+                        str(path)
+                        for path in win32clipboard.GetClipboardData(win32con.CF_HDROP)
+                        if str(path)
+                    ]
+            finally:
+                win32clipboard.CloseClipboard()
+        finally:
+            try:
+                win32clipboard.OpenClipboard()
+                win32clipboard.EmptyClipboard()
+                for fmt, value in saved:
+                    try:
+                        if fmt == win32con.CF_UNICODETEXT:
+                            win32clipboard.SetClipboardText(value, fmt)
+                        else:
+                            win32clipboard.SetClipboardData(fmt, value)
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    win32clipboard.CloseClipboard()
+                except Exception:
+                    pass
+        return paths
+
+    @classmethod
+    def _download_button(cls, file_control):
+        for control in cls._walk(file_control, 100):
+            name = _text(control.Name).casefold()
+            if name not in {"下载", "download"}:
+                continue
+            control_type = _text(control.ControlTypeName).casefold()
+            class_name = _text(control.ClassName).casefold()
+            if "button" in control_type or "button" in class_name:
+                return control
+        return None
+
+    @staticmethod
+    def _store_file_in_tmp(source: str, tmp_root: Path) -> str:
+        try:
+            source_path = Path(source).resolve()
+            if not source_path.is_file():
+                return ""
+            stat = source_path.stat()
+        except OSError:
+            return ""
+        destination_root = tmp_root.resolve()
+        destination_root.mkdir(parents=True, exist_ok=True)
+        identity = f"{source_path}\0{stat.st_size}\0{stat.st_mtime_ns}"
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", source_path.name).strip(" .")
+        safe_name = safe_name or "wechat-file"
+        target = destination_root / f"{digest}_{safe_name}"
+        if source_path != target and (
+            not target.exists() or target.stat().st_size != stat.st_size
+        ):
+            shutil.copy2(source_path, target)
+        return str(target)
+
+    def _wechat_data_roots(self) -> list[Path]:
+        roots = []
+        configured = _text(self.config.get("wechat_files_dir"))
+        if configured:
+            roots.append(Path(os.path.expandvars(os.path.expanduser(configured))))
+        roots.extend(
+            [
+                Path.home() / "Documents" / "xwechat_files",
+                Path.home() / "Documents" / "WeChat Files",
+            ]
+        )
+        try:
+            import win32api
+            import win32con
+            import win32process
+
+            _hwnd, process_id = self._window()
+            process = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+                False,
+                process_id,
+            )
+            try:
+                executable = Path(win32process.GetModuleFileNameEx(process, 0))
+            finally:
+                process.Close()
+            roots.append(executable.parent.parent / "Documents" / "xwechat_files")
+        except Exception:
+            pass
+        unique = []
+        seen = set()
+        for root in roots:
+            try:
+                resolved = root.resolve()
+            except OSError:
+                continue
+            key = os.path.normcase(str(resolved))
+            if key not in seen and resolved.is_dir():
+                seen.add(key)
+                unique.append(resolved)
+        return unique
+
+    def _find_cached_message_file(self, content: str) -> str:
+        filename, expected_size = self._file_card_metadata(content)
+        if not filename:
+            return ""
+        original = Path(filename)
+        duplicate_name = re.compile(
+            rf"^{re.escape(original.stem)}(?:\s*\(\d+\))?{re.escape(original.suffix)}$",
+            re.IGNORECASE,
+        )
+        candidates = []
+        for root in self._wechat_data_roots():
+            patterns = (
+                "*/msg/file/*/*",
+                "*/FileStorage/File/*/*",
+            )
+            for pattern in patterns:
+                try:
+                    paths = root.glob(pattern)
+                    for path in paths:
+                        if not path.is_file() or not duplicate_name.fullmatch(path.name):
+                            continue
+                        stat = path.stat()
+                        size_gap = (
+                            abs(stat.st_size - expected_size)
+                            if expected_size is not None
+                            else 0
+                        )
+                        if expected_size is not None and size_gap > max(
+                            2048, int(expected_size * 0.02)
+                        ):
+                            continue
+                        candidates.append((size_gap, -stat.st_mtime_ns, path))
+                except OSError:
+                    continue
+        if not candidates:
+            return ""
+        return str(min(candidates, key=lambda item: (item[0], item[1]))[2])
+
+    def fetch_message_file(
+        self, message: UiaChatMessage, tmp_root: Optional[Path] = None
+    ) -> str:
+        """Copy a visible WeChat file bubble's local file into project tmp."""
+        if message.message_type != "file":
+            return ""
+        target_root = tmp_root or (
+            Path(__file__).resolve().parents[2] / "tmp" / "wechat_files"
+        )
+        timeout = (
+            max(0.0, min(float(self.config.get("uia_file_download_timeout_seconds", 10)), 30.0))
+            if bool(self.config.get("uia_file_download_enabled", True))
+            else 0.0
+        )
+        deadline = time.time() + timeout
+        ui_attempted = False
+        while True:
+            cached = self._find_cached_message_file(message.content)
+            if cached:
+                stored = self._store_file_in_tmp(cached, Path(target_root))
+                if stored:
+                    logger.info("[WechatDesktop] cached file copied to tmp: %s", stored)
+                    return stored
+            if ui_attempted:
+                if time.time() >= deadline:
+                    break
+                time.sleep(min(0.5, max(0.0, deadline - time.time())))
+                continue
+            ui_attempted = True
+            self.focus_window()
+            with self.operation_lock, self._uia_root() as root:
+                control = self._find_message_control(root, message)
+                if control is None:
+                    break
+                paths = self._copy_control_file_paths(control)
+                for path in paths:
+                    try:
+                        stored = self._store_file_in_tmp(path, Path(target_root))
+                    except OSError as exc:
+                        logger.warning(
+                            "[WechatDesktop] failed to copy clipboard file to tmp: %s",
+                            exc,
+                        )
+                        stored = ""
+                    if stored:
+                        logger.info("[WechatDesktop] file copied to tmp: %s", stored)
+                        return stored
+                if timeout > 0:
+                    download = self._download_button(control)
+                    if download is not None:
+                        self._click_and_restore(download)
+            if time.time() >= deadline:
+                break
+        logger.warning(
+            "[WechatDesktop] file bubble was detected but no local file path was available: %s",
+            message.content,
+        )
+        return ""
 
     @contextmanager
     def _clipboard(self, unicode_text: Optional[str] = None, files: Optional[Iterable[str]] = None):

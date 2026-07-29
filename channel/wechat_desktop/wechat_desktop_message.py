@@ -1,3 +1,5 @@
+import os
+
 from bridge.context import ContextType
 from channel.chat_message import ChatMessage
 from channel.wechat_desktop.models import WechatDesktopEvent
@@ -9,7 +11,12 @@ class WechatDesktopMessage(ChatMessage):
         self.event = event
         self.msg_id = event.event_id
         self.create_time = event.observed_at
-        self.ctype = ContextType.IMAGE if event.content_type == "image" else ContextType.TEXT
+        if event.content_type == "image":
+            self.ctype = ContextType.IMAGE
+        elif event.content_type == "file" and os.path.isfile(str(event.content or "")):
+            self.ctype = ContextType.FILE
+        else:
+            self.ctype = ContextType.TEXT
         self.content = event.content
         self.from_user_id = event.sender_id
         self.from_user_nickname = event.sender_name
