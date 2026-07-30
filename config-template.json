@@ -38,6 +38,15 @@
   "knowledge": true,
   "self_evolution_enabled": true,
   "mcp_tool_retrieval_enabled": false,
+  "tools": {
+    "web_search": {
+      "strategy": "auto",
+      "tavily_api_key": "",
+      "qianfan_daily_limit": 50,
+      "tavily_monthly_limit": 1000
+    }
+  },
+  "qianfan_api_key": "",
   "wechat_desktop": {
     "uia_focus_settle_ms": 350,
     "uia_recovery_attempts": 3,
@@ -90,10 +99,12 @@
     "analyze_incoming_images": true,
     "uia_file_download_enabled": true,
     "uia_file_download_timeout_seconds": 10,
+    "attachment_context_window_messages": 2,
     "attachment_debounce_ms": 800,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
-    "bootstrap_existing_messages": false
+    "bootstrap_existing_messages": false,
+    "process_startup_unread_messages": true
   }
 }

@@ -70,11 +70,13 @@ DEFAULT_CONFIG = {
     "analyze_incoming_images": True,
     "uia_file_download_enabled": True,
     "uia_file_download_timeout_seconds": 10,
+    "attachment_context_window_messages": 2,
     "attachment_debounce_ms": 800,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
     "bootstrap_existing_messages": False,
+    "process_startup_unread_messages": True,
 }
 
 
@@ -99,6 +101,25 @@ def _normalize_auto_reply_text(value) -> str:
             text = text[len(left):-len(right)].strip()
             break
     return text
+
+
+def _is_network_reply_error(value) -> bool:
+    text = str(value or "").casefold()
+    return any(
+        marker in text
+        for marker in (
+            "timeout",
+            "timed out",
+            "connection error",
+            "connection reset",
+            "connection aborted",
+            "sslerror",
+            "ssl:",
+            "unexpected_eof",
+            "max retries exceeded",
+            "network is unreachable",
+        )
+    )
 
 
 @singleton
@@ -231,10 +252,7 @@ class WechatDesktopChannel(ChatChannel):
 
     def stop(self):
         self._stop_event.set()
-        with self._pending_attachment_lock:
-            for _, timer in self._pending_attachments.values():
-                timer.cancel()
-            self._pending_attachments.clear()
+        self._clear_pending_attachments()
         discarded = self._reply_queue.stop()
         close = getattr(self._driver, "close", None)
         if close:
@@ -313,7 +331,19 @@ class WechatDesktopChannel(ChatChannel):
                 )
                 self._store.mark_event_processed(event.event_id)
                 continue
-            if first_poll and not bool(self.config.get("bootstrap_existing_messages", False)):
+            process_startup_unread = bool(
+                self.config.get("process_startup_unread_messages", True)
+            )
+            startup_unread_event = bool(
+                process_startup_unread and event.session_unread_count > 0
+            )
+            if (
+                first_poll
+                and not bool(
+                    self.config.get("bootstrap_existing_messages", False)
+                )
+                and not startup_unread_event
+            ):
                 self._trace(
                     "08-skip",
                     "id=%s reason=initial_baseline",
@@ -397,7 +427,7 @@ class WechatDesktopChannel(ChatChannel):
         pending_attachment = self._take_pending_attachment(event.conversation_id)
         if pending_attachment is not None:
             marker_name = (
-                "文件" if pending_attachment.content_type == "file" else "附件"
+                "文件" if pending_attachment.content_type == "file" else "图片"
             )
             attachment_marker = f"[{marker_name}: {pending_attachment.content}]"
             if not any(
@@ -490,6 +520,15 @@ class WechatDesktopChannel(ChatChannel):
             self._accept_replacement_event(validation.replacement_event)
             return
         self._enqueue_reply_event(event)
+
+    def _clear_pending_attachments(self) -> list[str]:
+        with self._pending_attachment_lock:
+            event_ids = []
+            for event, timer in self._pending_attachments.values():
+                timer.cancel()
+                event_ids.append(event.event_id)
+            self._pending_attachments.clear()
+        return event_ids
 
     def _enqueue_reply_event(self, event: WechatDesktopEvent):
         enqueue_result = self._reply_queue.enqueue(event)
@@ -599,25 +638,16 @@ class WechatDesktopChannel(ChatChannel):
         except OSError as exc:
             logger.warning(f"[WechatDesktop] failed to preserve evidence: {exc}")
 
-    def _analyze_image(self, event: WechatDesktopEvent) -> str:
+    def _image_agent_prompt(self, event: WechatDesktopEvent) -> str:
         if not bool(self.config.get("analyze_incoming_images", True)):
             return "[收到一张图片，当前 AI 仅处理文字，请人工查看]"
         if not event.content or not Path(event.content).is_file():
             return "[收到一张图片，但无法提取图像区域]"
-        try:
-            from agent.tools.vision.vision import Vision
-
-            result = Vision().execute(
-                {
-                    "image": event.content,
-                    "question": "简要描述这张微信聊天图片，并提取其中可见文字。",
-                }
-            )
-            if result.status == "success":
-                return f"[收到图片: {event.content}]\n图片内容：{result.result}"
-            return f"[收到图片: {event.content}]"
-        except Exception:
-            return f"[收到图片: {event.content}]"
+        return (
+            f"[需要回复的微信图片已保存到本地: {event.content}]\n"
+            "请使用 vision 工具读取这张图片，并结合图片附近的会话历史判断发送者的意图后自然回复。"
+            "不要只做机械的图片描述；如果发送者是在提问、确认或延续前文，应直接回应其真实意图。"
+        )
 
     def _learn_from_official_account(self, event: WechatDesktopEvent):
         if not bool(self.config.get("learn_from_official_accounts", False)):
@@ -691,6 +721,24 @@ class WechatDesktopChannel(ChatChannel):
         msg = WechatDesktopMessage(event)
         ctype = msg.ctype
         content = msg.content
+        attachment_instruction = ""
+        if ctype == ContextType.IMAGE:
+            ctype = ContextType.TEXT
+            content = self._image_agent_prompt(event)
+            if (
+                bool(self.config.get("analyze_incoming_images", True))
+                and event.content
+                and Path(event.content).is_file()
+            ):
+                attachment_instruction = (
+                    "当前消息是一张图片，必须先使用 vision 工具读取图片，再结合附近上下文回复。"
+                )
+        elif ctype == ContextType.FILE:
+            ctype = ContextType.TEXT
+            content = f"[微信文件已保存到本地: {event.content}]"
+            attachment_instruction = (
+                "当前消息是一个文件，请读取该文件，并结合附近上下文自然回复发送者。"
+            )
         if ctype == ContextType.TEXT:
             history_items = list(event.history)
             self._trace(
@@ -735,21 +783,14 @@ class WechatDesktopChannel(ChatChannel):
                         "像本人聊天一样直接回复正文，尽量自然、简短、口语化。"
                         "不要出现“可以回复”“可以回”“建议回复”“回复如下”等"
                         "提示语，也不要用引号、Markdown 加粗或解释你正在代写。"
-                        "若上文包含本地文件，只在新消息确实要求处理该文件时读取；"
-                        "否则按普通聊天回复，不要擅自分析文件。"
+                        "若上文包含本地文件或图片，只在新消息确实要求处理该附件时调用相应工具读取；"
+                        "否则按普通聊天回复，不要擅自分析附件。"
                     ),
                 ]
             )
+            if attachment_instruction:
+                sections.append(attachment_instruction)
             content = "\n".join(sections)
-        if ctype == ContextType.IMAGE:
-            ctype = ContextType.TEXT
-            content = self._analyze_image(event)
-        if ctype == ContextType.FILE:
-            ctype = ContextType.TEXT
-            content = (
-                f"[微信文件已保存到本地: {event.content}]\n"
-                "请读取该文件，并根据文件内容自然回复发送者。"
-            )
         context = self._compose_context(
             ctype,
             content,
@@ -921,6 +962,29 @@ class WechatDesktopChannel(ChatChannel):
             )
             return
 
+        if reply.type == ReplyType.ERROR:
+            context["wechat_desktop_queue_terminal"] = "failed"
+            if _is_network_reply_error(reply.content):
+                self._handle_network_reply_error(
+                    reply,
+                    context,
+                    send_target,
+                    target_name,
+                )
+            else:
+                logger.error(
+                    "[WechatDesktop] agent reply failed target=%s error=%s",
+                    target_name,
+                    reply.content,
+                )
+                self._store.audit(
+                    "agent_reply",
+                    target_name,
+                    "failed",
+                    detail=str(reply.content or ""),
+                )
+            return
+
         if reply.type == ReplyType.TEXT:
             reply_text = (
                 _normalize_auto_reply_text(reply.content)
@@ -1050,6 +1114,81 @@ class WechatDesktopChannel(ChatChannel):
             return
         context["wechat_desktop_queue_terminal"] = "skipped"
         logger.warning(f"[WechatDesktop] unsupported reply type: {reply.type}")
+
+    def _handle_network_reply_error(
+        self,
+        reply: Reply,
+        context: Context,
+        send_target: str,
+        target_name: str,
+    ):
+        self._finish_reply_cycle(context)
+        discarded_event_ids = self._reply_queue.clear_pending()
+        discarded_event_ids.extend(self._clear_pending_attachments())
+        discarded_event_ids = list(dict.fromkeys(discarded_event_ids))
+        for event_id in discarded_event_ids:
+            self._store.mark_event_processed(event_id)
+        notice = "目前网络不稳定，请稍后再试。"
+        error_detail = str(reply.content or "")
+        self._trace(
+            "10-network-unstable",
+            "target=%s discarded=%s error=%s",
+            target_name,
+            len(discarded_event_ids),
+            error_detail,
+        )
+        logger.warning(
+            "[WechatDesktop] network unstable; paused reply monitoring and cleared %s pending events; target=%s error=%s",
+            len(discarded_event_ids),
+            target_name,
+            error_detail,
+        )
+        self._store.audit(
+            "network_unstable",
+            target_name,
+            "detected",
+            detail=(
+                f"discarded={len(discarded_event_ids)}; error={error_detail}"
+            ),
+        )
+        try:
+            result = self._driver.send_text(send_target, notice)
+            if result.get("success"):
+                verified = bool(result.get("verified"))
+                self._trace(
+                    "12-network-notice-success",
+                    "target=%s verified=%s",
+                    target_name,
+                    verified,
+                )
+                self._store.audit(
+                    "network_unstable_notice",
+                    target_name,
+                    "success" if verified else "unverified",
+                    self._content_hash(notice),
+                    detail=str(result.get("message", "")),
+                )
+                return
+            raise RuntimeError(str(result.get("message") or "send failed"))
+        except Exception as exc:
+            self._trace(
+                "12-network-notice-failed",
+                "target=%s error=%s",
+                target_name,
+                exc,
+            )
+            logger.error(
+                "[WechatDesktop] failed to send network instability notice; ending reply flow target=%s error=%s",
+                target_name,
+                exc,
+            )
+            self._store.audit(
+                "network_unstable_notice",
+                target_name,
+                "failed",
+                self._content_hash(notice),
+                detail=str(exc),
+            )
 
     def _execute_agent_action(self, action: str, **params) -> dict:
         if action != "send_text":

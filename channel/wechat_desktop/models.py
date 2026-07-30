@@ -47,6 +47,7 @@ class UiaChatMessage:
     runtime_id: str = ""
     bounds: Optional[Tuple[int, int, int, int]] = None
     file_path: str = ""
+    stable_id: str = ""
 
 
 @dataclass
@@ -66,6 +67,7 @@ class WechatDesktopEvent:
     bounds: Optional[Tuple[int, int, int, int]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     target_key: str = ""
+    session_unread_count: int = 0
     observed_at: float = field(default_factory=time.time)
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 

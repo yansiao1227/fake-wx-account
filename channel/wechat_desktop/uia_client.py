@@ -644,7 +644,14 @@ class WechatUiaClient:
     def _message_type(class_name: str, content: str) -> str:
         class_value = _text(class_name).casefold()
         content_value = _text(content)
-        if "image" in class_value or content_value in {"[图片]", "[Image]"}:
+        if (
+            "image" in class_value
+            or content_value in {"[图片]", "[Image]"}
+            or (
+                "chatbubblereferitemview" in class_value
+                and content_value.casefold() in {"图片", "image"}
+            )
+        ):
             return "image"
         if "voice" in class_value or content_value in {"[语音]", "[Voice]"}:
             return "voice"
@@ -1374,6 +1381,53 @@ class WechatUiaClient:
             message.content,
         )
         return ""
+
+    def fetch_message_image(
+        self, message: UiaChatMessage, tmp_root: Optional[Path] = None
+    ) -> str:
+        """Capture a visible image bubble into project ``tmp`` for vision input."""
+        if message.message_type != "image" or not message.bounds:
+            return ""
+        left, top, right, bottom = (int(value) for value in message.bounds)
+        if right <= left or bottom <= top:
+            return ""
+        target_root = (
+            Path(tmp_root)
+            if tmp_root is not None
+            else Path(__file__).resolve().parents[2] / "tmp" / "wechat_images"
+        )
+        target_root.mkdir(parents=True, exist_ok=True)
+        identity = "\0".join(
+            (
+                str(message.stable_id or message.runtime_id or message.content),
+                str((left, top, right, bottom)),
+            )
+        )
+        target = target_root / (
+            hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] + ".png"
+        )
+        try:
+            # Bounding rectangles returned by UIA use virtual-screen coordinates.
+            # Pillow's all_screens flag preserves negative coordinates on multi-monitor
+            # Windows setups and captures only the image-card anchor, not the full row.
+            from PIL import ImageGrab
+
+            image = ImageGrab.grab(
+                bbox=(left, top, right, bottom),
+                all_screens=True,
+            )
+            if image.width < 2 or image.height < 2:
+                return ""
+            image.save(target, format="PNG")
+            logger.info("[WechatDesktop] image bubble captured to tmp: %s", target)
+            return str(target)
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] failed to capture image bubble bounds=%s: %s",
+                message.bounds,
+                exc,
+            )
+            return ""
 
     @contextmanager
     def _clipboard(self, unicode_text: Optional[str] = None, files: Optional[Iterable[str]] = None):

@@ -41,6 +41,7 @@ class WechatUiaDriver:
         self._rows = {}
         self._conversation_selectors = {}
         self._emitted_targets: dict[str, str] = {}
+        self._message_snapshots: dict[str, list[UiaChatMessage]] = {}
         self._known_groups = {str(x) for x in config.get("auto_reply_groups", [])}
         self._known_group_keys: set[str] = set()
         self._reply_in_flight = threading.Event()
@@ -190,16 +191,89 @@ class WechatUiaDriver:
 
     @classmethod
     def _target_key(cls, message: UiaChatMessage, index: int) -> str:
-        # UIA runtime IDs identify recyclable controls, not WeChat messages.
-        # Build the short-lived reply-target key from message data instead.
+        # Bounds and visible indexes drift as the chat scrolls, while runtime
+        # IDs belong to recyclable controls.  ``stable_id`` is reconciled
+        # against the preceding visible snapshot by the driver.
         stable = repr(
             (
                 message.message_type,
                 message.content,
-                int(index),
+                message.stable_id or "",
             )
         )
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _message_signature(message: UiaChatMessage) -> tuple[str, str]:
+        return message.message_type, str(message.content or "")
+
+    def _stabilize_messages(
+        self,
+        conversation_id: str,
+        messages: list[UiaChatMessage],
+    ) -> list[UiaChatMessage]:
+        """Carry message identities across scrolling UIA snapshots."""
+        previous = self._message_snapshots.get(conversation_id, [])
+        stable_ids = ["" for _ in messages]
+        used_previous: set[int] = set()
+
+        runtime_matches: dict[tuple[str, tuple[str, str]], list[int]] = {}
+        for previous_index, message in enumerate(previous):
+            if not message.runtime_id or not message.stable_id:
+                continue
+            key = (message.runtime_id, self._message_signature(message))
+            runtime_matches.setdefault(key, []).append(previous_index)
+        for current_index, message in enumerate(messages):
+            if not message.runtime_id:
+                continue
+            key = (message.runtime_id, self._message_signature(message))
+            candidates = runtime_matches.get(key, [])
+            previous_index = next(
+                (index for index in candidates if index not in used_previous),
+                None,
+            )
+            if previous_index is not None:
+                stable_ids[current_index] = previous[previous_index].stable_id
+                used_previous.add(previous_index)
+
+        # Runtime IDs may change when WeChat recreates controls. Match the
+        # remaining ordered overlap by payload without using absolute indexes.
+        search_start = 0
+        for current_index, message in enumerate(messages):
+            if stable_ids[current_index]:
+                matched_previous = next(
+                    (
+                        index
+                        for index, old in enumerate(previous)
+                        if old.stable_id == stable_ids[current_index]
+                    ),
+                    None,
+                )
+                if matched_previous is not None:
+                    search_start = max(search_start, matched_previous + 1)
+                continue
+            signature = self._message_signature(message)
+            previous_index = next(
+                (
+                    index
+                    for index in range(search_start, len(previous))
+                    if index not in used_previous
+                    and self._message_signature(previous[index]) == signature
+                    and previous[index].stable_id
+                ),
+                None,
+            )
+            if previous_index is not None:
+                stable_ids[current_index] = previous[previous_index].stable_id
+                used_previous.add(previous_index)
+                search_start = previous_index + 1
+
+        stabilized = [
+            replace(message, stable_id=stable_ids[index] or uuid.uuid4().hex)
+            for index, message in enumerate(messages)
+        ]
+        self._message_snapshots[conversation_id] = stabilized
+        return stabilized
 
     def _select_reply_target(
         self,
@@ -222,16 +296,31 @@ class WechatUiaDriver:
         target_index: int,
         is_group: bool,
     ) -> list[dict]:
+        target = messages[target_index] if 0 <= target_index < len(messages) else None
+        followup_limit = max(
+            0,
+            min(int(self.config.get("attachment_context_window_messages", 2)), 10),
+        )
+        start = 0
+        end = len(messages)
+        if target is not None and target.message_type in {"file", "image"}:
+            # Previous messages are already useful conversation context and
+            # remain unbounded within the visible snapshot. Only absorb a
+            # small number of messages sent after the attachment; later ones
+            # stay outside this event and are handled as new queue targets.
+            end = min(len(messages), target_index + followup_limit + 1)
         context_messages = [
             message
             for index, message in enumerate(messages)
-            if index != target_index
+            if start <= index < end and index != target_index
         ]
         history = []
         for message in context_messages:
             content = message.content
             if message.message_type == "file" and message.file_path:
                 content = f"[文件: {message.file_path}]"
+            elif message.message_type == "image" and message.file_path:
+                content = f"[图片: {message.file_path}]"
             history.append(
                 {
                     "sender_name": message.sender_name if is_group else "",
@@ -250,6 +339,11 @@ class WechatUiaDriver:
                 file_path = self.client.fetch_message_file(visible_message)
                 if file_path:
                     visible_message = replace(visible_message, file_path=file_path)
+            elif visible_message.message_type == "image":
+                fetch_image = getattr(self.client, "fetch_message_image", None)
+                image_path = fetch_image(visible_message) if fetch_image else ""
+                if image_path:
+                    visible_message = replace(visible_message, file_path=image_path)
             resolved_messages.append(visible_message)
         return resolved_messages
 
@@ -272,6 +366,7 @@ class WechatUiaDriver:
         is_at: bool,
         ordinal: int,
         target_key: str,
+        session_unread_count: int = 0,
     ) -> Optional[WechatDesktopEvent]:
         event_id = uuid.uuid4().hex
         sender = message.sender_name or ("群成员" if is_group else conversation)
@@ -286,9 +381,13 @@ class WechatUiaDriver:
             is_group=is_group,
             is_at=is_at,
             source_type="group" if is_group else "private",
+            evidence_path=(
+                message.file_path if message.message_type == "image" else ""
+            ),
             bounds=message.bounds,
             history=history,
             target_key=target_key,
+            session_unread_count=max(0, int(session_unread_count)),
             observed_at=time.time() + ordinal / 1_000_000.0,
             event_id=event_id,
         )
@@ -311,7 +410,16 @@ class WechatUiaDriver:
                 first_scan = not self._rows
                 previous_rows = self._rows
                 self._rows = current_rows
-                if first_scan and not bool(self.config.get("bootstrap_existing_messages", False)):
+                process_startup_unread = bool(
+                    self.config.get("process_startup_unread_messages", True)
+                )
+                if (
+                    first_scan
+                    and not bool(
+                        self.config.get("bootstrap_existing_messages", False)
+                    )
+                    and not process_startup_unread
+                ):
                     self._trace(
                         "02-baseline",
                         "existing sessions recorded without reply candidates",
@@ -319,6 +427,12 @@ class WechatUiaDriver:
                     return self._observation(
                         visible_conversations=len(rows), unread_conversations=sum(row.not_read_number > 0 for row in rows)
                     ), []
+                if first_scan and process_startup_unread:
+                    self._trace(
+                        "02-baseline",
+                        "startup unread sessions eligible from session-list UI tree unread=%s",
+                        sum(row.not_read_number > 0 for row in rows),
+                    )
 
                 candidates = []
                 for row_key, row in current_rows.items():
@@ -411,6 +525,7 @@ class WechatUiaDriver:
                         row_index=row.row_index,
                     )
                     messages = self._resolve_message_files(messages)
+                    messages = self._stabilize_messages(row_key, messages)
                     self._trace(
                         "04-history",
                         "conversation=%s group=%s visible_messages=%s",
@@ -476,6 +591,7 @@ class WechatUiaDriver:
                         bool(is_group),
                         ordinal,
                         target_key,
+                        row.not_read_number,
                     )
                     if event is not None:
                         self._emitted_targets[row_key] = target_key
@@ -520,6 +636,7 @@ class WechatUiaDriver:
             row_index=row_index,
         )
         messages = self._resolve_message_files(messages)
+        messages = self._stabilize_messages(event.conversation_id, messages)
         if event.is_group and any(
             self._target_key(message, message_index) == event.target_key
             for message_index, message in enumerate(messages)

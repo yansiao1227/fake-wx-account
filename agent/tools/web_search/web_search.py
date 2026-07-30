@@ -1,4 +1,5 @@
-"""Web Search tool. Supports five backends with a unified response format:
+"""Web Search tool. Supports six backends with a unified response format:
+  - tavily  (https://api.tavily.com/search)
   - bocha   (https://open.bochaai.com)
   - zhipu   (https://docs.bigmodel.cn/cn/guide/tools/web-search)
   - qianfan (https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy)
@@ -7,13 +8,13 @@
 
 Provider selection
   - strategy 'auto' (default): pick the first configured provider in the
-    canonical order [bocha, qianfan, zhipu, linkai, ddgs]. When the caller passes
-    an explicit `provider` it overrides the pick; an invalid/unconfigured
-    one silently falls back to the auto order.
+    canonical order [qianfan, tavily, bocha, zhipu, linkai, ddgs]. Caller
+    hints cannot bypass this deployment fallback order.
   - strategy 'fixed': use the configured provider; if its credential is
     missing at call time, silently fall back to auto order (no card hint).
 
 Credentials
+  - tavily  : tools.web_search.tavily_api_key -> env TAVILY_API_KEY
   - bocha   : tools.web_search.bocha_api_key  ->  env BOCHA_API_KEY
   - zhipu   : conf.zhipu_ai_api_key            ->  env ZHIPUAI_API_KEY
   - qianfan : conf.qianfan_api_key             ->  env QIANFAN_API_KEY
@@ -23,6 +24,10 @@ Credentials
 
 import json
 import os
+import sqlite3
+import threading
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -39,7 +44,7 @@ except ImportError:  # Optional dependency; API-key providers still work.
 
 from agent.tools.base_tool import BaseTool, ToolResult
 from common.log import logger
-from config import conf
+from config import conf, get_data_root
 
 
 DEFAULT_TIMEOUT = 30
@@ -48,19 +53,106 @@ CITATION_POLICY = (
     "clickable source links. Do not present search-derived factual claims without citations."
 )
 
-# Canonical fallback order. Empirically ordered by Chinese real-time
-# quality + relevance: bocha (best overall), qianfan (best for hot news),
-# zhipu (strong on long-form articles), linkai (cloud aggregator), then
-# DDGS as the keyless metasearch fallback.
-PROVIDER_ORDER = ("bocha", "qianfan", "zhipu", "linkai", "ddgs")
+# Canonical fallback order. Baidu Search is preferred, Tavily follows, and
+# DDGS remains the final keyless fallback when API-backed providers fail.
+PROVIDER_ORDER = ("qianfan", "tavily", "bocha", "zhipu", "linkai", "ddgs")
 
 PROVIDER_LABELS = {
+    "tavily": "Tavily",
     "bocha":   "Bocha",
     "zhipu":   "Zhipu",
     "qianfan": "Baidu Qianfan",
     "linkai":  "LinkAI",
     "ddgs": "DDGS",
 }
+
+_DEFAULT_PROVIDER_QUOTAS = {
+    "qianfan": ("day", 50),
+    "tavily": ("month", 1000),
+}
+
+
+class WebSearchUsageStore:
+    """Persist provider request counts and reserve quota atomically."""
+
+    _schema_lock = threading.Lock()
+
+    def __init__(self, path: Optional[str] = None):
+        configured = path or _tools_web_search_conf().get("usage_store_path")
+        self.path = Path(configured or (Path(get_data_root()) / "web_search_usage.db"))
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+
+    def _connect(self):
+        connection = sqlite3.connect(str(self.path), timeout=10)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_schema(self):
+        with self._schema_lock, self._connect() as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS provider_usage (
+                    provider TEXT NOT NULL,
+                    period_key TEXT NOT NULL,
+                    request_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (provider, period_key)
+                )
+                """
+            )
+
+    @staticmethod
+    def period_key(period: str, now: Optional[datetime] = None) -> str:
+        current = now or datetime.now().astimezone()
+        if period == "day":
+            return current.strftime("%Y-%m-%d")
+        if period == "month":
+            return current.strftime("%Y-%m")
+        return "all"
+
+    def count(self, provider: str, period: str, now: Optional[datetime] = None) -> int:
+        key = self.period_key(period, now)
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT request_count FROM provider_usage WHERE provider=? AND period_key=?",
+                (provider, key),
+            ).fetchone()
+        return int(row["request_count"]) if row else 0
+
+    def reserve(
+        self,
+        provider: str,
+        period: str,
+        limit: Optional[int],
+        now: Optional[datetime] = None,
+    ) -> tuple[bool, int]:
+        """Increment before the request; return False without increment at quota."""
+        key = self.period_key(period, now)
+        updated_at = (now or datetime.now().astimezone()).isoformat()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT request_count FROM provider_usage WHERE provider=? AND period_key=?",
+                (provider, key),
+            ).fetchone()
+            current = int(row["request_count"]) if row else 0
+            if limit is not None and current >= max(0, int(limit)):
+                db.rollback()
+                return False, current
+            next_count = current + 1
+            db.execute(
+                """
+                INSERT INTO provider_usage(provider, period_key, request_count, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider, period_key) DO UPDATE SET
+                    request_count=excluded.request_count,
+                    updated_at=excluded.updated_at
+                """,
+                (provider, key, next_count, updated_at),
+            )
+            db.commit()
+            return True, next_count
 
 
 def _tools_web_search_conf() -> dict:
@@ -74,6 +166,9 @@ def _tools_web_search_conf() -> dict:
 
 def _get_api_key(provider: str) -> str:
     """Resolve API key for a provider, with conf -> env fallback."""
+    if provider == "tavily":
+        key = (_tools_web_search_conf().get("tavily_api_key") or "").strip()
+        return key or os.environ.get("TAVILY_API_KEY", "").strip()
     if provider == "bocha":
         key = (_tools_web_search_conf().get("bocha_api_key") or "").strip()
         return key or os.environ.get("BOCHA_API_KEY", "").strip()
@@ -145,6 +240,48 @@ class WebSearch(BaseTool):
 
     def __init__(self, config: dict = None):
         self.config = config or {}
+        self._usage_store_path = self.config.get("usage_store_path")
+        self._usage_store: Optional[WebSearchUsageStore] = None
+
+    def _get_usage_store(self) -> WebSearchUsageStore:
+        if self._usage_store is None:
+            self._usage_store = WebSearchUsageStore(self._usage_store_path)
+        return self._usage_store
+
+    @staticmethod
+    def _provider_quota(provider: str) -> tuple[str, Optional[int]]:
+        default_period, default_limit = _DEFAULT_PROVIDER_QUOTAS.get(
+            provider, ("all", None)
+        )
+        search_config = _tools_web_search_conf()
+        if provider == "qianfan":
+            limit = search_config.get("qianfan_daily_limit", default_limit)
+        elif provider == "tavily":
+            limit = search_config.get("tavily_monthly_limit", default_limit)
+        else:
+            limit = None
+        try:
+            normalized_limit = None if limit is None else max(0, int(limit))
+        except (TypeError, ValueError):
+            normalized_limit = default_limit
+        return default_period, normalized_limit
+
+    def _reserve_provider(self, provider: str) -> tuple[bool, int, Optional[int]]:
+        period, limit = self._provider_quota(provider)
+        try:
+            reserved, count = self._get_usage_store().reserve(
+                provider, period, limit
+            )
+            return reserved, count, limit
+        except sqlite3.Error as exc:
+            logger.error(
+                "[WebSearch] failed to persist provider usage provider=%s: %s",
+                provider,
+                exc,
+            )
+            # Fail closed for metered APIs so a broken counter cannot exceed
+            # free quotas. Unlimited providers such as DDGS remain available.
+            return limit is None, 0, limit
 
     @staticmethod
     def is_available() -> bool:
@@ -153,26 +290,14 @@ class WebSearch(BaseTool):
 
     @classmethod
     def get_json_schema(cls) -> dict:
-        """Augment the static schema with a `provider` field — only when the
-        user has ≥2 providers configured AND strategy is 'auto'. Otherwise
-        the backend picks silently and exposing the field would only waste
-        the agent's tokens."""
+        """Return the schema without exposing deployment routing to the model."""
         schema = {
             "name": cls.name,
             "description": cls.description,
             "parameters": json.loads(json.dumps(cls.params)),  # deep copy
         }
-        if _configured_strategy() != "auto":
-            return schema
-        available = configured_providers()
-        if len(available) < 2:
-            return schema
-
-        schema["parameters"]["properties"]["provider"] = {
-            "type": "string",
-            "enum": available,
-            "description": "Optional. Specifies the search backend. You may switch between providers when the user wants results from a particular source or from multiple sources.",
-        }
+        # Provider routing is a deployment policy. Do not expose a provider
+        # selector that lets a model bypass the configured fallback order.
         return schema
 
     # ------------------------------------------------------------------
@@ -182,19 +307,12 @@ class WebSearch(BaseTool):
     def _resolve_provider(self, requested: Optional[str]) -> Optional[str]:
         """Pick a provider for this call.
 
-        Priority: caller-supplied (if configured) > fixed strategy (if
-        configured) > first configured in PROVIDER_ORDER. Silent fallback
-        when the desired one has no key.
+        Fixed strategy wins when configured. Auto strategy always starts at
+        the first configured provider in PROVIDER_ORDER.
         """
         available = configured_providers()
         if not available:
             return None
-
-        if requested:
-            req = requested.strip().lower()
-            if req in available:
-                return req
-            logger.warning(f"[WebSearch] requested provider '{requested}' unavailable, falling back")
 
         if _configured_strategy() == "fixed":
             pinned = _configured_provider()
@@ -203,13 +321,18 @@ class WebSearch(BaseTool):
             if pinned:
                 logger.warning(f"[WebSearch] pinned provider '{pinned}' unavailable, falling back to auto")
 
+        if requested:
+            logger.info(
+                "[WebSearch] ignoring provider hint=%r in auto strategy; "
+                "using configured fallback order",
+                requested,
+            )
+
         return available[0]
 
     @staticmethod
     def _resolution_reason(requested: Optional[str], chosen: str) -> str:
         """Human-readable explanation for why `chosen` won the resolver."""
-        if requested and requested.strip().lower() == chosen:
-            return "caller-requested"
         strategy = _configured_strategy()
         if strategy == "fixed" and _configured_provider() == chosen:
             return "fixed-strategy"
@@ -242,7 +365,7 @@ class WebSearch(BaseTool):
         if not provider:
             return ToolResult.fail(
                 "Error: No search provider configured. "
-                "Configure one of BOCHA_API_KEY / zhipu_ai_api_key / qianfan_api_key / linkai_api_key."
+                "Configure TAVILY_API_KEY or another supported search provider."
             )
 
         # Always log the routing decision so multi-provider deployments can
@@ -255,29 +378,158 @@ class WebSearch(BaseTool):
             f"available={list(available)} query={q_preview!r} count={count} freshness={freshness}"
         )
 
+        if provider in available:
+            candidates = [provider] + [item for item in available if item != provider]
+        else:
+            # Configuration may be reloaded between resolution and execution;
+            # still honor the already-resolved provider for this call.
+            candidates = [provider]
+        failures = []
+        for attempt, candidate in enumerate(candidates, start=1):
+            if attempt > 1:
+                previous = candidates[attempt - 2]
+                logger.warning(
+                    "[WebSearch] provider=%s failed; falling back to provider=%s",
+                    previous,
+                    candidate,
+                )
+            reserved, usage_count, quota_limit = self._reserve_provider(candidate)
+            if not reserved:
+                logger.info(
+                    "[WebSearch] provider=%s skipped quota=%s/%s",
+                    candidate,
+                    usage_count,
+                    quota_limit,
+                )
+                failures.append(
+                    f"{PROVIDER_LABELS.get(candidate, candidate)}: local quota "
+                    f"reached ({usage_count}/{quota_limit})"
+                )
+                continue
+            logger.info(
+                "[WebSearch] provider=%s usage=%s%s",
+                candidate,
+                usage_count,
+                f"/{quota_limit}" if quota_limit is not None else "",
+            )
+            result = self._execute_provider(
+                candidate, query, count, freshness, summary
+            )
+            if result.status == "success":
+                return self._attach_citation_policy(result)
+            failures.append(f"{PROVIDER_LABELS.get(candidate, candidate)}: {result.result}")
+        return ToolResult.fail("Error: All search providers failed. " + " | ".join(failures))
+
+    def _execute_provider(
+        self, provider: str, query: str, count: int, freshness: str, summary: bool
+    ) -> ToolResult:
         try:
+            if provider == "tavily":
+                return self._search_tavily(query, count, freshness, summary)
             if provider == "bocha":
-                result = self._search_bocha(query, count, freshness, summary)
-            elif provider == "zhipu":
-                result = self._search_zhipu(query, count, freshness)
-            elif provider == "qianfan":
-                result = self._search_qianfan(query, count, freshness)
-            elif provider == "linkai":
-                result = self._search_linkai(query, count, freshness)
-            elif provider == "ddgs":
-                result = self._search_ddgs(query, count, freshness)
-            else:
-                return ToolResult.fail(f"Error: Unknown provider '{provider}'")
-            return self._attach_citation_policy(result)
+                return self._search_bocha(query, count, freshness, summary)
+            if provider == "zhipu":
+                return self._search_zhipu(query, count, freshness)
+            if provider == "qianfan":
+                return self._search_qianfan(query, count, freshness)
+            if provider == "linkai":
+                return self._search_linkai(query, count, freshness)
+            if provider == "ddgs":
+                return self._search_ddgs(query, count, freshness)
+            return ToolResult.fail(f"Error: Unknown provider '{provider}'")
         except requests.Timeout:
-            return ToolResult.fail(f"Error: Search request timed out after {DEFAULT_TIMEOUT}s")
+            return ToolResult.fail(
+                f"Error: Search request timed out after {DEFAULT_TIMEOUT}s"
+            )
         except requests.ConnectionError:
             return ToolResult.fail("Error: Failed to connect to search API")
         except DDGSException as e:
             return ToolResult.fail(f"Error: DDGS search failed - {e}")
         except Exception as e:
-            logger.error(f"[WebSearch] Unexpected error ({provider}): {e}", exc_info=True)
+            logger.error(
+                f"[WebSearch] Unexpected error ({provider}): {e}", exc_info=True
+            )
             return ToolResult.fail(f"Error: Search failed - {str(e)}")
+
+    # ------------------------------------------------------------------
+    # Tavily
+    # ------------------------------------------------------------------
+
+    def _search_tavily(
+        self, query: str, count: int, freshness: str, summary: bool
+    ) -> ToolResult:
+        api_key = _get_api_key("tavily")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: Dict[str, Any] = {
+            "query": query,
+            "search_depth": "basic",
+            "max_results": max(1, min(int(count or 10), 20)),
+            "include_answer": bool(summary),
+            "include_raw_content": False,
+        }
+        time_range = {
+            "oneDay": "day",
+            "oneWeek": "week",
+            "oneMonth": "month",
+            "oneYear": "year",
+        }.get(freshness)
+        if time_range:
+            payload["time_range"] = time_range
+        elif isinstance(freshness, str) and ".." in freshness:
+            start_date, end_date = freshness.split("..", 1)
+            if start_date.strip() and end_date.strip():
+                payload["start_date"] = start_date.strip()
+                payload["end_date"] = end_date.strip()
+
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            headers=headers,
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+        if resp.status_code == 401:
+            return ToolResult.fail("Error: Invalid Tavily API key.")
+        if resp.status_code == 429:
+            return ToolResult.fail("Error: Tavily API quota or rate limit reached.")
+        if resp.status_code != 200:
+            return ToolResult.fail(
+                f"Error: Tavily API returned HTTP {resp.status_code}: {resp.text[:200]}"
+            )
+
+        data = resp.json()
+        results = []
+        for item in data.get("results") or []:
+            url = str(item.get("url") or "").strip()
+            title = str(item.get("title") or "").strip()
+            if not url or not title:
+                continue
+            results.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "snippet": str(item.get("content") or "").strip(),
+                    "siteName": urlparse(url).hostname or "",
+                    "datePublished": str(item.get("published_date") or ""),
+                    "score": item.get("score"),
+                }
+            )
+        if not results:
+            return ToolResult.fail("Error: Tavily returned no results.")
+        output = {
+            "query": query,
+            "backend": "tavily",
+            "total": len(results),
+            "count": len(results),
+            "results": results,
+        }
+        if summary and data.get("answer"):
+            output["summary"] = data["answer"]
+        if data.get("usage"):
+            output["usage"] = data["usage"]
+        return ToolResult.success(output)
 
     # ------------------------------------------------------------------
     # Bocha
@@ -408,20 +660,35 @@ class WebSearch(BaseTool):
         }
 
         count = max(1, min(int(count or 10), 50))
+        weighted_length = 0
+        trimmed_chars = []
+        for char in query or "":
+            char_weight = 1 if ord(char) < 128 else 2
+            if weighted_length + char_weight > 72:
+                break
+            trimmed_chars.append(char)
+            weighted_length += char_weight
+        trimmed_query = "".join(trimmed_chars)
         payload: Dict[str, Any] = {
-            "messages": [{"role": "user", "content": query}],
+            "messages": [{"role": "user", "content": trimmed_query}],
+            "edition": "standard",
             "search_source": "baidu_search_v2",
             "resource_type_filter": [{"type": "web", "top_k": count}],
         }
 
-        # Baidu AI Search expects freshness as a date-range filter, not a
-        # named recency token. Translate our shared vocabulary into the
-        # underlying page_time range expected by the API.
-        search_filter = self._qianfan_build_freshness_filter(freshness)
-        if search_filter:
-            payload["search_filter"] = search_filter
+        recency = {
+            "oneWeek": "week",
+            "oneMonth": "month",
+            "oneYear": "year",
+        }.get(freshness)
+        if recency:
+            payload["search_recency_filter"] = recency
+        else:
+            search_filter = self._qianfan_build_freshness_filter(freshness)
+            if search_filter:
+                payload["search_filter"] = search_filter
 
-        logger.debug(f"[WebSearch] qianfan: query='{query}', count={count}, freshness={freshness!r}")
+        logger.debug(f"[WebSearch] qianfan: query='{trimmed_query}', count={count}, freshness={freshness!r}")
         resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
 
         if resp.status_code == 401:
@@ -444,6 +711,8 @@ class WebSearch(BaseTool):
                 "siteName": d.get("web_anchor") or d.get("website") or "",
                 "datePublished": d.get("date", ""),
             })
+        if not results:
+            return ToolResult.fail("Error: Baidu Search returned no results.")
         return ToolResult.success({
             "query": query, "backend": "qianfan",
             "total": len(results), "count": len(results), "results": results,
@@ -556,7 +825,15 @@ class WebSearch(BaseTool):
             f"[WebSearch] ddgs: query='{query}', count={kwargs['max_results']}, "
             f"freshness={freshness!r}"
         )
-        rows = DDGS(timeout=DEFAULT_TIMEOUT).text(query, **kwargs) or []
+        try:
+            rows = DDGS(timeout=DEFAULT_TIMEOUT).text(query, **kwargs) or []
+        except DDGSException as exc:
+            # DDGS raises for a legitimate empty result set in recent
+            # versions; keep transport failures as errors.
+            if "no results" not in str(exc).lower():
+                raise
+            logger.info("[WebSearch] DDGS returned no results query=%r", query)
+            rows = []
         results = []
         for row in rows:
             title = (row.get("title") or "").strip()
@@ -570,9 +847,6 @@ class WebSearch(BaseTool):
                 "siteName": row.get("source") or (urlparse(url).hostname or ""),
                 "datePublished": row.get("date") or "",
             })
-
-        if not results:
-            return ToolResult.fail("Error: DDGS returned no results. Refine the query and try again.")
 
         return ToolResult.success({
             "query": query,

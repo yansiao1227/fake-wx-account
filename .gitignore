@@ -17,6 +17,7 @@ logs/
 workspace
 config.yaml
 user_datas.pkl
+web_search_usage.db
 chatgpt_tool_hub/
 plugins/**/
 !plugins/bdunit

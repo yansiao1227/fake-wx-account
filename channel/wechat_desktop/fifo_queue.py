@@ -277,6 +277,39 @@ class WechatReplyQueue:
                 **{f"queue_{key}": value for key, value in self._counts.items()},
             }
 
+    def clear_pending(self) -> list[str]:
+        """Discard global and active-conversation pending work, not the active item."""
+        discarded_event_ids: list[str] = []
+        with self._lock:
+            for item in (*self._active_followups, *self._ready_continuations):
+                discarded_event_ids.append(item.event.event_id)
+                discarded_event_ids.extend(item.superseded_event_ids)
+                self._pending_ids.discard(item.event.event_id)
+                for event_id in item.superseded_event_ids:
+                    self._pending_ids.discard(event_id)
+            self._active_followups.clear()
+            self._ready_continuations.clear()
+
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is self._STOP:
+                    self._queue.put(self._STOP)
+                    self._queue.task_done()
+                    break
+                discarded_event_ids.append(item.event.event_id)
+                discarded_event_ids.extend(item.superseded_event_ids)
+                self._pending_ids.discard(item.event.event_id)
+                for event_id in item.superseded_event_ids:
+                    self._pending_ids.discard(event_id)
+                self._pending_by_conversation.pop(
+                    str(item.event.conversation_id), None
+                )
+                self._queue.task_done()
+        return list(dict.fromkeys(discarded_event_ids))
+
     def stop(self) -> int:
         discarded = 0
         with self._lock:
