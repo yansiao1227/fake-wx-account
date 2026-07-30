@@ -48,6 +48,7 @@ class WechatUiaDriver:
         self._reply_conversation = ""
         self._reply_conversation_id = ""
         self._last_reply_monitor_at = 0.0
+        self._interim_texts: dict[str, set[str]] = {}
 
     def _trace(self, stage: str, message: str, *args) -> None:
         if bool(self.config.get("diagnostic_logging", False)):
@@ -68,10 +69,35 @@ class WechatUiaDriver:
         self._reply_in_flight.set()
 
     def end_reply_cycle(self):
+        conversation_id = self._reply_conversation_id
         self._reply_conversation = ""
         self._reply_conversation_id = ""
         self._last_reply_monitor_at = 0.0
         self._reply_in_flight.clear()
+        if conversation_id:
+            self._interim_texts.pop(conversation_id, None)
+
+    def register_interim_text(self, conversation_id: str, text: str):
+        """Keep an Agent progress notice from becoming a new reply target."""
+        conversation_id = str(conversation_id or "")
+        text = str(text or "").strip()
+        if conversation_id and text:
+            self._interim_texts.setdefault(conversation_id, set()).add(text)
+
+    def forget_interim_text(self, conversation_id: str, text: str):
+        texts = self._interim_texts.get(str(conversation_id or ""))
+        if not texts:
+            return
+        texts.discard(str(text or "").strip())
+        if not texts:
+            self._interim_texts.pop(str(conversation_id or ""), None)
+
+    def _is_interim_message(
+        self, conversation_id: str, message: UiaChatMessage
+    ) -> bool:
+        return str(message.content or "").strip() in self._interim_texts.get(
+            str(conversation_id or ""), set()
+        )
 
     def _is_reply_conversation(self, row_key: str, row) -> bool:
         return self.reply_in_flight and (
@@ -280,12 +306,15 @@ class WechatUiaDriver:
         messages: list[UiaChatMessage],
         is_group: bool,
         owner: str,
+        conversation_id: str = "",
     ) -> tuple[int, Optional[UiaChatMessage]]:
         """Classify visible nodes newest-first without using message direction."""
         if not messages:
             return -1, None
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
+            if self._is_interim_message(conversation_id, message):
+                continue
             if not is_group or self._mentions_owner(message.content, owner):
                 return index, message
         return -1, None
@@ -295,6 +324,7 @@ class WechatUiaDriver:
         messages: list[UiaChatMessage],
         target_index: int,
         is_group: bool,
+        conversation_id: str = "",
     ) -> list[dict]:
         target = messages[target_index] if 0 <= target_index < len(messages) else None
         followup_limit = max(
@@ -313,6 +343,7 @@ class WechatUiaDriver:
             message
             for index, message in enumerate(messages)
             if start <= index < end and index != target_index
+            and not self._is_interim_message(conversation_id, message)
         ]
         history = []
         for message in context_messages:
@@ -544,7 +575,7 @@ class WechatUiaDriver:
                         owner or "<empty>",
                     )
                     target_index, message = self._select_reply_target(
-                        messages, is_group, owner
+                        messages, is_group, owner, row_key
                     )
                     if message is None:
                         reason = (
@@ -580,7 +611,9 @@ class WechatUiaDriver:
                         and row.preview_has_sender_prefix
                     ):
                         message = replace(message, sender_name=row.preview_sender)
-                    history = self._history_snapshot(messages, target_index, is_group)
+                    history = self._history_snapshot(
+                        messages, target_index, is_group, row_key
+                    )
                     ordinal += 1
                     event = self._event(
                         row_key,
@@ -645,7 +678,9 @@ class WechatUiaDriver:
             # is still queued in the active conversation's local FIFO.
             return ReplyTargetValidation(True)
         owner = self.client.get_owner_info().nick_name
-        index, target = self._select_reply_target(messages, event.is_group, owner)
+        index, target = self._select_reply_target(
+            messages, event.is_group, owner, event.conversation_id
+        )
         if target is None:
             return ReplyTargetValidation(False, "reply target is no longer visible")
         target_key = self._target_key(target, index)
@@ -665,7 +700,9 @@ class WechatUiaDriver:
                 event.conversation_id,
                 title,
                 target,
-                self._history_snapshot(messages, index, event.is_group),
+                self._history_snapshot(
+                    messages, index, event.is_group, event.conversation_id
+                ),
                 event.is_group,
                 bool(event.is_group),
                 0,

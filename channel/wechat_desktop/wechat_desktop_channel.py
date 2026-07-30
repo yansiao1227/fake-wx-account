@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import threading
@@ -60,6 +61,18 @@ DEFAULT_CONFIG = {
     "official_account_knowledge_max_chars": 4000,
     "diagnostic_logging": False,
     "reply_cycle_timeout_seconds": 180,
+    "agent_tool_notice_enabled": True,
+    "agent_tool_notice_once_per_reply": True,
+    "agent_skill_notice_templates": [
+        "这题得请 `{name}` skill 出场了，我去搬个救兵，稍等一下 🧰",
+        "我先翻开 `{name}` skill 的小抄，马上回来 📖",
+        "正在召唤 `{name}` skill，答案已经在路上了 ✨",
+    ],
+    "agent_tool_notice_templates": [
+        "我准备调用 `{name}` tool 查一查，稍等我操作一下 🔧",
+        "轮到 `{name}` tool 上场了，我去后台忙活一下 🛠️",
+        "先让 `{name}` tool 跑一趟，别走开，马上带结果回来 🚀",
+    ],
     "auto_reply_contacts": [],
     "auto_reply_groups": [],
     "group_reply_mode": "at_only",
@@ -101,6 +114,24 @@ def _normalize_auto_reply_text(value) -> str:
             text = text[len(left):-len(right)].strip()
             break
     return text
+
+
+def _tool_notice_subject(data: dict) -> tuple[str, str]:
+    """Return (kind, display name), recognizing reads of a skill's SKILL.md."""
+    tool_name = str(data.get("tool_name") or "tool").strip() or "tool"
+    arguments = data.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (TypeError, ValueError):
+            arguments = {}
+    if isinstance(arguments, dict):
+        for key in ("path", "file_path", "location"):
+            value = str(arguments.get(key) or "").replace("\\", "/").rstrip("/")
+            match = re.search(r"(?:^|/)skills/([^/]+)/SKILL\.md$", value, re.I)
+            if match:
+                return "skill", match.group(1)
+    return "tool", tool_name
 
 
 def _is_network_reply_error(value) -> bool:
@@ -812,6 +843,7 @@ class WechatDesktopChannel(ChatChannel):
             context["wechat_desktop_reply_cycle"] = True
             context["wechat_desktop_queue_token"] = queue_token
             context["wechat_desktop_queue_terminal"] = "completed"
+            context["on_event"] = self._make_agent_event_callback(context)
             self._driver.begin_reply_cycle(
                 event.conversation_name, event.conversation_id
             )
@@ -828,6 +860,132 @@ class WechatDesktopChannel(ChatChannel):
             event.event_id[:10],
         )
         return False
+
+    def _make_agent_event_callback(self, context: Context):
+        downstream = context.get("on_event")
+        lock = threading.Lock()
+        seen_tool_calls: set[str] = set()
+        notice_sent = False
+
+        def on_event(event: dict):
+            nonlocal notice_sent
+            try:
+                if (
+                    event.get("type") == "tool_execution_start"
+                    and bool(self.config.get("agent_tool_notice_enabled", True))
+                ):
+                    data = event.get("data", {})
+                    tool_call_id = str(
+                        data.get("tool_call_id") or data.get("tool_name") or "tool"
+                    )
+                    with lock:
+                        once = bool(
+                            self.config.get("agent_tool_notice_once_per_reply", True)
+                        )
+                        if tool_call_id not in seen_tool_calls and not (
+                            once and notice_sent
+                        ):
+                            seen_tool_calls.add(tool_call_id)
+                            notice_sent = self._send_agent_tool_notice(
+                                context, data
+                            ) or notice_sent
+            except Exception as exc:
+                logger.warning(
+                    "[WechatDesktop] Agent tool notice failed: %s", exc
+                )
+            finally:
+                if downstream:
+                    downstream(event)
+
+        return on_event
+
+    def _send_agent_tool_notice(self, context: Context, data: dict) -> bool:
+        queue_token = str(context.get("wechat_desktop_queue_token") or "")
+        if queue_token and not self._reply_queue.is_active(queue_token):
+            return False
+
+        msg = context.get("msg")
+        target_name = (
+            getattr(msg, "other_user_nickname", "")
+            or context.get("receiver", "")
+        )
+        target_id = (
+            getattr(msg, "other_user_id", "")
+            or context.get("receiver", "")
+        )
+        send_target = (
+            target_id
+            if str(target_id).startswith("uia-session:")
+            else target_name
+        )
+        is_group = bool(context.get("isgroup", False))
+        if (
+            bool(self._service.status().get("paused"))
+            or bool(self.config.get("shadow_mode", True))
+            or self._policy.is_blocked(target_name)
+            or not self._policy.is_allowlisted(target_name, is_group)
+        ):
+            return False
+
+        kind, name = _tool_notice_subject(data)
+        name = re.sub(r"[\r\n`]+", " ", name).strip()[:80] or kind
+        template_key = (
+            "agent_skill_notice_templates"
+            if kind == "skill"
+            else "agent_tool_notice_templates"
+        )
+        templates = [
+            str(item)
+            for item in self.config.get(template_key, [])
+            if str(item).strip()
+        ]
+        if not templates:
+            templates = ["我准备调用 `{name}` " + kind + "，稍等一下 🛠️"]
+        try:
+            notice = random.choice(templates).format(name=name)
+        except (KeyError, ValueError):
+            notice = f"我准备调用 `{name}` {kind}，稍等一下 🛠️"
+
+        event = getattr(msg, "event", None)
+        conversation_id = str(
+            getattr(event, "conversation_id", "") or target_id
+        )
+        self._driver.register_interim_text(conversation_id, notice)
+        try:
+            result = self._driver.send_text(send_target, notice)
+            if not result.get("success"):
+                raise RuntimeError(str(result.get("message") or "send failed"))
+        except Exception:
+            self._driver.forget_interim_text(conversation_id, notice)
+            raise
+
+        self._store.append_conversation_history(
+            conversation_id=target_id,
+            conversation_name=target_name,
+            sender_name=str(self.config.get("self_display_name") or "我"),
+            direction="outgoing",
+            content_type="text",
+            content=notice,
+            source_type=str(
+                context.get("wechat_desktop_source_type", "unknown")
+            ),
+        )
+        self._store.audit(
+            "agent_tool_notice",
+            target_name,
+            "success" if result.get("verified") else "unverified",
+            self._content_hash(notice),
+            detail=f"{kind}={name}",
+        )
+        self._trace(
+            "10-tool-notice",
+            "target=%s kind=%s name=%s verified=%s",
+            target_name,
+            kind,
+            name,
+            bool(result.get("verified")),
+        )
+        return True
 
     def _accept_replacement_event(self, event: WechatDesktopEvent):
         """Apply the same safety gates before queuing a send-time replacement."""

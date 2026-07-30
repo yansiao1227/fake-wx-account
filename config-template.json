@@ -81,6 +81,18 @@
     "shell_hook_debounce_ms": 250,
     "reply_monitor_interval_seconds": 1.0,
     "active_conversation_burst_limit": 5,
+    "agent_tool_notice_enabled": true,
+    "agent_tool_notice_once_per_reply": true,
+    "agent_skill_notice_templates": [
+        "这题得请 `{name}` skill 出场了，我去搬个救兵，稍等一下 🧰",
+        "我先翻开 `{name}` skill 的小抄，马上回来 📖",
+        "正在召唤 `{name}` skill，答案已经在路上了 ✨"
+    ],
+    "agent_tool_notice_templates": [
+        "我准备调用 `{name}` tool 查一查，稍等我操作一下 🔧",
+        "轮到 `{name}` tool 上场了，我去后台忙活一下 🛠️",
+        "先让 `{name}` tool 跑一趟，别走开，马上带结果回来 🚀"
+    ],
     "auto_reply_private_all": false,
     "auto_reply_groups_all": false,
     "auto_reply_blacklist": [],

@@ -17,7 +17,10 @@ from channel.wechat_desktop.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia_client import WechatUiaClient, parse_session_accessible_name
 from channel.wechat_desktop.uia_driver import WechatUiaDriver
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
-from channel.wechat_desktop.wechat_desktop_channel import _is_network_reply_error
+from channel.wechat_desktop.wechat_desktop_channel import (
+    _is_network_reply_error,
+    _tool_notice_subject,
+)
 
 
 def test_send_button_uses_real_click_and_restores_cursor(monkeypatch):
@@ -1502,6 +1505,57 @@ def test_reply_cycle_monitors_private_conversation_without_unread_marker():
     _, monitored_events = driver.observe_events()
 
     assert [event.content for event in monitored_events] == ["new"]
+
+
+def test_reply_cycle_ignores_interim_tool_notice_but_still_finds_followup():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [incoming("old", "1")]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+    _, first_events = driver.observe_events()
+    original = first_events[0]
+    driver.begin_reply_cycle("Alice", original.conversation_id)
+    notice = "我准备调用 `web_search` tool 查一查，稍等一下 🔧"
+    driver.register_interim_text(original.conversation_id, notice)
+    client.rows = [row("Alice", unread=0, signature="unchanged")]
+    client.histories["Alice"] = [
+        incoming("old", "1"),
+        outgoing(notice, "2"),
+    ]
+
+    _, notice_events = driver.observe_events()
+
+    assert notice_events == []
+    assert driver.validate_reply_target(original).valid is True
+
+    client.histories["Alice"].append(incoming("new", "3"))
+    _, followup_events = driver.observe_events()
+
+    assert [event.content for event in followup_events] == ["new"]
+    assert notice not in [
+        item["content"] for item in followup_events[0].history
+    ]
+
+
+def test_tool_notice_subject_recognizes_skill_reads_and_regular_tools():
+    assert _tool_notice_subject(
+        {
+            "tool_name": "read",
+            "arguments": {"path": r"C:\cow\skills\web-search\SKILL.md"},
+        }
+    ) == ("skill", "web-search")
+    assert _tool_notice_subject(
+        {
+            "tool_name": "read",
+            "arguments": '{"location":"skills/vision/SKILL.md"}',
+        }
+    ) == ("skill", "vision")
+    assert _tool_notice_subject(
+        {"tool_name": "web_search", "arguments": {"query": "天气"}}
+    ) == ("tool", "web_search")
 
 
 def test_reply_cycle_monitors_group_without_session_mention_marker():
