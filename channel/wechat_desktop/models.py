@@ -39,6 +39,17 @@ class HeaderInfo:
 
 
 @dataclass(frozen=True)
+class UiaReferencedMessage:
+    sender_name: str
+    content: str
+    message_type: str = "text"
+    file_path: str = ""
+    resolved: bool = False
+    degraded: bool = False
+    strategy: str = ""
+
+
+@dataclass(frozen=True)
 class UiaChatMessage:
     sender_name: str
     content: str
@@ -48,6 +59,7 @@ class UiaChatMessage:
     bounds: Optional[Tuple[int, int, int, int]] = None
     file_path: str = ""
     stable_id: str = ""
+    reference: Optional[UiaReferencedMessage] = None
 
 
 @dataclass
@@ -66,7 +78,11 @@ class WechatDesktopEvent:
     evidence_path: str = ""
     bounds: Optional[Tuple[int, int, int, int]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
+    reference: Dict[str, Any] = field(default_factory=dict)
     target_key: str = ""
+    message_runtime_id: str = ""
+    message_stable_id: str = ""
+    content_signature: str = ""
     session_unread_count: int = 0
     observed_at: float = field(default_factory=time.time)
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -85,7 +101,6 @@ class WechatDesktopEvent:
             "sender_id": self.sender_id,
             "content_type": self.content_type,
             "content": fingerprint_content,
-            "direction": self.direction,
             "source_type": self.source_type,
             "bounds": self.bounds,
         }

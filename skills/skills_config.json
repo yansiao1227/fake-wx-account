@@ -1,8 +1,22 @@
 {
+    "amap-map": {
+        "name": "amap-map",
+        "description": "使用高德地图 Web 服务查询地点、周边 POI、地址与坐标，并规划步行、骑行或驾车路线。用户询问位置、附近地点、地址解析或路线时使用。",
+        "source": "clawhub",
+        "enabled": true,
+        "category": "skill"
+    },
     "analyze-url": {
         "name": "analyze-url",
         "description": "Analyze an HTTP or HTTPS URL, decide whether it points to a downloadable file or a web page, and route it appropriately. Use whenever the user provides a URL to open, read, inspect, summarize, or extract content from: download files into the workspace tmp directory and parse them with a suitable tool; fetch non-file web pages with web_fetch.",
         "source": "project",
+        "enabled": true,
+        "category": "skill"
+    },
+    "baidu-hot-cn": {
+        "name": "baidu-hot-cn",
+        "description": "获取真实的百度热搜榜单。用户询问百度热搜、当前热点，或民生、财经、体育、文娱、国际、挑战、电影、电视剧、小说榜时使用。",
+        "source": "clawhub",
         "enabled": true,
         "category": "skill"
     },

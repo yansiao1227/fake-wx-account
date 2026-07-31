@@ -1,5 +1,7 @@
 import threading
 import time
+import logging
+import queue
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,16 +13,25 @@ from channel.wechat_desktop.models import (
     HeaderInfo,
     OwnerInfo,
     UiaChatMessage,
+    UiaReferencedMessage,
     WechatDesktopEvent,
 )
 from channel.wechat_desktop.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia_client import WechatUiaClient, parse_session_accessible_name
-from channel.wechat_desktop.uia_driver import WechatUiaDriver
+from channel.wechat_desktop.uia_driver import (
+    WechatUiaDriver,
+    _UiaPriorityCoordinator,
+)
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
 from channel.wechat_desktop.wechat_desktop_channel import (
+    ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+    WechatDesktopChannel,
     _is_network_reply_error,
+    _preflight_tool_notice_data,
+    _render_event_context_lines,
     _tool_notice_subject,
 )
+from common.log import logger
 
 
 def test_send_button_uses_real_click_and_restores_cursor(monkeypatch):
@@ -313,6 +324,86 @@ def test_send_message_splits_and_verifies_each_chunk(monkeypatch):
     }
 
 
+def test_send_message_retries_uncleared_input_with_enter_after_verification(
+    monkeypatch,
+):
+    client = WechatUiaClient({})
+    enter_retries = []
+    verification_results = iter(
+        [
+            {
+                "success": True,
+                "verified": False,
+                "message": "not visible yet",
+            },
+            {"success": True, "verified": True, "runtime_id": "sent-1"},
+        ]
+    )
+
+    @contextmanager
+    def fake_clipboard(unicode_text=None, files=None):
+        assert unicode_text == "working"
+        assert files is None
+        yield
+
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "_clipboard", fake_clipboard)
+    monkeypatch.setattr(
+        client,
+        "_paste_and_send",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("WeChat Send button did not clear the reply input")
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "_verify_send",
+        lambda *_args, **_kwargs: next(verification_results),
+    )
+    monkeypatch.setattr(
+        client,
+        "_send_existing_input_with_enter",
+        lambda text: enter_retries.append(text) or True,
+    )
+
+    result = client.send_message("Alice", "working", expedited=True)
+
+    assert enter_retries == ["working"]
+    assert result["success"] is True
+    assert result["verified"] is True
+
+
+def test_expedited_send_skips_pacing_and_does_not_delay_next_reply(monkeypatch):
+    client = WechatUiaClient({"uia_text_chunk_chars": 500})
+    waits = []
+
+    @contextmanager
+    def fake_clipboard(unicode_text=None, files=None):
+        assert unicode_text == "working"
+        assert files is None
+        yield
+
+    monkeypatch.setattr(client, "_wait_for_send_slot", lambda who: waits.append(who))
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "_clipboard", fake_clipboard)
+    monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
+    monkeypatch.setattr(
+        client,
+        "_verify_send",
+        lambda *_args, **_kwargs: {"success": True, "verified": True},
+    )
+
+    client.send_message("Alice", "working", expedited=True)
+
+    assert waits == []
+    assert client._last_send_at == 0.0
+    assert client._last_conversation_send == {}
+
+
 class GeometryControl:
     def __init__(
         self,
@@ -442,6 +533,211 @@ def test_referenced_image_card_is_classified_from_wechat_uia_shape():
     assert classify("mmui::ChatTextItemView", "图片") == "text"
 
 
+def test_flattened_reference_label_separates_current_message_and_one_preview():
+    parsed = WechatUiaClient._parse_reference_label(
+        "测试引用引用 Alice 的消息 : Bob 引用 Carol 的消息 : 完整原文"
+    )
+
+    assert parsed == {
+        "current": "测试引用",
+        "sender": "Alice",
+        "preview": "Bob 引用 Carol 的消息 : 完整原文",
+    }
+
+
+def test_reference_history_contains_only_the_single_original_message():
+    reference = UiaReferencedMessage(
+        "Alice",
+        "完整原文",
+        resolved=True,
+        strategy="wechat_locate_original",
+    )
+    messages = [
+        UiaChatMessage("Alice", "older", direction="incoming"),
+        UiaChatMessage(
+            "Alice",
+            "当前问题",
+            direction="incoming",
+            reference=reference,
+        ),
+        UiaChatMessage("Alice", "newer", direction="incoming"),
+    ]
+    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
+
+    history = driver._history_snapshot(messages, 1, False)
+
+    assert history == [
+        {
+            "sender_name": "",
+            "content": "完整原文",
+            "content_type": "text",
+            "is_reference": True,
+            "resolved": True,
+            "degraded": False,
+            "strategy": "wechat_locate_original",
+        }
+    ]
+
+
+def test_reference_attachment_is_added_to_event_without_changing_current_type():
+    reference = UiaReferencedMessage(
+        "Alice",
+        "图片",
+        message_type="image",
+        file_path="C:/tmp/reference.png",
+        resolved=True,
+        strategy="wechat_locate_original",
+    )
+    message = UiaChatMessage(
+        "Alice",
+        "这是什么",
+        direction="incoming",
+        reference=reference,
+    )
+    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
+
+    event = driver._event(
+        "session", "Alice", message, [], False, False, 0, "target"
+    )
+
+    assert event.content_type == "text"
+    assert event.content == "这是什么"
+    assert event.evidence_path == "C:/tmp/reference.png"
+    assert event.reference["depth"] == 1
+    assert event.reference["file_path"] == "C:/tmp/reference.png"
+
+
+def test_reference_context_renderer_labels_only_the_original_message():
+    event = WechatDesktopEvent(
+        "message",
+        "session",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "当前问题",
+        history=[
+            {
+                "sender_name": "Alice",
+                "content": "完整原文",
+                "content_type": "text",
+                "is_reference": True,
+            }
+        ],
+        reference={
+            "sender_name": "Alice",
+            "content": "完整原文",
+            "content_type": "text",
+            "depth": 1,
+        },
+    )
+
+    heading, lines = _render_event_context_lines(event)
+
+    assert heading == "[被引用的原消息，仅追溯这一层]"
+    assert lines == ["Alice: 完整原文"]
+    assert "当前问题" not in "\n".join(lines)
+
+
+def test_reply_target_image_requests_viewer_quality_capture():
+    client = FakeClient()
+    calls = []
+
+    def fetch_image(message, prefer_viewer=True):
+        calls.append(prefer_viewer)
+        return "C:/tmp/viewer.png"
+
+    client.fetch_message_image = fetch_image
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    message = UiaChatMessage(
+        "Alice",
+        "图片",
+        message_type="image",
+        bounds=(100, 100, 300, 260),
+    )
+
+    resolved, resolve_count = driver._resolve_reply_target_message("a", message)
+
+    assert calls == [True]
+    assert resolved.file_path == "C:/tmp/viewer.png"
+    assert resolve_count == 1
+
+
+def test_reply_target_skips_verified_outgoing_without_using_direction():
+    for observed_direction in ("incoming", "outgoing", "unknown"):
+        client = WechatUiaClient({"outgoing_echo_suppression_seconds": 300})
+        client.remember_outgoing_message(
+            "Alice", "机器人刚发的回复", "bot-runtime"
+        )
+        driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+        messages = [
+            UiaChatMessage(
+                "",
+                "对方的新消息",
+                direction="unknown",
+                runtime_id="user-runtime",
+            ),
+            UiaChatMessage(
+                "",
+                "机器人刚发的回复",
+                direction=observed_direction,
+                runtime_id="bot-runtime",
+            ),
+        ]
+
+        index, target = driver._select_reply_target(
+            messages, False, "", "session", "Alice"
+        )
+
+        assert index == 0
+        assert target.content == "对方的新消息"
+
+
+def test_private_scan_excludes_verified_outgoing_before_history_and_queue():
+    client = WechatUiaClient({"outgoing_echo_suppression_seconds": 300})
+    client.remember_outgoing_message(
+        "Alice", "这题得请 pdf-reader skill 出场了", "notice-runtime"
+    )
+    client.remember_outgoing_message(
+        "Alice", "机器人最终回复", "reply-runtime"
+    )
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    incoming = UiaChatMessage(
+        "Alice", "用户新消息", runtime_id="incoming-runtime"
+    )
+    notice = UiaChatMessage(
+        "", "这题得请 pdf-reader skill 出场了", runtime_id="notice-runtime"
+    )
+    reply = UiaChatMessage(
+        "", "机器人最终回复", runtime_id="reply-runtime"
+    )
+
+    filtered = driver._exclude_private_outgoing_messages(
+        [incoming, notice, reply], "Alice", False
+    )
+
+    assert filtered == [incoming]
+    assert driver._exclude_private_outgoing_messages(
+        [incoming, notice, reply], "Alice", True
+    ) == [incoming, notice, reply]
+
+
+def test_event_fingerprint_does_not_depend_on_observed_direction():
+    common = dict(
+        kind="message",
+        conversation_id="session",
+        conversation_name="Alice",
+        sender_id="alice",
+        sender_name="Alice",
+        content_type="text",
+        content="hello",
+    )
+    incoming_event = WechatDesktopEvent(**common, direction="incoming")
+    unknown_event = WechatDesktopEvent(**common, direction="unknown")
+
+    assert incoming_event.fingerprint() == unknown_event.fingerprint()
+
+
 def test_file_card_metadata_parses_wechat_binary_units():
     filename, size = WechatUiaClient._file_card_metadata(
         "文件\n季度报告.xlsx\n684.2K\n微信电脑版"
@@ -534,15 +830,15 @@ def test_message_sender_uses_geometry_direction_for_self_and_private_peer():
 
     assert incoming_direction == "incoming"
     assert WechatUiaClient._message_sender(
-        incoming_direction, header, owner, incoming_row, "对方消息"
+        header, incoming_row, "对方消息"
     ) == "颜料盒"
     assert outgoing_direction == "outgoing"
     assert WechatUiaClient._message_sender(
-        outgoing_direction, header, owner, outgoing_row, "自己的消息"
-    ) == owner
+        header, outgoing_row, "自己的消息"
+    ) == "颜料盒"
 
 
-def test_message_sender_reads_group_member_only_for_incoming_message():
+def test_message_sender_reads_group_member_without_direction():
     member = GeometryControl((130, 100, 220, 120), "群成员甲", "Text")
     bubble = GeometryControl((120, 130, 420, 190), "群消息", "ChatTextBubble")
     row = GeometryControl(
@@ -550,11 +846,8 @@ def test_message_sender_reads_group_member_only_for_incoming_message():
     )
 
     assert WechatUiaClient._message_sender(
-        "incoming", HeaderInfo("测试群", "group", 3), "当前账号", row, "群消息"
+        HeaderInfo("测试群", "group", 3), row, "群消息"
     ) == "群成员甲"
-    assert WechatUiaClient._message_sender(
-        "outgoing", HeaderInfo("测试群", "group", 3), "当前账号", row, "群消息"
-    ) == "当前账号"
 
 
 def test_history_member_filter_selects_unique_self_candidate():
@@ -683,6 +976,7 @@ class FakeClient:
         self.histories = {}
         self.headers = {}
         self.history_calls = []
+        self.history_ensure_conversation = []
         self.focus_calls = 0
         self.owner_calls = 0
         self.seeded_outgoing = {}
@@ -724,11 +1018,19 @@ class FakeClient:
             return self.headers[key] if key in self.headers else self.headers[name]
         return next(iter(self.headers.values()), HeaderInfo("", "unknown", 1))
 
-    def get_chat_history(self, name=None, limit=5, runtime_id="", row_index=-1):
+    def get_chat_history(
+        self,
+        name=None,
+        limit=5,
+        runtime_id="",
+        row_index=-1,
+        ensure_conversation=True,
+    ):
         if name:
             self.selected = name
             self.selected_key = runtime_id or name
         self.history_calls.append(name)
+        self.history_ensure_conversation.append(ensure_conversation)
         return list(self.histories.get(runtime_id or name, []))[-limit:]
 
     def fetch_message_file(self, message):
@@ -992,10 +1294,17 @@ def test_private_file_target_is_fetched_and_event_uses_local_path(tmp_path):
 
     _, events = driver.observe_events()
 
-    assert client.file_fetches == ["report.pdf 8 KB"]
+    assert client.file_fetches == []
     assert len(events) == 1
     assert events[0].content_type == "file"
-    assert events[0].content == str(local_file)
+    assert events[0].content == "report.pdf 8 KB"
+
+    materialized, resolve_count = driver.materialize_event(events[0])
+
+    assert client.file_fetches == ["report.pdf 8 KB"]
+    assert resolve_count == 1
+    assert materialized.content_type == "file"
+    assert materialized.content == str(local_file)
 
 
 def test_private_image_target_is_captured_and_event_uses_local_path(tmp_path):
@@ -1022,14 +1331,19 @@ def test_private_image_target_is_captured_and_event_uses_local_path(tmp_path):
 
     _, events = driver.observe_events()
 
-    assert client.image_fetches == ["[图片]"]
+    assert client.image_fetches == []
     assert len(events) == 1
     assert events[0].content_type == "image"
-    assert events[0].content == str(local_image)
-    assert events[0].evidence_path == str(local_image)
+
+    materialized, resolve_count = driver.materialize_event(events[0])
+
+    assert client.image_fetches == ["[图片]"]
+    assert resolve_count == 1
+    assert materialized.content == str(local_image)
+    assert materialized.evidence_path == str(local_image)
 
 
-def test_attachment_history_keeps_all_previous_and_limits_followups():
+def test_attachment_history_keeps_previous_and_excludes_all_followups():
     messages = [incoming(f"before-{index}", str(index)) for index in range(6)]
     messages.append(
         UiaChatMessage(
@@ -1042,11 +1356,7 @@ def test_attachment_history_keeps_all_previous_and_limits_followups():
         )
     )
     messages.extend(incoming(f"after-{index}", f"a{index}") for index in range(6))
-    driver = WechatUiaDriver(
-        {"attachment_context_window_messages": 2},
-        client=FakeClient(),
-        shell_hook=FakeHook(),
-    )
+    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
 
     history = driver._history_snapshot(messages, 6, False)
 
@@ -1057,35 +1367,10 @@ def test_attachment_history_keeps_all_previous_and_limits_followups():
         "before-3",
         "before-4",
         "before-5",
-        "after-0",
-        "after-1",
     ]
 
 
-def test_attachment_history_can_disable_followup_absorption():
-    messages = [
-        incoming("before", "before"),
-        UiaChatMessage(
-            "Alice",
-            "report.pdf",
-            message_type="file",
-            direction="incoming",
-            runtime_id="file-target",
-        ),
-        incoming("after", "after"),
-    ]
-    driver = WechatUiaDriver(
-        {"attachment_context_window_messages": 0},
-        client=FakeClient(),
-        shell_hook=FakeHook(),
-    )
-
-    history = driver._history_snapshot(messages, 1, False)
-
-    assert [item["content"] for item in history] == ["before"]
-
-
-def test_private_text_target_includes_preceding_downloaded_file_in_history(tmp_path):
+def test_private_text_target_does_not_resolve_preceding_visible_file(tmp_path):
     local_file = tmp_path / "tmp" / "wechat_files" / "report.pdf"
     local_file.parent.mkdir(parents=True)
     local_file.write_bytes(b"%PDF-test")
@@ -1108,10 +1393,13 @@ def test_private_text_target_includes_preceding_downloaded_file_in_history(tmp_p
     )
 
     _, events = driver.observe_events()
+    materialized, resolve_count = driver.materialize_event(events[0])
 
     assert [event.content for event in events] == ["读取这个文件"]
-    assert events[0].history[0]["content_type"] == "file"
-    assert events[0].history[0]["content"] == f"[文件: {local_file}]"
+    assert resolve_count == 0
+    assert client.file_fetches == []
+    assert materialized.history[0]["content_type"] == "file"
+    assert str(local_file) not in materialized.history[0]["content"]
 
 
 def test_private_message_after_outgoing_is_the_only_reply_target():
@@ -1312,7 +1600,7 @@ def test_reply_queue_is_global_fifo_and_rejects_duplicates():
     assert "queue_approval" not in reply_queue.status()
 
 
-def test_reply_queue_replaces_pending_target_from_same_conversation():
+def test_reply_queue_appends_pending_target_from_same_conversation():
     reply_queue = WechatReplyQueue()
     old = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "old"
@@ -1322,14 +1610,14 @@ def test_reply_queue_replaces_pending_target_from_same_conversation():
     )
 
     assert reply_queue.enqueue(old).action == "added"
-    assert reply_queue.enqueue(new).action == "replaced_pending"
-    item = reply_queue.get()
+    assert reply_queue.enqueue(new).action == "added"
+    first = reply_queue.get()
+    assert first.event is old
+    reply_queue.finish(first, "completed")
+    assert reply_queue.get().event is new
 
-    assert item.event.content == "new"
-    assert item.superseded_event_ids == [old.event_id]
 
-
-def test_reply_queue_collects_private_followup_outside_global_fifo():
+def test_reply_queue_private_followup_does_not_expire_active():
     reply_queue = WechatReplyQueue()
     old = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "old"
@@ -1342,16 +1630,17 @@ def test_reply_queue_collects_private_followup_outside_global_fifo():
 
     result = reply_queue.enqueue(new)
 
-    assert result.action == "collected_active_private"
-    assert result.cancel_event_id == old.event_id
-    assert active.expired is True
-    assert active.terminal == "superseded"
-    reply_queue.finish(active, "superseded")
+    assert result.action == "added"
+    assert active.expired is False
+    assert active.terminal == ""
+    assert reply_queue.is_relevant(active.token, "a") is True
+    assert reply_queue.is_relevant(active.token, "b") is True
+    reply_queue.finish(active, "completed")
     assert reply_queue.get().event.content == "new"
-    assert reply_queue.status()["queue_superseded"] == 1
+    assert reply_queue.status()["queue_superseded"] == 0
 
 
-def test_reply_queue_merges_multiple_private_followups():
+def test_reply_queue_preserves_multiple_private_followups():
     reply_queue = WechatReplyQueue()
     first = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "first"
@@ -1365,20 +1654,16 @@ def test_reply_queue_merges_multiple_private_followups():
     reply_queue.enqueue(first)
     active = reply_queue.get()
 
-    assert reply_queue.enqueue(second).action == "collected_active_private"
-    assert reply_queue.enqueue(third).action == "merged_active_private"
-    reply_queue.finish(active, "superseded")
-    merged = reply_queue.get()
-
-    assert merged.event.content == "third"
-    assert [item["content"] for item in merged.event.history] == [
-        "first",
-        "second",
-    ]
-    assert reply_queue.status()["queue_depth"] == 0
+    assert reply_queue.enqueue(second).action == "added"
+    assert reply_queue.enqueue(third).action == "added"
+    reply_queue.finish(active, "completed")
+    second_item = reply_queue.get()
+    assert second_item.event is second
+    reply_queue.finish(second_item, "completed")
+    assert reply_queue.get().event is third
 
 
-def test_reply_queue_collects_group_mentions_in_local_fifo_without_canceling_active():
+def test_reply_queue_appends_group_mentions_without_canceling_active():
     reply_queue = WechatReplyQueue()
     first = WechatDesktopEvent(
         "message", "g", "项目群", "a", "成员A", "text", "@小牛 first", is_group=True
@@ -1392,8 +1677,8 @@ def test_reply_queue_collects_group_mentions_in_local_fifo_without_canceling_act
     reply_queue.enqueue(first)
     active = reply_queue.get()
 
-    assert reply_queue.enqueue(second).action == "collected_active_group"
-    assert reply_queue.enqueue(third).action == "collected_active_group"
+    assert reply_queue.enqueue(second).action == "added"
+    assert reply_queue.enqueue(third).action == "added"
     assert active.expired is False
     assert active.done.is_set() is False
     reply_queue.finish(active, "completed")
@@ -1404,7 +1689,7 @@ def test_reply_queue_collects_group_mentions_in_local_fifo_without_canceling_act
     assert reply_queue.get().event.content == "@小牛 third"
 
 
-def test_reply_queue_yields_to_global_queue_after_conversation_burst_limit():
+def test_reply_queue_ignores_legacy_burst_limit_and_keeps_global_fifo():
     reply_queue = WechatReplyQueue(conversation_burst_limit=2)
     first = WechatDesktopEvent(
         "message", "g", "项目群", "a", "成员A", "text", "@小牛 1", is_group=True
@@ -1424,14 +1709,14 @@ def test_reply_queue_yields_to_global_queue_after_conversation_burst_limit():
     reply_queue.enqueue(second)
     reply_queue.finish(active, "completed")
     active = reply_queue.get()
-    assert active.event is second
+    assert active.event is other
     reply_queue.enqueue(third)
     reply_queue.finish(active, "completed")
 
-    yielded = reply_queue.get()
+    second_item = reply_queue.get()
 
-    assert yielded.event is other
-    reply_queue.finish(yielded, "completed")
+    assert second_item.event is second
+    reply_queue.finish(second_item, "completed")
     assert reply_queue.get().event is third
 
 
@@ -1468,7 +1753,7 @@ def test_network_reply_error_detection():
     assert not _is_network_reply_error("invalid tool arguments")
 
 
-def test_driver_revalidation_rejects_target_replaced_during_generation():
+def test_driver_private_revalidation_keeps_started_target_relevant():
     client = FakeClient()
     client.rows = [row("Alice", unread=1)]
     client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
@@ -1482,11 +1767,9 @@ def test_driver_revalidation_rejects_target_replaced_during_generation():
     validation = driver.validate_reply_target(events[0])
     valid, reason = validation
 
-    assert valid is False
-    assert "newer" in reason
-    assert validation.replacement_event is not None
-    assert validation.replacement_event.content == "new"
-    assert validation.replacement_event.history[-1]["content"] == "old"
+    assert valid is True
+    assert reason == ""
+    assert validation.replacement_event is None
 
 
 def test_reply_cycle_monitors_private_conversation_without_unread_marker():
@@ -1498,6 +1781,7 @@ def test_reply_cycle_monitors_private_conversation_without_unread_marker():
         {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
     )
     _, first_events = driver.observe_events()
+    discovery_focus_calls = client.focus_calls
     driver.begin_reply_cycle("Alice", first_events[0].conversation_id)
     client.rows = [row("Alice", unread=0, signature="unchanged")]
     client.histories["Alice"] = [incoming("old", "1"), incoming("new", "2")]
@@ -1505,6 +1789,31 @@ def test_reply_cycle_monitors_private_conversation_without_unread_marker():
     _, monitored_events = driver.observe_events()
 
     assert [event.content for event in monitored_events] == ["new"]
+    assert client.focus_calls == discovery_focus_calls
+    assert client.history_ensure_conversation[-1] is False
+
+
+def test_discovery_focus_failure_backs_off_without_failing_observation():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+
+    def deny_foreground():
+        client.focus_calls += 1
+        raise OSError(5, "SetForegroundWindow", "拒绝访问。")
+
+    client.focus_window = deny_foreground
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+
+    first_observation, first_events = driver.observe_events()
+    second_observation, second_events = driver.observe_events()
+
+    assert first_observation["error"] == ""
+    assert second_observation["error"] == ""
+    assert first_events == []
+    assert second_events == []
+    assert client.focus_calls == 1
+    assert client.history_calls == []
 
 
 def test_reply_cycle_ignores_interim_tool_notice_but_still_finds_followup():
@@ -1556,6 +1865,60 @@ def test_tool_notice_subject_recognizes_skill_reads_and_regular_tools():
     assert _tool_notice_subject(
         {"tool_name": "web_search", "arguments": {"query": "天气"}}
     ) == ("tool", "web_search")
+
+
+def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
+    docx_event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "file", r"C:\tmp\LDAP.docx"
+    )
+    image_reference_event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "inspect",
+        reference={"content_type": "image", "file_path": r"C:\tmp\quoted.png"},
+    )
+    unresolved_image_reference = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "inspect",
+        reference={"content_type": "image"},
+    )
+    unresolved_file_reference = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "inspect",
+        reference={"content_type": "file"},
+    )
+    text_event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "hello"
+    )
+
+    assert _tool_notice_subject(_preflight_tool_notice_data(docx_event)) == (
+        "skill",
+        "docx",
+    )
+    assert _tool_notice_subject(
+        _preflight_tool_notice_data(image_reference_event)
+    ) == ("tool", "vision")
+    assert _tool_notice_subject(
+        _preflight_tool_notice_data(unresolved_image_reference)
+    ) == ("tool", "vision")
+    assert _tool_notice_subject(
+        _preflight_tool_notice_data(unresolved_file_reference)
+    ) == ("tool", "file-reader")
+    assert _preflight_tool_notice_data(text_event) is None
 
 
 def test_reply_cycle_monitors_group_without_session_mention_marker():
@@ -1812,6 +2175,750 @@ def test_expired_queue_token_rejects_late_result():
     assert not reply_queue.is_active(item.token)
     reply_queue.signal(item.token, "completed")
     assert item.terminal == ""
+
+
+def _bare_wechat_channel():
+    implementation = WechatDesktopChannel.__closure__[0].cell_contents
+    return object.__new__(implementation)
+
+
+class FakeTimer:
+    instances = []
+
+    def __init__(self, interval, callback, args=()):
+        self.interval = interval
+        self.callback = callback
+        self.args = args
+        self.daemon = False
+        self.cancelled = False
+        self.started = False
+        self.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self.callback(*self.args)
+
+
+def test_private_aggregation_uses_sliding_window():
+    FakeTimer.instances = []
+    channel = _bare_wechat_channel()
+    channel.config = {"private_message_aggregation_ms": 800}
+    channel._pending_private_lock = threading.RLock()
+    channel._pending_private_batches = {}
+    channel._private_batch_timer_factory = FakeTimer
+    channel._stop_event = threading.Event()
+    channel._trace = lambda *_args, **_kwargs: None
+    released = []
+    channel._submit_materialization = lambda events: released.append(events)
+    first = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "first"
+    )
+    second = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "second"
+    )
+
+    channel._defer_private_event(first)
+    first_timer = FakeTimer.instances[-1]
+    channel._defer_private_event(second)
+    second_timer = FakeTimer.instances[-1]
+
+    first_timer.fire()
+    assert released == []
+    second_timer.fire()
+
+    assert released == [[first, second]]
+    assert first_timer.cancelled is True
+    assert second_timer.interval == 0.8
+    assert channel._pending_private_batches == {}
+
+
+def test_private_aggregation_is_isolated_by_conversation_and_window():
+    FakeTimer.instances = []
+    channel = _bare_wechat_channel()
+    channel.config = {"private_message_aggregation_ms": 800}
+    channel._pending_private_lock = threading.RLock()
+    channel._pending_private_batches = {}
+    channel._private_batch_timer_factory = FakeTimer
+    channel._stop_event = threading.Event()
+    channel._trace = lambda *_args, **_kwargs: None
+    released = []
+    channel._submit_materialization = lambda events: released.append(events)
+    alice = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "alice-1"
+    )
+    bob = WechatDesktopEvent(
+        "message", "b", "Bob", "b", "Bob", "text", "bob-1"
+    )
+    later = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "alice-2"
+    )
+
+    channel._defer_private_event(alice)
+    alice_timer = FakeTimer.instances[-1]
+    channel._defer_private_event(bob)
+    bob_timer = FakeTimer.instances[-1]
+    alice_timer.fire()
+    bob_timer.fire()
+    channel._defer_private_event(later)
+    later_timer = FakeTimer.instances[-1]
+    later_timer.fire()
+
+    assert released == [[alice], [bob], [later]]
+
+
+def test_control_events_bypass_private_aggregation():
+    channel = _bare_wechat_channel()
+    routed = []
+    channel._dispatch_control_event = lambda event: routed.append(("control", event))
+    channel._defer_private_event = lambda event: routed.append(("private", event))
+    channel._submit_materialization = lambda events: routed.append(("group", events))
+    cancel = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "/cancel"
+    )
+    steer = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "/steer 改查测试"
+    )
+
+    channel._route_reply_event(cancel)
+    channel._route_reply_event(steer)
+
+    assert routed == [("control", cancel), ("control", steer)]
+
+
+def test_standalone_image_is_observed_while_file_is_materialized():
+    channel = _bare_wechat_channel()
+    routed = []
+    processed = []
+    finished = []
+    channel._store = SimpleNamespace(
+        mark_event_processed=lambda event_id: processed.append(event_id)
+    )
+    channel._trace = lambda *_args, **_kwargs: None
+    channel._finish_lifecycle = (
+        lambda event_ids, terminal: finished.append((event_ids, terminal))
+    )
+    channel._defer_private_event = lambda event: routed.append(("private", event))
+    channel._submit_materialization = lambda events: routed.append(
+        ("materialize", events)
+    )
+    image = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "image", "image.png"
+    )
+    file_event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "file", "report.pdf"
+    )
+    text = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "说明"
+    )
+
+    channel._route_reply_event(image)
+    channel._route_reply_event(file_event)
+    channel._route_reply_event(text)
+
+    assert routed == [
+        ("materialize", [file_event]),
+        ("private", text),
+    ]
+    assert processed == [image.event_id]
+    assert finished == [
+        ([image.event_id], "observed"),
+    ]
+
+
+def test_materialized_batch_keeps_all_source_event_ids():
+    channel = _bare_wechat_channel()
+    channel._driver = SimpleNamespace(
+        materialize_event=lambda event: (event, int(event.content_type == "image"))
+    )
+    channel._preserve_event_evidence = lambda _event: None
+    channel._lifecycle_lock = threading.RLock()
+    channel._lifecycles = {}
+    channel._scan_count = 1
+    first = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "image", "C:/tmp/image.png"
+    )
+    second = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "这是什么"
+    )
+    channel._start_lifecycle(first)
+    channel._start_lifecycle(second)
+
+    batch = channel._materialize_batch([first, second])
+
+    assert batch is second
+    assert getattr(batch, "_source_event_ids") == [first.event_id, second.event_id]
+    assert getattr(batch, "_batch_id")
+    assert batch.history == []
+    assert channel._lifecycles[first.event_id]["attachment_resolve_count"] == 1
+    reply_queue = WechatReplyQueue()
+    assert reply_queue.enqueue(batch)
+    queued = reply_queue.get()
+    assert queued.source_event_ids == [first.event_id, second.event_id]
+    assert queued.batch_id == getattr(batch, "_batch_id")
+
+
+def test_referenced_attachment_remains_available_to_agent_context():
+    channel = _bare_wechat_channel()
+    channel._driver = SimpleNamespace(
+        materialize_event=lambda event: (event, 0)
+    )
+    channel._preserve_event_evidence = lambda _event: None
+    channel._lifecycle_lock = threading.RLock()
+    channel._lifecycles = {}
+    channel._scan_count = 1
+    event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这是什么图？",
+        history=[
+            {
+                "content": "[图片: C:/tmp/image.png]",
+                "content_type": "image",
+            }
+        ],
+        reference={
+            "content_type": "image",
+            "file_path": "C:/tmp/image.png",
+        },
+    )
+    channel._start_lifecycle(event)
+
+    materialized = channel._materialize_batch([event])
+
+    assert materialized.history == event.history
+    assert getattr(materialized, "_attachment_reference_required") is False
+
+
+def test_standalone_file_batch_is_cache_only():
+    channel = _bare_wechat_channel()
+    channel._driver = SimpleNamespace(
+        materialize_event=lambda event: (event, 1)
+    )
+    channel._preserve_event_evidence = lambda _event: None
+    channel._lifecycle_lock = threading.RLock()
+    channel._lifecycles = {}
+    channel._scan_count = 1
+    file_event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "file",
+        "C:/tmp/report.pdf",
+    )
+    channel._start_lifecycle(file_event)
+
+    materialized = channel._materialize_batch([file_event])
+
+    assert getattr(materialized, "_cache_only") is True
+    assert getattr(materialized, "_attachment_reference_required") is False
+
+
+def test_non_reference_attachment_question_requires_quote():
+    question = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这个文件讲了什么？",
+    )
+    referenced = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这个文件讲了什么？",
+        reference={"content_type": "file", "file_path": "C:/tmp/a.pdf"},
+    )
+    generation = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "帮我生成一张图片",
+    )
+    image_question = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这是什么图？",
+    )
+
+    assert WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
+        question
+    )
+    assert WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
+        image_question
+    )
+    assert not WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
+        referenced
+    )
+    assert not WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
+        generation
+    )
+
+
+def test_materialization_worker_defers_referenced_attachment_until_fifo():
+    channel = _bare_wechat_channel()
+    channel._stop_event = threading.Event()
+    channel._materialize_queue = queue.Queue()
+    channel._materialize_stop = object()
+    enqueued = []
+    channel._prepare_deferred_materialization = (
+        WechatDesktopChannel.__closure__[0].cell_contents._prepare_deferred_materialization.__get__(
+            channel
+        )
+    )
+    channel._has_referenced_attachment = (
+        WechatDesktopChannel.__closure__[0].cell_contents._has_referenced_attachment
+    )
+    channel._materialize_batch = lambda _events: (_ for _ in ()).throw(
+        AssertionError("referenced attachment must wait for its FIFO turn")
+    )
+    channel._enqueue_reply_event = lambda event: enqueued.append(event)
+    event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这是什么图",
+        reference={"content_type": "image"},
+    )
+    channel._materialize_queue.put([event])
+    channel._materialize_queue.put(channel._materialize_stop)
+
+    channel._consume_materialization_queue()
+
+    assert enqueued == [event]
+    assert getattr(event, "_deferred_materialization_events") == [event]
+
+
+def test_attachment_reference_prompt_is_sent_without_agent():
+    channel = _bare_wechat_channel()
+    event = WechatDesktopEvent(
+        "message",
+        "uia-session:a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这是什么图？",
+    )
+    setattr(event, "_attachment_reference_required", True)
+    reply_queue = WechatReplyQueue()
+    assert reply_queue.enqueue(event)
+    item = reply_queue.get()
+    sent = []
+    lifecycle = []
+    audits = []
+    history = []
+    channel._service = SimpleNamespace(status=lambda: {"paused": False})
+    channel._policy = SimpleNamespace(can_auto_send=lambda *_args: True)
+    channel._driver = SimpleNamespace(
+        validate_reply_target=lambda _event: SimpleNamespace(
+            valid=True,
+            reason="",
+            replacement_event=None,
+        ),
+        send_text=lambda target, text: (
+            sent.append((target, text))
+            or {"success": True, "verified": True}
+        ),
+    )
+    channel._store = SimpleNamespace(
+        audit=lambda *args, **kwargs: audits.append((args, kwargs)),
+        append_conversation_history=lambda **kwargs: history.append(kwargs),
+    )
+    channel._mark_lifecycle = (
+        lambda event_ids, stage, **kwargs: lifecycle.append(
+            (event_ids, stage, kwargs)
+        )
+    )
+    channel.config = {"self_display_name": "Bot"}
+
+    terminal = channel._send_attachment_reference_prompt(item)
+
+    assert terminal == "completed"
+    assert sent == [
+        ("uia-session:a", ATTACHMENT_REFERENCE_REQUIRED_REPLY)
+    ]
+    assert [stage for _, stage, _ in lifecycle] == [
+        "send_started",
+        "send_verified",
+    ]
+    assert history[0]["content"] == ATTACHMENT_REFERENCE_REQUIRED_REPLY
+    assert audits
+
+
+def test_reply_consumer_bypasses_agent_for_reference_prompt():
+    channel = _bare_wechat_channel()
+    channel._stop_event = threading.Event()
+    channel._reply_queue = WechatReplyQueue()
+    event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "这是什么图？"
+    )
+    setattr(event, "_attachment_reference_required", True)
+    assert channel._reply_queue.enqueue(event)
+    original_finish = channel._reply_queue.finish
+
+    def finish(item, terminal):
+        original_finish(item, terminal)
+        channel._stop_event.set()
+
+    channel._reply_queue.finish = finish
+    stages = []
+    processed = []
+    channel._service = SimpleNamespace(
+        update_status=lambda **_kwargs: None
+    )
+    channel._store = SimpleNamespace(
+        mark_event_processed=lambda event_id: processed.append(event_id),
+        audit=lambda *_args, **_kwargs: None,
+    )
+    channel._driver = SimpleNamespace(
+        end_reply_cycle=lambda: (_ for _ in ()).throw(
+            AssertionError("no Agent reply cycle should be active")
+        )
+    )
+    channel._mark_lifecycle = (
+        lambda _event_ids, stage, **_kwargs: stages.append(stage)
+    )
+    channel._finish_lifecycle = lambda *_args, **_kwargs: None
+    channel._send_attachment_reference_prompt = lambda _item: "completed"
+    channel._dispatch_message = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("reference prompt must bypass Agent")
+    )
+
+    channel._consume_reply_queue()
+
+    assert processed == [event.event_id]
+    assert "agent_started" not in stages
+    assert "agent_done" not in stages
+
+
+def test_attachment_path_cache_avoids_second_image_capture(tmp_path):
+    local_image = tmp_path / "cached.png"
+    local_image.write_bytes(b"png")
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [
+        UiaChatMessage(
+            "Alice",
+            "[图片]",
+            message_type="image",
+            runtime_id="image-1",
+            bounds=(100, 100, 300, 260),
+        )
+    ]
+    client.image_paths["[图片]"] = str(local_image)
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+    _, events = driver.observe_events()
+
+    _, first_count = driver.materialize_event(events[0])
+    _, second_count = driver.materialize_event(events[0])
+
+    assert first_count == 1
+    assert second_count == 0
+    assert client.image_fetches == ["[图片]"]
+
+
+def test_materialization_resolves_only_selected_visible_attachment(tmp_path):
+    old_file = tmp_path / "old.pdf"
+    target_image = tmp_path / "target.png"
+    old_file.write_bytes(b"pdf")
+    target_image.write_bytes(b"png")
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [
+        UiaChatMessage(
+            "Alice",
+            "old.pdf",
+            message_type="file",
+            runtime_id="file-1",
+        ),
+        UiaChatMessage(
+            "Alice",
+            "target-image",
+            message_type="image",
+            runtime_id="image-1",
+            bounds=(100, 100, 300, 260),
+        ),
+    ]
+    client.file_paths["old.pdf"] = str(old_file)
+    client.image_paths["target-image"] = str(target_image)
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True},
+        client=client,
+        shell_hook=FakeHook(),
+    )
+
+    _, events = driver.observe_events()
+    materialized, resolve_count = driver.materialize_event(events[0])
+
+    assert resolve_count == 1
+    assert materialized.content == str(target_image)
+    assert client.image_fetches == ["target-image"]
+    assert client.file_fetches == []
+
+
+def test_cached_file_is_reused_by_quoted_filename(tmp_path):
+    local_file = tmp_path / "report.pdf"
+    local_file.write_bytes(b"%PDF")
+    client = FakeClient()
+    client.file_paths["文件\nreport.pdf\n8 KB"] = str(local_file)
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    standalone = UiaChatMessage(
+        "Alice",
+        "文件\nreport.pdf\n8 KB",
+        message_type="file",
+        runtime_id="file-1",
+        stable_id="stable-file-1",
+    )
+
+    cached, first_count = driver._resolve_reply_target_message(
+        "conversation", standalone
+    )
+    quoted = UiaChatMessage(
+        "Alice",
+        "帮我读一下",
+        message_type="text",
+        runtime_id="quote-1",
+        stable_id="stable-quote-1",
+        reference=UiaReferencedMessage(
+            sender_name="Alice",
+            content="report.pdf",
+            message_type="file",
+        ),
+    )
+    resolved, second_count = driver._resolve_reply_target_message(
+        "conversation", quoted
+    )
+
+    assert cached.file_path == str(local_file)
+    assert first_count == 1
+    assert resolved.reference.file_path == str(local_file)
+    assert resolved.reference.resolved is True
+    assert second_count == 0
+    assert client.file_fetches == ["文件\nreport.pdf\n8 KB"]
+
+
+def test_attachment_cache_re_resolves_invalid_path_and_changed_identity(tmp_path):
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    first_path.write_bytes(b"one")
+    second_path.write_bytes(b"two")
+    client = FakeClient()
+    client.image_paths["same"] = str(first_path)
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    first = UiaChatMessage(
+        "Alice",
+        "same",
+        message_type="image",
+        runtime_id="runtime-1",
+        stable_id="stable-1",
+    )
+
+    resolved, first_count = driver._resolve_reply_target_message("alice", first)
+    first_path.unlink()
+    client.image_paths["same"] = str(second_path)
+    refreshed, invalid_path_count = driver._resolve_reply_target_message(
+        "alice", first
+    )
+    changed_identity = UiaChatMessage(
+        "Alice",
+        "same",
+        message_type="image",
+        runtime_id="runtime-2",
+        stable_id="stable-2",
+    )
+    _, identity_count = driver._resolve_reply_target_message(
+        "alice", changed_identity
+    )
+
+    assert resolved.file_path == str(first_path)
+    assert refreshed.file_path == str(second_path)
+    assert (first_count, invalid_path_count, identity_count) == (1, 1, 1)
+    assert client.image_fetches == ["same", "same", "same"]
+
+
+def test_reply_priority_skips_starting_a_scan():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    driver._reply_ui_pending.set()
+
+    observation, events = driver.observe_events()
+
+    assert events == []
+    assert observation["scan_yielded_to_reply"] is True
+    assert client.focus_calls == 0
+    assert client.owner_calls == 0
+    assert client.history_calls == []
+
+
+def test_waiting_reply_prevents_scanner_from_reentering_uia():
+    coordinator = _UiaPriorityCoordinator()
+    first_scan_started = threading.Event()
+    release_first_scan = threading.Event()
+    order = []
+
+    def first_scan():
+        with coordinator.lease(reply=False):
+            first_scan_started.set()
+            release_first_scan.wait(1)
+
+    def reply():
+        with coordinator.lease(reply=True):
+            order.append("reply")
+
+    def second_scan():
+        with coordinator.lease(reply=False):
+            order.append("scan")
+
+    first = threading.Thread(target=first_scan)
+    high = threading.Thread(target=reply)
+    low = threading.Thread(target=second_scan)
+    first.start()
+    assert first_scan_started.wait(1)
+    high.start()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with coordinator._condition:
+            if coordinator._reply_waiters:
+                break
+        time.sleep(0.005)
+    low.start()
+    release_first_scan.set()
+    for worker in (first, high, low):
+        worker.join(1)
+
+    assert order == ["reply", "scan"]
+
+
+def test_reply_validation_does_not_deadlock_with_active_scan():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [incoming("hello", "message-1")]
+    scan_inside_uia = threading.Event()
+    release_scan_read = threading.Event()
+    original_locate = client.locate_conversation
+
+    def blocking_locate(*args, **kwargs):
+        scan_inside_uia.set()
+        assert release_scan_read.wait(1)
+        return original_locate(*args, **kwargs)
+
+    client.locate_conversation = blocking_locate
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True},
+        client=client,
+        shell_hook=FakeHook(),
+    )
+    conversation_id = driver._row_key(client.rows[0])
+    event = WechatDesktopEvent(
+        "message",
+        conversation_id,
+        "Alice",
+        "Alice",
+        "Alice",
+        "text",
+        "hello",
+    )
+    result = {}
+    scan_thread = threading.Thread(
+        target=lambda: result.setdefault("scan", driver.observe_events()),
+        daemon=True,
+    )
+    reply_thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "validation", driver.validate_reply_target(event)
+        ),
+        daemon=True,
+    )
+
+    scan_thread.start()
+    assert scan_inside_uia.wait(1)
+    reply_thread.start()
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        with driver._uia_priority._condition:
+            if driver._uia_priority._reply_waiters:
+                break
+        time.sleep(0.005)
+    release_scan_read.set()
+    scan_thread.join(1)
+    reply_thread.join(1)
+
+    assert not scan_thread.is_alive()
+    assert not reply_thread.is_alive()
+    assert result["validation"].valid is True
+
+
+def test_lifecycle_summary_is_one_info_line_per_source_message():
+    channel = _bare_wechat_channel()
+    channel._lifecycle_lock = threading.RLock()
+    channel._lifecycles = {}
+    channel._scan_count = 4
+    event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "hello"
+    )
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture()
+    logger.addHandler(handler)
+    try:
+        channel._start_lifecycle(event)
+        channel._mark_lifecycle(
+            [event.event_id],
+            "materialized",
+            batch_id="batch-1",
+            attachment_resolve_count=1,
+        )
+        channel._mark_lifecycle([event.event_id], "queued")
+        channel._mark_lifecycle([event.event_id], "agent_started")
+        channel._mark_lifecycle([event.event_id], "agent_done")
+        channel._finish_lifecycle([event.event_id], "completed")
+    finally:
+        logger.removeHandler(handler)
+
+    lifecycle_lines = [
+        line for line in records if line.startswith("[WechatDesktop][lifecycle]")
+    ]
+    assert len(lifecycle_lines) == 1
+    assert "event_id=" + event.event_id in lifecycle_lines[0]
+    assert "attachment_resolve_count=1" in lifecycle_lines[0]
+    assert "superseded_by=-" in lifecycle_lines[0]
 
 
 def test_shell_hook_filters_process_and_debounces_injected_signals():

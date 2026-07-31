@@ -23,6 +23,7 @@ from channel.wechat_desktop.models import (
     HeaderInfo,
     OwnerInfo,
     UiaChatMessage,
+    UiaReferencedMessage,
 )
 
 
@@ -129,6 +130,9 @@ class WechatUiaClient:
         self._last_send_at = 0.0
         self._last_conversation_send: dict[str, float] = {}
         self._known_outgoing_texts: dict[str, list[str]] = {}
+        self._known_outgoing_messages: dict[
+            str, list[tuple[str, str, float]]
+        ] = {}
         self.last_direction_resolution: dict = {}
 
     def cancel_waits(self):
@@ -190,6 +194,42 @@ class WechatUiaClient:
     def seed_outgoing_texts(self, conversation: str, texts: Iterable[str]) -> None:
         for text in texts:
             self.remember_outgoing_text(conversation, text)
+
+    def remember_outgoing_message(
+        self, conversation: str, text: str = "", runtime_id: str = ""
+    ) -> None:
+        value = _text(text)
+        runtime = _text(runtime_id)
+        if not value and not runtime:
+            return
+        key = _text(conversation)
+        if value:
+            self.remember_outgoing_text(key, value)
+        records = self._known_outgoing_messages.setdefault(key, [])
+        records.append((value, runtime, time.monotonic()))
+        del records[:-50]
+
+    def is_known_outgoing_message(
+        self, conversation: str, message: UiaChatMessage
+    ) -> bool:
+        key = _text(conversation)
+        records = self._known_outgoing_messages.get(key, [])
+        window = max(
+            5.0,
+            min(
+                float(self.config.get("outgoing_echo_suppression_seconds", 300)),
+                3600.0,
+            ),
+        )
+        cutoff = time.monotonic() - window
+        records[:] = [record for record in records if record[2] >= cutoff]
+        runtime = _text(message.runtime_id)
+        content = _text(message.content)
+        return any(
+            (runtime and record_runtime and runtime == record_runtime)
+            or (content and record_text and content == record_text)
+            for record_text, record_runtime, _created_at in records
+        )
 
     @staticmethod
     def _require_windows():
@@ -303,9 +343,10 @@ class WechatUiaClient:
                 return False
 
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        activation_error = None
         try:
             win32gui.SetForegroundWindow(hwnd)
-        except Exception:
+        except Exception as first_error:
             current_thread = win32api.GetCurrentThreadId()
             foreground = win32gui.GetForegroundWindow()
             foreground_thread, _ = win32process.GetWindowThreadProcessId(foreground)
@@ -313,11 +354,16 @@ class WechatUiaClient:
                 current_thread, foreground_thread, True
             )
             try:
-                win32gui.SetForegroundWindow(hwnd)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception as second_error:
+                    activation_error = second_error
             finally:
                 ctypes.windll.user32.AttachThreadInput(
                     current_thread, foreground_thread, False
                 )
+            if activation_error is not None and not self._click_taskbar_button():
+                raise activation_error from first_error
         self._paced_wait(
             "uia_focus_settle_ms_min",
             "uia_focus_settle_ms_max",
@@ -667,6 +713,37 @@ class WechatUiaClient:
         return "text"
 
     @staticmethod
+    def _parse_reference_label(content: str) -> Optional[dict]:
+        match = re.match(
+            r"^(?P<current>.*?)引用\s+(?P<sender>.+?)\s+的消息\s*[:：]\s*(?P<quoted>.*)$",
+            _text(content),
+            re.DOTALL,
+        )
+        if not match:
+            return None
+        return {
+            "current": match.group("current").strip(),
+            "sender": match.group("sender").strip(),
+            "preview": match.group("quoted").strip(),
+        }
+
+    @classmethod
+    def _reference_message_type(cls, preview: str) -> str:
+        value = _text(preview)
+        folded = value.casefold()
+        if folded in {"图片", "image"}:
+            return "image"
+        if re.search(
+            r"\.(?:docx?|pdf|xlsx?|pptx?|txt|md|csv|zip|rar|7z)$",
+            value,
+            re.IGNORECASE,
+        ):
+            return "file"
+        if folded in {"文件", "file"}:
+            return "file"
+        return "text"
+
+    @staticmethod
     def _file_card_metadata(content: str) -> tuple[str, Optional[int]]:
         """Extract the filename and displayed size from a WeChat file card."""
         lines = [line.strip() for line in _text(content).splitlines() if line.strip()]
@@ -698,17 +775,11 @@ class WechatUiaClient:
     @classmethod
     def _message_sender(
         cls,
-        direction: str,
         header: HeaderInfo,
-        owner: str,
         item,
         content: str,
     ) -> str:
-        """Map structural direction to sender without comparing display names."""
-        if direction == "outgoing":
-            return _text(owner)
-        if direction != "incoming":
-            return ""
+        """Read sender metadata without using the observed direction field."""
         if header.header_type == "private":
             return _text(header.title)
         if header.header_type == "group":
@@ -762,13 +833,10 @@ class WechatUiaClient:
         total_counts = Counter(
             _text(message.content)
             for message in messages
-            if message.direction == "unknown" and _text(message.content)
+            if _text(message.content)
         )
         resolved = []
         for message in messages:
-            if message.direction != "unknown":
-                resolved.append(message)
-                continue
             content = _text(message.content)
             total = total_counts.get(content, 0)
             own = self_counts.get(content, 0)
@@ -917,7 +985,7 @@ class WechatUiaClient:
             "conversation": _text(conversation),
             "status": "not_started",
         }
-        if not owner or not any(item.direction == "unknown" for item in messages):
+        if not owner:
             self.last_direction_resolution["status"] = "not_needed"
             return messages
         import win32con
@@ -1074,15 +1142,21 @@ class WechatUiaClient:
         limit: int = 0,
         runtime_id: str = "",
         row_index: int = -1,
+        ensure_conversation: bool = True,
     ) -> list[UiaChatMessage]:
         requested_limit = int(limit)
         bounded_limit = 0 if requested_limit <= 0 else min(requested_limit, 20)
-        if conversation and not self.locate_conversation(
+        if ensure_conversation and conversation and not self.locate_conversation(
             conversation, runtime_id=runtime_id, row_index=row_index
         ):
             raise RuntimeError(f"Conversation is not visible: {conversation}")
-        owner = self.get_owner_info().nick_name
         header = self.get_title()
+        if (
+            not ensure_conversation
+            and conversation
+            and header.title != _text(conversation)
+        ):
+            return []
         messages: list[UiaChatMessage] = []
         with self.operation_lock, self._uia_root() as root:
             message_list = None
@@ -1104,8 +1178,22 @@ class WechatUiaClient:
                 if class_name.casefold() == "mmui::chatitemview":
                     continue
                 direction, item_bounds = self._message_direction(item, list_bounds)
+                parsed_reference = self._parse_reference_label(content)
+                reference = None
+                if parsed_reference is not None:
+                    content = parsed_reference["current"]
+                    reference = UiaReferencedMessage(
+                        sender_name=parsed_reference["sender"],
+                        content=parsed_reference["preview"],
+                        message_type=self._reference_message_type(
+                            parsed_reference["preview"]
+                        ),
+                        resolved=False,
+                        degraded=True,
+                        strategy="preview_only",
+                    )
                 sender = self._message_sender(
-                    direction, header, owner, item, content
+                    header, item, content
                 )
                 messages.append(
                     UiaChatMessage(
@@ -1115,6 +1203,7 @@ class WechatUiaClient:
                         direction=direction,
                         runtime_id=_runtime_id(item),
                         bounds=item_bounds,
+                        reference=reference,
                     )
                 )
         return messages if bounded_limit == 0 else messages[-bounded_limit:]
@@ -1144,6 +1233,263 @@ class WechatUiaClient:
             if name_matches:
                 candidates.append(control)
         return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _right_click_point(point: tuple[int, int]) -> None:
+        import win32api
+        import win32con
+
+        cursor = win32api.GetCursorPos()
+        try:
+            win32api.SetCursorPos(point)
+            win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
+        finally:
+            win32api.SetCursorPos(cursor)
+
+    @staticmethod
+    def _left_click_point(point: tuple[int, int]) -> None:
+        import win32api
+        import win32con
+
+        cursor = win32api.GetCursorPos()
+        try:
+            win32api.SetCursorPos(point)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        finally:
+            win32api.SetCursorPos(cursor)
+
+    @staticmethod
+    def _press_escape_key() -> None:
+        import win32api
+        import win32con
+
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+        win32api.keybd_event(
+            win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0
+        )
+
+    @staticmethod
+    def _press_end_key() -> None:
+        import win32api
+        import win32con
+
+        win32api.keybd_event(win32con.VK_END, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_END, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+    @classmethod
+    def _find_desktop_control(cls, name: str, class_name: str):
+        import uiautomation as auto
+
+        root = auto.GetRootControl()
+        if _text(root.Name) == name and _text(root.ClassName) == class_name:
+            return root
+        return next(
+            (
+                control
+                for control in cls._walk(root)
+                if _text(control.Name) == name
+                and _text(control.ClassName) == class_name
+            ),
+            None,
+        )
+
+    @classmethod
+    def _pick_located_original_control(
+        cls, message_list, message_type: str, preview: str
+    ):
+        list_bounds = _bounds(message_list)
+        if not list_bounds:
+            return None
+        center_y = (list_bounds[1] + list_bounds[3]) / 2
+        preview_folded = _text(preview).casefold()
+        expected_classes = {
+            "text": ("chattextitemview",),
+            "file": ("chatbubbleitemview", "chatfileitemview"),
+            "image": ("chatbubblereferitemview", "chatimageitemview"),
+        }
+        ranked = []
+        for control in message_list.GetChildren():
+            class_name = _text(control.ClassName).casefold()
+            if "chat" not in class_name or "itemview" not in class_name:
+                continue
+            bounds = _bounds(control)
+            if not bounds:
+                continue
+            name = _text(control.Name)
+            row_center = (bounds[1] + bounds[3]) / 2
+            score = -abs(row_center - center_y)
+            if any(
+                expected in class_name
+                for expected in expected_classes.get(message_type, ())
+            ):
+                score += 240
+            if preview_folded and preview_folded in name.casefold():
+                score += 320
+            if message_type == "file" and cls._file_card_metadata(name)[0]:
+                score += 200
+            ranked.append((score, control))
+        return max(ranked, key=lambda item: item[0])[1] if ranked else None
+
+    def _return_to_reference(self) -> bool:
+        button = self._find_desktop_control(
+            "回到引用位置", "mmui::UnreadBarView"
+        )
+        if button is None:
+            return False
+        self._click_and_restore(button)
+        self._paced_wait(
+            "uia_reference_return_settle_ms_min",
+            "uia_reference_return_settle_ms_max",
+            300,
+            600,
+        )
+        return True
+
+    def _send_existing_input_with_enter(self, expected_text: str) -> bool:
+        """Retry a failed Send-button click without pasting a duplicate."""
+        import win32api
+        import win32con
+
+        self.focus_window()
+        with self._uia_root() as root:
+            control = next(
+                (
+                    item
+                    for item in self._walk(root)
+                    if _text(item.AutomationId) == INPUT_ID
+                ),
+                None,
+            )
+            if control is None:
+                return False
+            value_available, value = self._try_input_value(control)
+            if (
+                value_available
+                and self._normalize_input_text(value)
+                != self._normalize_input_text(expected_text)
+            ):
+                return False
+            try:
+                control.SetFocus()
+            except Exception:
+                return False
+            win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
+            win32api.keybd_event(
+                win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0
+            )
+            return True
+
+    def resolve_message_reference(
+        self, message: UiaChatMessage
+    ) -> UiaChatMessage:
+        """Resolve one quote through WeChat's native locate-original action."""
+        reference = message.reference
+        if reference is None or not message.bounds:
+            return message
+        left, top, right, bottom = message.bounds
+        if right <= left or bottom <= top:
+            return message
+        point = (
+            int(left + (right - left) * 0.25),
+            int(top + (bottom - top) * 0.72),
+        )
+        original = None
+        located = False
+        try:
+            self.focus_window()
+            with self.operation_lock, self._uia_root() as root:
+                self._right_click_point(point)
+                self._paced_wait(
+                    "uia_reference_menu_settle_ms_min",
+                    "uia_reference_menu_settle_ms_max",
+                    250,
+                    450,
+                )
+                menu_item = self._find_desktop_control(
+                    "定位到原文位置", "mmui::XMenuView"
+                )
+                if menu_item is None:
+                    self._press_escape_key()
+                    return message
+                self._click_and_restore(menu_item)
+                located = True
+                self._paced_wait(
+                    "uia_reference_locate_settle_ms_min",
+                    "uia_reference_locate_settle_ms_max",
+                    500,
+                    900,
+                )
+                message_list = next(
+                    (
+                        control
+                        for control in self._walk(root)
+                        if _text(control.AutomationId) == MESSAGE_LIST_ID
+                    ),
+                    None,
+                )
+                if message_list is None:
+                    return message
+                control = self._pick_located_original_control(
+                    message_list, reference.message_type, reference.content
+                )
+                if control is None:
+                    return message
+                content = _text(control.Name)
+                class_name = _text(control.ClassName)
+                original = UiaChatMessage(
+                    sender_name=reference.sender_name,
+                    content=content,
+                    message_type=self._message_type(class_name, content),
+                    direction="unknown",
+                    runtime_id=_runtime_id(control),
+                    bounds=_bounds(control),
+                )
+            file_path = ""
+            if original.message_type == "image":
+                file_path = self.fetch_message_image(original)
+            elif original.message_type == "file":
+                file_path = self.fetch_message_file(original)
+            resolved_reference = UiaReferencedMessage(
+                sender_name=reference.sender_name,
+                content=original.content,
+                message_type=original.message_type,
+                file_path=file_path,
+                resolved=True,
+                degraded=(
+                    original.message_type in {"image", "file"} and not file_path
+                ),
+                strategy="wechat_locate_original",
+            )
+            logger.info(
+                "[WechatDesktop] reference resolved type=%s attachment=%s",
+                original.message_type,
+                bool(file_path),
+            )
+            return replace(message, reference=resolved_reference)
+        except Exception as exc:
+            logger.warning("[WechatDesktop] failed to resolve reference: %s", exc)
+            return message
+        finally:
+            if located:
+                try:
+                    if not self._return_to_reference():
+                        logger.warning(
+                            "[WechatDesktop] return-to-reference control unavailable; "
+                            "falling back to End"
+                        )
+                        self._press_end_key()
+                        self._paced_wait(
+                            "uia_reference_return_settle_ms_min",
+                            "uia_reference_return_settle_ms_max",
+                            300,
+                            600,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[WechatDesktop] failed to return to reference: %s", exc
+                    )
 
     def _copy_control_file_paths(self, control) -> list[str]:
         """Copy a file bubble and return CF_HDROP paths, restoring the clipboard."""
@@ -1323,6 +1669,97 @@ class WechatUiaClient:
             return ""
         return str(min(candidates, key=lambda item: (item[0], item[1]))[2])
 
+    def _save_control_file_as(
+        self,
+        control,
+        content: str,
+        target_root: Path,
+        timeout: float,
+    ) -> str:
+        """Use WeChat's native Save As menu when no cached path is available."""
+        filename, _expected_size = self._file_card_metadata(content)
+        bounds = _bounds(control)
+        if not filename or not bounds:
+            return ""
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip(" .")
+        if not safe_name:
+            return ""
+        target_root = Path(target_root).resolve()
+        target_root.mkdir(parents=True, exist_ok=True)
+        identity = f"{content}\0{_runtime_id(control)}\0{time.time_ns()}"
+        target = target_root / (
+            f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:12]}_{safe_name}"
+        )
+        left, top, right, bottom = bounds
+        self._right_click_point(
+            (int(left + (right - left) * 0.25), int((top + bottom) / 2))
+        )
+        self._paced_wait(
+            "uia_file_menu_settle_ms_min",
+            "uia_file_menu_settle_ms_max",
+            250,
+            450,
+        )
+        menu_item = self._find_desktop_control("另存为...", "mmui::XMenuView")
+        if menu_item is None:
+            self._press_escape_key()
+            return ""
+        self._click_and_restore(menu_item)
+        self._paced_wait(
+            "uia_file_save_dialog_settle_ms_min",
+            "uia_file_save_dialog_settle_ms_max",
+            400,
+            700,
+        )
+        try:
+            import uiautomation as auto
+            import win32gui
+
+            dialog_hwnd = int(win32gui.GetForegroundWindow() or 0)
+            if not dialog_hwnd or win32gui.GetClassName(dialog_hwnd) != "#32770":
+                return ""
+            dialog = auto.ControlFromHandle(dialog_hwnd)
+            filename_input = next(
+                (
+                    item
+                    for item in self._walk(dialog, 500)
+                    if _text(item.AutomationId) == "1001"
+                    and "edit" in _text(item.ControlTypeName).casefold()
+                ),
+                None,
+            )
+            save_button = next(
+                (
+                    item
+                    for item in self._walk(dialog, 500)
+                    if _text(item.AutomationId) == "1"
+                    and "button" in _text(item.ControlTypeName).casefold()
+                ),
+                None,
+            )
+            if filename_input is None or save_button is None:
+                return ""
+            filename_input.GetValuePattern().SetValue(str(target))
+            self._click_and_restore(save_button)
+            deadline = time.time() + max(1.0, min(float(timeout), 30.0))
+            while time.time() < deadline:
+                if target.is_file() and target.stat().st_size > 0:
+                    logger.info(
+                        "[WechatDesktop] file saved from native dialog: %s", target
+                    )
+                    return str(target)
+                time.sleep(0.25)
+        finally:
+            try:
+                import win32gui
+
+                foreground = int(win32gui.GetForegroundWindow() or 0)
+                if foreground and win32gui.GetClassName(foreground) == "#32770":
+                    self._press_escape_key()
+            except Exception:
+                pass
+        return ""
+
     def fetch_message_file(
         self, message: UiaChatMessage, tmp_root: Optional[Path] = None
     ) -> str:
@@ -1376,6 +1813,24 @@ class WechatUiaClient:
                         self._click_and_restore(download)
             if time.time() >= deadline:
                 break
+        if bool(self.config.get("uia_file_save_as_enabled", True)):
+            try:
+                self.focus_window()
+                with self.operation_lock, self._uia_root() as root:
+                    control = self._find_message_control(root, message)
+                    if control is not None:
+                        saved = self._save_control_file_as(
+                            control,
+                            message.content,
+                            Path(target_root),
+                            max(timeout, 5.0),
+                        )
+                        if saved:
+                            return saved
+            except Exception as exc:
+                logger.warning(
+                    "[WechatDesktop] native Save As fallback failed: %s", exc
+                )
         logger.warning(
             "[WechatDesktop] file bubble was detected but no local file path was available: %s",
             message.content,
@@ -1383,9 +1838,12 @@ class WechatUiaClient:
         return ""
 
     def fetch_message_image(
-        self, message: UiaChatMessage, tmp_root: Optional[Path] = None
+        self,
+        message: UiaChatMessage,
+        tmp_root: Optional[Path] = None,
+        prefer_viewer: bool = True,
     ) -> str:
-        """Capture a visible image bubble into project ``tmp`` for vision input."""
+        """Open WeChat's image viewer and capture it, falling back to the bubble."""
         if message.message_type != "image" or not message.bounds:
             return ""
         left, top, right, bottom = (int(value) for value in message.bounds)
@@ -1406,6 +1864,71 @@ class WechatUiaClient:
         target = target_root / (
             hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] + ".png"
         )
+        if prefer_viewer and bool(self.config.get("uia_image_viewer_enabled", True)):
+            try:
+                import win32gui
+                import win32process
+                from PIL import ImageGrab
+
+                self.focus_window()
+                with self.operation_lock, self._uia_root() as root:
+                    control = self._find_message_control(root, message)
+                    control_bounds = _bounds(control) if control is not None else None
+                    click_bounds = control_bounds or message.bounds
+                    click_left, click_top, click_right, click_bottom = click_bounds
+                    point = (
+                        int(click_left + (click_right - click_left) * 0.2),
+                        int((click_top + click_bottom) / 2),
+                    )
+                    before_hwnd = int(win32gui.GetForegroundWindow() or 0)
+                    self._left_click_point(point)
+                    self._paced_wait(
+                        "uia_image_viewer_settle_ms_min",
+                        "uia_image_viewer_settle_ms_max",
+                        500,
+                        900,
+                    )
+                    after_hwnd = int(win32gui.GetForegroundWindow() or 0)
+                    title = win32gui.GetWindowText(after_hwnd) if after_hwnd else ""
+                    process_id = 0
+                    if after_hwnd:
+                        _, process_id = win32process.GetWindowThreadProcessId(
+                            after_hwnd
+                        )
+                    viewer_opened = bool(
+                        after_hwnd
+                        and after_hwnd != before_hwnd
+                        and int(process_id) in self.allowed_process_ids()
+                    ) or title in {"图片和视频", "Images and Videos"}
+                    if viewer_opened:
+                        try:
+                            viewer_bounds = tuple(
+                                int(value)
+                                for value in win32gui.GetWindowRect(after_hwnd)
+                            )
+                            image = ImageGrab.grab(
+                                bbox=viewer_bounds, all_screens=True
+                            )
+                            if image.width >= 2 and image.height >= 2:
+                                image.save(target, format="PNG")
+                                logger.info(
+                                    "[WechatDesktop] image viewer captured to tmp: %s",
+                                    target,
+                                )
+                                return str(target)
+                        finally:
+                            self._press_escape_key()
+                            self._paced_wait(
+                                "uia_image_viewer_close_settle_ms_min",
+                                "uia_image_viewer_close_settle_ms_max",
+                                200,
+                                400,
+                            )
+            except Exception as exc:
+                logger.warning(
+                    "[WechatDesktop] image viewer capture failed; using bubble: %s",
+                    exc,
+                )
         try:
             # Bounding rectangles returned by UIA use virtual-screen coordinates.
             # Pillow's all_screens flag preserves negative coordinates on multi-monitor
@@ -1750,6 +2273,7 @@ class WechatUiaClient:
         message: str,
         runtime_id: str = "",
         row_index: int = -1,
+        expedited: bool = False,
     ) -> dict:
         text = str(message or "")
         if not text:
@@ -1772,20 +2296,47 @@ class WechatUiaClient:
             results = []
             for index, chunk in enumerate(chunks, 1):
                 try:
-                    self._wait_for_send_slot(who)
+                    if not expedited:
+                        self._wait_for_send_slot(who)
                     self.focus_window()
                     if not self.locate_conversation(who, runtime_id, row_index):
                         raise RuntimeError(f"Conversation is not visible: {who}")
                     before = self.get_chat_history(limit=5)
                     with self._clipboard(unicode_text=chunk):
-                        self._paste_and_send(expected_text=chunk)
-                    result = self._verify_send(who, before, text=chunk)
+                        try:
+                            self._paste_and_send(expected_text=chunk)
+                        except RuntimeError as exc:
+                            if "did not clear the reply input" not in str(exc):
+                                raise
+                            # The UIA ValuePattern can lag behind a successful
+                            # click. Verify first so the fallback cannot send a
+                            # duplicate, then reacquire the input before Enter.
+                            result = self._verify_send(
+                                who, before, text=chunk
+                            )
+                            if not result.get("verified"):
+                                if not self._send_existing_input_with_enter(chunk):
+                                    raise
+                                result = self._verify_send(
+                                    who, before, text=chunk
+                                )
+                                if not result.get("verified"):
+                                    raise exc
+                        else:
+                            result = self._verify_send(
+                                who, before, text=chunk
+                            )
                     results.append(result)
-                    now = time.monotonic()
-                    self._last_send_at = now
-                    self._last_conversation_send[str(who)] = now
+                    if not expedited:
+                        now = time.monotonic()
+                        self._last_send_at = now
+                        self._last_conversation_send[str(who)] = now
                     if result.get("verified"):
-                        self.remember_outgoing_text(who, chunk)
+                        self.remember_outgoing_message(
+                            who,
+                            chunk,
+                            str(result.get("runtime_id") or ""),
+                        )
                 except Exception as exc:
                     raise RuntimeError(
                         f"WeChat text chunk {index}/{len(chunks)} failed: {exc}"
@@ -1820,6 +2371,10 @@ class WechatUiaClient:
             now = time.monotonic()
             self._last_send_at = now
             self._last_conversation_send[str(who)] = now
+            if result.get("verified"):
+                self.remember_outgoing_message(
+                    who, runtime_id=str(result.get("runtime_id") or "")
+                )
             return result
 
     def _verify_send(
@@ -1839,10 +2394,11 @@ class WechatUiaClient:
                 matches = (text and item.content == text) or (
                     expected_type and item.message_type in {expected_type, "image"}
                 )
-                if is_new and matches and item.direction in {"outgoing", "unknown"}:
+                if is_new and matches:
                     return {
                         "success": True,
                         "verified": True,
+                        "runtime_id": item.runtime_id,
                     }
         return {
             "success": True,

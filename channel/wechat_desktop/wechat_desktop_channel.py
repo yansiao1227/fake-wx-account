@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import random
 import re
 import shutil
 import threading
 import time
+import unicodedata
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -45,6 +48,7 @@ DEFAULT_CONFIG = {
     "uia_send_interval_ms_min": 2000,
     "uia_send_interval_ms_max": 5000,
     "uia_conversation_cooldown_seconds": 5,
+    "outgoing_echo_suppression_seconds": 300,
     "uia_history_sender_resolution_enabled": True,
     "uia_history_settle_ms_min": 800,
     "uia_history_settle_ms_max": 1300,
@@ -63,6 +67,7 @@ DEFAULT_CONFIG = {
     "reply_cycle_timeout_seconds": 180,
     "agent_tool_notice_enabled": True,
     "agent_tool_notice_once_per_reply": True,
+    "agent_preflight_notice_enabled": True,
     "agent_skill_notice_templates": [
         "这题得请 `{name}` skill 出场了，我去搬个救兵，稍等一下 🧰",
         "我先翻开 `{name}` skill 的小抄，马上回来 📖",
@@ -81,16 +86,22 @@ DEFAULT_CONFIG = {
     "shadow_mode": True,
     "auto_send_images": False,
     "analyze_incoming_images": True,
+    "resolve_message_references": True,
+    "uia_image_viewer_enabled": True,
     "uia_file_download_enabled": True,
+    "uia_file_save_as_enabled": True,
     "uia_file_download_timeout_seconds": 10,
-    "attachment_context_window_messages": 2,
-    "attachment_debounce_ms": 800,
+    "private_message_aggregation_ms": 800,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
     "bootstrap_existing_messages": False,
     "process_startup_unread_messages": True,
 }
+
+ATTACHMENT_REFERENCE_REQUIRED_REPLY = (
+    "为了确保我读取的是正确的图片或文件，请在微信中引用对应的图片或文件消息后再提问。"
+)
 
 
 def _normalize_auto_reply_text(value) -> str:
@@ -116,6 +127,32 @@ def _normalize_auto_reply_text(value) -> str:
     return text
 
 
+def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[str]]:
+    history_lines = []
+    for item in event.history:
+        if event.reference:
+            speaker = str(
+                item.get("sender_name")
+                or event.reference.get("sender_name")
+                or "原消息发送者"
+            )
+        elif event.is_group:
+            speaker = str(
+                item.get("sender_name") or item.get("sender") or "群成员"
+            )
+        else:
+            speaker = "历史消息"
+        history_lines.append(
+            f"{speaker}: {item.get('content') or '[非文字消息]'}"
+        )
+    heading = (
+        "[被引用的原消息，仅追溯这一层]"
+        if event.reference
+        else "[本地会话历史，仅供理解上下文，不要逐条回复]"
+    )
+    return heading, history_lines
+
+
 def _tool_notice_subject(data: dict) -> tuple[str, str]:
     """Return (kind, display name), recognizing reads of a skill's SKILL.md."""
     tool_name = str(data.get("tool_name") or "tool").strip() or "tool"
@@ -132,6 +169,36 @@ def _tool_notice_subject(data: dict) -> tuple[str, str]:
             if match:
                 return "skill", match.group(1)
     return "tool", tool_name
+
+
+def _preflight_tool_notice_data(event: WechatDesktopEvent) -> dict | None:
+    """Predict attachment tools so a notice can be sent before the first LLM turn."""
+    content_type = str(event.content_type or "").lower()
+    path = str(event.content or "")
+    if event.reference:
+        reference_type = str(event.reference.get("content_type") or "").lower()
+        reference_path = str(event.reference.get("file_path") or "")
+        if reference_type in {"image", "file"}:
+            content_type, path = reference_type, reference_path
+    if content_type == "image":
+        return {"tool_name": "vision", "arguments": {"path": path}}
+    if content_type != "file":
+        return None
+    suffix = Path(path).suffix.lower()
+    skill_names = {
+        ".doc": "docx",
+        ".docx": "docx",
+        ".pdf": "pdf-reader",
+        ".xls": "xlsx",
+        ".xlsx": "xlsx",
+    }
+    skill_name = skill_names.get(suffix)
+    if skill_name:
+        return {
+            "tool_name": "read",
+            "arguments": {"path": f"skills/{skill_name}/SKILL.md"},
+        }
+    return {"tool_name": "file-reader", "arguments": {"path": path}}
 
 
 def _is_network_reply_error(value) -> bool:
@@ -171,9 +238,20 @@ class WechatDesktopChannel(ChatChannel):
         self._reply_queue = WechatReplyQueue(
             int(self.config.get("active_conversation_burst_limit", 5))
         )
-        self._pending_attachment_lock = threading.RLock()
-        self._pending_attachments = {}
+        self._pending_private_lock = threading.RLock()
+        self._pending_private_batches: dict[
+            str, tuple[list[WechatDesktopEvent], threading.Timer]
+        ] = {}
+        self._private_batch_timer_factory = threading.Timer
+        self._materialize_submit_lock = threading.RLock()
+        self._materialize_queue: queue.Queue = queue.Queue()
+        self._materialize_stop = object()
         self._queue_thread = None
+        self._scan_thread = None
+        self._materialize_thread = None
+        self._lifecycle_lock = threading.RLock()
+        self._lifecycles: dict[str, dict] = {}
+        self._scan_count = 0
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
         self._policy = WechatDesktopPolicy(self.config, self._store)
@@ -205,6 +283,95 @@ class WechatDesktopChannel(ChatChannel):
                 *args,
             )
 
+    def _start_lifecycle(self, event: WechatDesktopEvent):
+        now = time.monotonic()
+        with self._lifecycle_lock:
+            self._lifecycles.setdefault(
+                event.event_id,
+                {
+                    "event_id": event.event_id,
+                    "conversation": event.conversation_name,
+                    "batch_id": "",
+                    "detected": now,
+                    "materialized": None,
+                    "queued": None,
+                    "agent_started": None,
+                    "first_tool": None,
+                    "agent_done": None,
+                    "send_started": None,
+                    "send_verified": None,
+                    "send_result": "-",
+                    "detected_scan": self._scan_count,
+                    "attachment_resolve_count": 0,
+                    "superseded_by": "",
+                },
+            )
+
+    def _mark_lifecycle(
+        self,
+        event_ids,
+        stage: str,
+        *,
+        batch_id: str = "",
+        attachment_resolve_count: int = 0,
+        send_result: str = "",
+    ):
+        now = time.monotonic()
+        with self._lifecycle_lock:
+            for event_id in event_ids:
+                lifecycle = self._lifecycles.get(str(event_id))
+                if lifecycle is None:
+                    continue
+                if stage in lifecycle and lifecycle[stage] is None:
+                    lifecycle[stage] = now
+                if batch_id:
+                    lifecycle["batch_id"] = batch_id
+                if attachment_resolve_count:
+                    lifecycle["attachment_resolve_count"] += int(
+                        attachment_resolve_count
+                    )
+                if send_result:
+                    lifecycle["send_result"] = send_result
+
+    def _finish_lifecycle(self, event_ids, terminal: str):
+        rows = []
+        with self._lifecycle_lock:
+            for event_id in event_ids:
+                lifecycle = self._lifecycles.pop(str(event_id), None)
+                if lifecycle is not None:
+                    rows.append(lifecycle)
+            scan_count = self._scan_count
+        for lifecycle in rows:
+            detected = lifecycle["detected"]
+
+            def elapsed(field):
+                value = lifecycle.get(field)
+                return "-" if value is None else str(max(0, int((value - detected) * 1000)))
+
+            logger.info(
+                "[WechatDesktop][lifecycle] "
+                "event_id=%s batch_id=%s conversation=%s terminal=%s "
+                "detected=0 materialized=%s queued=%s agent_started=%s "
+                "first_tool=%s agent_done=%s send_started=%s send_verified=%s "
+                "scan_count=%s attachment_resolve_count=%s superseded_by=%s "
+                "send_result=%s",
+                lifecycle["event_id"],
+                lifecycle["batch_id"] or "-",
+                lifecycle["conversation"],
+                terminal,
+                elapsed("materialized"),
+                elapsed("queued"),
+                elapsed("agent_started"),
+                elapsed("first_tool"),
+                elapsed("agent_done"),
+                elapsed("send_started"),
+                elapsed("send_verified"),
+                max(1, scan_count - int(lifecycle["detected_scan"]) + 1),
+                lifecycle["attachment_resolve_count"],
+                lifecycle["superseded_by"] or "-",
+                lifecycle["send_result"],
+            )
+
     def startup(self):
         self._stop_event.clear()
         try:
@@ -223,12 +390,22 @@ class WechatDesktopChannel(ChatChannel):
         self._reply_queue = WechatReplyQueue(
             int(self.config.get("active_conversation_burst_limit", 5))
         )
+        self._materialize_queue = queue.Queue()
         self._queue_thread = threading.Thread(
             target=self._consume_reply_queue,
             name="cow-wechat-reply-fifo",
             daemon=True,
         )
-        self._queue_thread.start()
+        self._materialize_thread = threading.Thread(
+            target=self._consume_materialization_queue,
+            name="cow-wechat-materialize",
+            daemon=True,
+        )
+        self._scan_thread = threading.Thread(
+            target=self._scan_loop,
+            name="cow-wechat-scan",
+            daemon=True,
+        )
         self._service.set_agent_executor(self._execute_agent_action)
         self._service.update_status(
             running=True,
@@ -254,6 +431,9 @@ class WechatDesktopChannel(ChatChannel):
             group_reply_mode=str(self.config.get("group_reply_mode", "at_or_prefix")),
             last_error="",
         )
+        self._queue_thread.start()
+        self._materialize_thread.start()
+        self._scan_thread.start()
         self.report_startup_success()
         logger.info(
             "[WechatDesktop] Channel started in %s mode",
@@ -268,6 +448,10 @@ class WechatDesktopChannel(ChatChannel):
             self.config.get("group_reply_mode"),
             list(self.config.get("auto_reply_blacklist", [])),
         )
+        while not self._stop_event.wait(0.25):
+            pass
+
+    def _scan_loop(self):
         first_observation = True
         while not self._stop_event.is_set():
             try:
@@ -283,19 +467,38 @@ class WechatDesktopChannel(ChatChannel):
 
     def stop(self):
         self._stop_event.set()
-        self._clear_pending_attachments()
+        pending_ids = self._clear_pending_private_batches()
+        for event_id in pending_ids:
+            self._store.mark_event_processed(event_id)
+            self._finish_lifecycle([event_id], "stopped")
+        queued_ids = self._reply_queue.clear_pending()
+        for event_id in queued_ids:
+            self._store.mark_event_processed(event_id)
+        self._finish_lifecycle(queued_ids, "stopped")
+        materializing_ids = self._clear_pending_materializations()
+        for event_id in materializing_ids:
+            self._store.mark_event_processed(event_id)
+        self._finish_lifecycle(materializing_ids, "stopped")
+        self._materialize_queue.put(self._materialize_stop)
         discarded = self._reply_queue.stop()
         close = getattr(self._driver, "close", None)
         if close:
             close()
         self._service.set_agent_executor(None)
         self._service.update_status(running=False, login_status="stopped")
-        if self._queue_thread and self._queue_thread is not threading.current_thread():
-            self._queue_thread.join(timeout=2.0)
+        for worker in (
+            self._scan_thread,
+            self._materialize_thread,
+            self._queue_thread,
+        ):
+            if worker and worker is not threading.current_thread():
+                worker.join(timeout=2.0)
         if discarded:
             logger.info("[WechatDesktop] discarded %s queued messages on stop", discarded)
 
     def _poll_once(self):
+        with self._lifecycle_lock:
+            self._scan_count += 1
         observation, events = self._driver.observe_events()
         now = time.time()
         if observation.get("error"):
@@ -332,7 +535,7 @@ class WechatDesktopChannel(ChatChannel):
                 if event.kind == "message"
             }
         for event in events:
-            self._preserve_event_evidence(event)
+            self._start_lifecycle(event)
             recorded = self._store.record_event(event)
             self._trace(
                 "07-event",
@@ -361,6 +564,7 @@ class WechatDesktopChannel(ChatChannel):
                     event.kind,
                 )
                 self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "skipped")
                 continue
             process_startup_unread = bool(
                 self.config.get("process_startup_unread_messages", True)
@@ -381,6 +585,7 @@ class WechatDesktopChannel(ChatChannel):
                     event.event_id[:10],
                 )
                 self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "skipped")
                 continue
             if event.source_type == "official_account":
                 self._trace(
@@ -391,6 +596,7 @@ class WechatDesktopChannel(ChatChannel):
                 )
                 self._learn_from_official_account(event)
                 self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "completed")
                 continue
             if (
                 self._policy.is_blocked(event.conversation_name)
@@ -409,6 +615,7 @@ class WechatDesktopChannel(ChatChannel):
                     event.sender_name,
                 )
                 self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "skipped")
                 continue
             if event.source_type not in {"private", "group"}:
                 logger.info(
@@ -422,6 +629,7 @@ class WechatDesktopChannel(ChatChannel):
                     event.source_type,
                 )
                 self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "skipped")
                 continue
             if event.is_group and not self._policy.group_triggered(event):
                 self._trace(
@@ -431,6 +639,7 @@ class WechatDesktopChannel(ChatChannel):
                     event.conversation_name,
                 )
                 self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "skipped")
                 continue
             self._trace(
                 "09-dispatch",
@@ -454,128 +663,339 @@ class WechatDesktopChannel(ChatChannel):
             self._last_cleanup_at = now
 
     def _route_reply_event(self, event: WechatDesktopEvent):
-        """Debounce attachments and merge an immediately following message."""
-        pending_attachment = self._take_pending_attachment(event.conversation_id)
-        if pending_attachment is not None:
-            marker_name = (
-                "文件" if pending_attachment.content_type == "file" else "图片"
-            )
-            attachment_marker = f"[{marker_name}: {pending_attachment.content}]"
-            if not any(
-                str(item.get("content") or "") == attachment_marker
-                for item in event.history
-            ):
-                event.history.append(
-                    {
-                        "sender_name": pending_attachment.sender_name,
-                        "content": attachment_marker,
-                        "content_type": pending_attachment.content_type,
-                    }
-                )
-            self._trace(
-                "09-attachment-followup",
-                "attachment_id=%s followup_id=%s conversation=%s",
-                pending_attachment.event_id[:10],
-                event.event_id[:10],
-                event.conversation_name,
-            )
-
-        if event.content_type in {"file", "image"} and not getattr(
-            event, "_attachment_debounce_released", False
-        ):
-            self._defer_attachment_event(event)
+        if self._is_control_event(event):
+            self._dispatch_control_event(event)
             return
-        self._enqueue_reply_event(event)
+        if event.content_type == "image" and not event.reference:
+            self._ignore_standalone_attachment(event)
+            return
+        if event.content_type == "file" and not event.reference:
+            self._submit_materialization([event])
+            return
+        if event.is_group:
+            self._submit_materialization([event])
+            return
+        self._defer_private_event(event)
 
-    def _defer_attachment_event(self, event: WechatDesktopEvent):
+    def _ignore_standalone_attachment(self, event: WechatDesktopEvent):
+        self._store.mark_event_processed(event.event_id)
+        self._trace(
+            "09-attachment-observed",
+            "id=%s conversation=%s type=%s action=identity_only",
+            event.event_id[:10],
+            event.conversation_name,
+            event.content_type,
+        )
+        self._finish_lifecycle([event.event_id], "observed")
+
+    @staticmethod
+    def _is_control_event(event: WechatDesktopEvent) -> bool:
+        if event.content_type != "text":
+            return False
+        text = str(event.content or "").strip().lower()
+        return text == "/cancel" or re.match(r"^/steer(?:\s|$)", text) is not None
+
+    def _dispatch_control_event(self, event: WechatDesktopEvent):
+        context = self._compose_context(
+            ContextType.TEXT,
+            str(event.content or ""),
+            isgroup=False,
+            msg=WechatDesktopMessage(event),
+            no_need_at=True,
+            wechat_desktop_source_type=event.source_type,
+            wechat_desktop_auto_reply=True,
+        )
+        self._mark_lifecycle([event.event_id], "materialized")
+        if context is None:
+            terminal = "skipped"
+        else:
+            context["wechat_desktop_source_event_ids"] = [event.event_id]
+            context["wechat_desktop_batch_id"] = event.event_id
+            try:
+                self.produce(context)
+                terminal = "completed"
+            except Exception:
+                terminal = "failed"
+                logger.exception("[WechatDesktop] control command dispatch failed")
+        self._store.mark_event_processed(event.event_id)
+        self._finish_lifecycle([event.event_id], terminal)
+
+    def _defer_private_event(self, event: WechatDesktopEvent):
         wait_seconds = max(
             0.05,
-            min(float(self.config.get("attachment_debounce_ms", 800)) / 1000.0, 5.0),
+            min(
+                float(self.config.get("private_message_aggregation_ms", 800))
+                / 1000.0,
+                5.0,
+            ),
         )
-        with self._pending_attachment_lock:
-            previous = self._pending_attachments.pop(event.conversation_id, None)
+        with self._pending_private_lock:
+            previous = self._pending_private_batches.pop(
+                event.conversation_id, None
+            )
+            events = list(previous[0]) if previous is not None else []
             if previous is not None:
                 previous[1].cancel()
-                self._store.mark_event_processed(previous[0].event_id)
-            timer = threading.Timer(
+            events.append(event)
+            timer = self._private_batch_timer_factory(
                 wait_seconds,
-                self._release_debounced_attachment,
+                self._release_private_batch,
                 args=(event.conversation_id, event.event_id),
             )
             timer.daemon = True
-            self._pending_attachments[event.conversation_id] = (event, timer)
+            self._pending_private_batches[event.conversation_id] = (events, timer)
             timer.start()
         self._trace(
-            "09-attachment-debounce",
-            "id=%s conversation=%s milliseconds=%s",
+            "09-private-aggregate",
+            "id=%s conversation=%s messages=%s milliseconds=%s",
             event.event_id[:10],
             event.conversation_name,
+            len(events),
             int(wait_seconds * 1000),
         )
 
-    def _take_pending_attachment(self, conversation_id: str):
-        with self._pending_attachment_lock:
-            pending = self._pending_attachments.pop(conversation_id, None)
-            if pending is None:
-                return None
-            pending[1].cancel()
-            event = pending[0]
-        self._store.mark_event_processed(event.event_id)
-        return event
-
-    def _release_debounced_attachment(self, conversation_id: str, event_id: str):
+    def _release_private_batch(self, conversation_id: str, last_event_id: str):
         if self._stop_event.is_set():
             return
-        with self._pending_attachment_lock:
-            pending = self._pending_attachments.get(conversation_id)
-            if pending is None or pending[0].event_id != event_id:
+        with self._pending_private_lock:
+            pending = self._pending_private_batches.get(conversation_id)
+            if (
+                pending is None
+                or not pending[0]
+                or pending[0][-1].event_id != last_event_id
+            ):
                 return
-            event, _ = self._pending_attachments.pop(conversation_id)
-        setattr(event, "_attachment_debounce_released", True)
-        self._trace(
-            "09-attachment-released",
-            "id=%s conversation=%s",
-            event.event_id[:10],
-            event.conversation_name,
-        )
-        validation = self._driver.validate_reply_target(event)
-        if not validation.valid and validation.replacement_event is not None:
-            self._store.mark_event_processed(event.event_id)
-            self._trace(
-                "09-attachment-replaced",
-                "attachment_id=%s replacement_id=%s conversation=%s",
-                event.event_id[:10],
-                validation.replacement_event.event_id[:10],
-                event.conversation_name,
-            )
-            self._accept_replacement_event(validation.replacement_event)
-            return
-        self._enqueue_reply_event(event)
+            events, _ = self._pending_private_batches.pop(conversation_id)
+        self._submit_materialization(events)
 
-    def _clear_pending_attachments(self) -> list[str]:
-        with self._pending_attachment_lock:
+    def _clear_pending_private_batches(self) -> list[str]:
+        with self._pending_private_lock:
             event_ids = []
-            for event, timer in self._pending_attachments.values():
+            for events, timer in self._pending_private_batches.values():
                 timer.cancel()
-                event_ids.append(event.event_id)
-            self._pending_attachments.clear()
+                event_ids.extend(event.event_id for event in events)
+            self._pending_private_batches.clear()
         return event_ids
+
+    def _submit_materialization(self, events: list[WechatDesktopEvent]):
+        if not events:
+            return False
+        with self._materialize_submit_lock:
+            if self._stop_event.is_set():
+                accepted = False
+            else:
+                self._materialize_queue.put(events)
+                accepted = True
+        if not accepted:
+            event_ids = [event.event_id for event in events]
+            for event_id in event_ids:
+                self._store.mark_event_processed(event_id)
+            self._finish_lifecycle(event_ids, "stopped")
+        return accepted
+
+    def _clear_pending_materializations(self) -> list[str]:
+        event_ids = []
+        with self._materialize_submit_lock:
+            while True:
+                try:
+                    events = self._materialize_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if events is not self._materialize_stop:
+                    event_ids.extend(event.event_id for event in events)
+                self._materialize_queue.task_done()
+        return list(dict.fromkeys(event_ids))
+
+    @staticmethod
+    def _attachment_marker(event: WechatDesktopEvent) -> str:
+        if event.content_type == "file":
+            return f"[文件: {event.content}]"
+        if event.content_type == "image":
+            return f"[图片: {event.content}]"
+        return str(event.content or "")
+
+    @staticmethod
+    def _requires_attachment_reference(event: WechatDesktopEvent) -> bool:
+        if event.content_type != "text":
+            return False
+        reference_type = str(event.reference.get("content_type") or "").lower()
+        if reference_type in {"file", "image"}:
+            return False
+        text = unicodedata.normalize("NFKC", str(event.content or "")).strip()
+        if not text or re.search(r"(?:生成|创建|制作|画一张|做一张)", text):
+            return False
+        attachment = re.search(
+            r"(?:图(?:片|像)?|照片|截图|文件|文档|附件|表格|PDF)",
+            text,
+            re.IGNORECASE,
+        )
+        question = re.search(
+            r"(?:是什么|是啥|什么内容|讲了?什么|写了?什么|说了?什么|"
+            r"内容是|分析|总结|概括|解读|看一下|看看|读一下|读取)",
+            text,
+            re.IGNORECASE,
+        )
+        return bool(attachment and question)
+
+    def _materialize_batch(
+        self, events: list[WechatDesktopEvent]
+    ) -> WechatDesktopEvent:
+        resolved_events = []
+        for event in events:
+            event, resolve_count = self._driver.materialize_event(event)
+            self._preserve_event_evidence(event)
+            resolved_events.append(event)
+            self._mark_lifecycle(
+                [event.event_id],
+                "materialized",
+                attachment_resolve_count=resolve_count,
+            )
+
+        target = resolved_events[-1]
+        batch_id = str(
+            getattr(events[-1], "_batch_id", "") or uuid.uuid4().hex
+        )
+        source_event_ids = [event.event_id for event in resolved_events]
+        history = list(target.history)
+        existing = {
+            (str(item.get("content") or ""), str(item.get("content_type") or ""))
+            for item in history
+        }
+        for event in resolved_events[:-1]:
+            content = self._attachment_marker(event)
+            key = (content, event.content_type)
+            replaced_history_item = False
+            if event.message_stable_id:
+                for item in history:
+                    if (
+                        str(item.get("_message_stable_id") or "")
+                        == event.message_stable_id
+                    ):
+                        item["content"] = content
+                        item["content_type"] = event.content_type
+                        replaced_history_item = True
+                        existing.add(key)
+                        break
+            if replaced_history_item:
+                continue
+            if key not in existing:
+                history.append(
+                    {
+                        "sender_name": event.sender_name,
+                        "content": content,
+                        "content_type": event.content_type,
+                    }
+                )
+                existing.add(key)
+        reference_type = str(target.reference.get("content_type") or "").lower()
+        if (
+            target.content_type == "text"
+            and reference_type not in {"file", "image"}
+        ):
+            # Cached attachments are not implicit context. A text message must
+            # explicitly quote the intended attachment before the Agent sees it.
+            history = [
+                item
+                for item in history
+                if str(item.get("content_type") or "") not in {"file", "image"}
+            ]
+        target.history = history
+        setattr(target, "_source_event_ids", source_event_ids)
+        setattr(target, "_batch_id", batch_id)
+        setattr(
+            target,
+            "_cache_only",
+            bool(resolved_events)
+            and all(
+                event.content_type == "file" and not event.reference
+                for event in resolved_events
+            ),
+        )
+        setattr(
+            target,
+            "_attachment_reference_required",
+            self._requires_attachment_reference(target),
+        )
+        self._mark_lifecycle(
+            source_event_ids,
+            "materialized",
+            batch_id=batch_id,
+        )
+        return target
+
+    @staticmethod
+    def _has_referenced_attachment(event: WechatDesktopEvent) -> bool:
+        return str(event.reference.get("content_type") or "").lower() in {
+            "file",
+            "image",
+        }
+
+    def _prepare_deferred_materialization(
+        self, events: list[WechatDesktopEvent]
+    ) -> WechatDesktopEvent:
+        target = events[-1]
+        source_event_ids = [event.event_id for event in events]
+        batch_id = uuid.uuid4().hex
+        setattr(target, "_source_event_ids", source_event_ids)
+        setattr(target, "_batch_id", batch_id)
+        setattr(target, "_deferred_materialization_events", list(events))
+        setattr(target, "_attachment_reference_required", False)
+        return target
+
+    def _consume_materialization_queue(self):
+        while not self._stop_event.is_set():
+            try:
+                events = self._materialize_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if events is self._materialize_stop:
+                self._materialize_queue.task_done()
+                return
+            event_ids = [event.event_id for event in events]
+            try:
+                if self._has_referenced_attachment(events[-1]):
+                    materialized = self._prepare_deferred_materialization(events)
+                else:
+                    materialized = self._materialize_batch(events)
+                if self._stop_event.is_set():
+                    for event_id in event_ids:
+                        self._store.mark_event_processed(event_id)
+                    self._finish_lifecycle(event_ids, "stopped")
+                elif bool(getattr(materialized, "_cache_only", False)):
+                    for event_id in event_ids:
+                        self._store.mark_event_processed(event_id)
+                    self._trace(
+                        "09-file-cached",
+                        "conversation=%s messages=%s",
+                        materialized.conversation_name,
+                        len(event_ids),
+                    )
+                    self._finish_lifecycle(event_ids, "cached")
+                else:
+                    self._enqueue_reply_event(materialized)
+            except Exception:
+                logger.exception("[WechatDesktop] message materialization failed")
+                for event_id in event_ids:
+                    self._store.mark_event_processed(event_id)
+                self._finish_lifecycle(event_ids, "failed")
+            finally:
+                self._materialize_queue.task_done()
 
     def _enqueue_reply_event(self, event: WechatDesktopEvent):
         enqueue_result = self._reply_queue.enqueue(event)
+        source_event_ids = list(
+            getattr(event, "_source_event_ids", None) or [event.event_id]
+        )
         if not enqueue_result:
+            for event_id in source_event_ids:
+                self._store.mark_event_processed(event_id)
+            self._finish_lifecycle(source_event_ids, "duplicate")
             return
-        if enqueue_result.cancel_event_id:
-            try:
-                from agent.protocol import get_cancel_registry
-
-                get_cancel_registry().cancel_request(enqueue_result.cancel_event_id)
-            except Exception as exc:
-                logger.warning(
-                    "[WechatDesktop] failed to cancel superseded event %s: %s",
-                    enqueue_result.cancel_event_id,
-                    exc,
-                )
+        self._mark_lifecycle(
+            source_event_ids,
+            "queued",
+            batch_id=str(getattr(event, "_batch_id", "") or event.event_id),
+        )
         self._trace(
             "09-queued",
             "id=%s conversation=%s action=%s queue_depth=%s",
@@ -585,6 +1005,103 @@ class WechatDesktopChannel(ChatChannel):
             self._reply_queue.status()["queue_depth"],
         )
         self._service.update_status(**self._reply_queue.status())
+
+    def _send_attachment_reference_prompt(self, item: ReplyQueueItem) -> str:
+        event = item.event
+        target_name = event.conversation_name
+        target_id = event.conversation_id
+        if bool(self._service.status().get("paused")) or not self._policy.can_auto_send(
+            target_name,
+            event.is_group,
+            "text",
+        ):
+            return "skipped"
+        validation = self._driver.validate_reply_target(event)
+        if not validation.valid:
+            if validation.replacement_event is not None:
+                self._accept_replacement_event(validation.replacement_event)
+            self._store.audit(
+                "send_text",
+                target_name,
+                "stale_target",
+                self._content_hash(ATTACHMENT_REFERENCE_REQUIRED_REPLY),
+                detail=validation.reason,
+            )
+            return "skipped"
+        send_target = (
+            target_id
+            if str(target_id).startswith("uia-session:")
+            else target_name
+        )
+        self._mark_lifecycle(item.source_event_ids, "send_started")
+        try:
+            result = self._driver.send_text(
+                send_target,
+                ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+            )
+        except Exception as exc:
+            self._mark_lifecycle(
+                item.source_event_ids,
+                "send_started",
+                send_result="failed",
+            )
+            logger.warning(
+                "[WechatDesktop] attachment reference prompt failed: %s",
+                exc,
+            )
+            return "failed"
+        if not result.get("success"):
+            self._mark_lifecycle(
+                item.source_event_ids,
+                "send_started",
+                send_result="failed",
+            )
+            return "failed"
+        verified = bool(result.get("verified"))
+        self._mark_lifecycle(
+            item.source_event_ids,
+            "send_verified" if verified else "send_started",
+            send_result="verified" if verified else "unverified",
+        )
+        self._store.audit(
+            "send_text",
+            target_name,
+            "success" if verified else "unverified",
+            self._content_hash(ATTACHMENT_REFERENCE_REQUIRED_REPLY),
+            detail="attachment reference required",
+        )
+        self._store.append_conversation_history(
+            conversation_id=target_id,
+            conversation_name=target_name,
+            sender_name=str(self.config.get("self_display_name") or "我"),
+            direction="outgoing",
+            content_type="text",
+            content=ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+            source_type=event.source_type,
+        )
+        return "completed"
+
+    def _send_deferred_attachment_notice(self, item: ReplyQueueItem) -> bool:
+        event = item.event
+        notice_data = _preflight_tool_notice_data(event)
+        if not notice_data or not bool(
+            self.config.get("agent_tool_notice_enabled", True)
+        ):
+            return False
+        context = {
+            "msg": WechatDesktopMessage(event),
+            "receiver": event.conversation_id or event.conversation_name,
+            "isgroup": event.is_group,
+            "wechat_desktop_queue_token": item.token,
+            "wechat_desktop_source_type": event.source_type,
+        }
+        try:
+            return self._send_agent_tool_notice(context, notice_data)
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] early attachment notice failed: %s", exc
+            )
+            return False
 
     def _consume_reply_queue(self):
         while not self._stop_event.is_set():
@@ -598,16 +1115,58 @@ class WechatDesktopChannel(ChatChannel):
                 **self._reply_queue.status(),
             )
             terminal = "failed"
+            deferred_failed = False
+            deferred_events = list(
+                getattr(
+                    item.event, "_deferred_materialization_events", None
+                )
+                or []
+            )
+            if deferred_events:
+                try:
+                    self._driver.begin_reply_cycle(
+                        item.event.conversation_name,
+                        item.event.conversation_id,
+                    )
+                    notice_sent = self._send_deferred_attachment_notice(item)
+                    materialized = self._materialize_batch(deferred_events)
+                    setattr(
+                        materialized,
+                        "_preflight_attachment_notice_sent",
+                        notice_sent,
+                    )
+                    item.event = materialized
+                except Exception:
+                    deferred_failed = True
+                    logger.exception(
+                        "[WechatDesktop] deferred attachment materialization failed"
+                    )
+            reference_required = bool(
+                getattr(item.event, "_attachment_reference_required", False)
+            )
+            if not reference_required:
+                self._mark_lifecycle(
+                    item.source_event_ids,
+                    "agent_started",
+                    batch_id=item.batch_id,
+                )
             try:
-                if item.expired:
-                    terminal = item.terminal or "superseded"
+                if deferred_failed:
+                    dispatched = False
+                elif item.expired:
+                    terminal = item.terminal or "skipped"
+                    dispatched = False
+                elif reference_required:
+                    terminal = self._send_attachment_reference_prompt(item)
                     dispatched = False
                 else:
                     dispatched = self._dispatch_message(item.event, item.token)
-                if not dispatched:
-                    terminal = item.terminal or (
-                        "superseded" if item.expired else "skipped"
-                    )
+                if reference_required:
+                    pass
+                elif deferred_failed:
+                    terminal = "failed"
+                elif not dispatched:
+                    terminal = item.terminal or "skipped"
                 else:
                     timeout = max(
                         1.0,
@@ -634,9 +1193,10 @@ class WechatDesktopChannel(ChatChannel):
                     "[WechatDesktop] queued message failed: %s", exc, exc_info=True
                 )
             finally:
-                self._driver.end_reply_cycle()
-                self._store.mark_event_processed(item.event.event_id)
-                for event_id in item.superseded_event_ids:
+                if not reference_required:
+                    self._driver.end_reply_cycle()
+                    self._mark_lifecycle(item.source_event_ids, "agent_done")
+                for event_id in item.source_event_ids:
                     self._store.mark_event_processed(event_id)
                 self._store.audit(
                     "reply_queue",
@@ -645,6 +1205,7 @@ class WechatDesktopChannel(ChatChannel):
                     detail=f"event_id={item.event.event_id}",
                 )
                 self._reply_queue.finish(item, terminal)
+                self._finish_lifecycle(item.source_event_ids, terminal)
                 self._service.update_status(
                     reply_in_flight=False,
                     reply_conversation="",
@@ -666,6 +1227,8 @@ class WechatDesktopChannel(ChatChannel):
             event.evidence_path = str(target)
             if event.content_type == "image" and event.content == old_source:
                 event.content = str(target)
+            if event.reference.get("file_path") == old_source:
+                event.reference["file_path"] = str(target)
         except OSError as exc:
             logger.warning(f"[WechatDesktop] failed to preserve evidence: {exc}")
 
@@ -770,6 +1333,19 @@ class WechatDesktopChannel(ChatChannel):
             attachment_instruction = (
                 "当前消息是一个文件，请读取该文件，并结合附近上下文自然回复发送者。"
             )
+        if event.reference:
+            reference_type = str(event.reference.get("content_type") or "text")
+            reference_path = str(event.reference.get("file_path") or "")
+            if reference_type == "image" and reference_path:
+                attachment_instruction = (
+                    f"被引用的原图片已保存到本地: {reference_path}。"
+                    "必须先使用 vision 工具读取这张大图，再回答当前消息。"
+                )
+            elif reference_type == "file" and reference_path:
+                attachment_instruction = (
+                    f"被引用的原文件已保存到本地: {reference_path}。"
+                    "请按当前消息的意图读取该文件后回答。"
+                )
         if ctype == ContextType.TEXT:
             history_items = list(event.history)
             self._trace(
@@ -780,24 +1356,12 @@ class WechatDesktopChannel(ChatChannel):
                 len(history_items),
                 "visible",
             )
-            history_lines = []
-            for item in history_items:
-                if event.is_group:
-                    speaker = str(
-                        item.get("sender_name")
-                        or item.get("sender")
-                        or "群成员"
-                    )
-                else:
-                    speaker = "历史消息"
-                history_lines.append(
-                    f"{speaker}: {item.get('content') or '[非文字消息]'}"
-                )
+            history_heading, history_lines = _render_event_context_lines(event)
             sections = []
             if history_lines:
                 sections.extend(
                     [
-                        "[本地会话历史，仅供理解上下文，不要逐条回复]",
+                        history_heading,
                         "\n".join(history_lines),
                     ]
                 )
@@ -843,11 +1407,38 @@ class WechatDesktopChannel(ChatChannel):
             context["wechat_desktop_reply_cycle"] = True
             context["wechat_desktop_queue_token"] = queue_token
             context["wechat_desktop_queue_terminal"] = "completed"
-            context["on_event"] = self._make_agent_event_callback(context)
+            context["wechat_desktop_source_event_ids"] = list(
+                getattr(event, "_source_event_ids", None) or [event.event_id]
+            )
+            context["wechat_desktop_batch_id"] = str(
+                getattr(event, "_batch_id", "") or event.event_id
+            )
+            context["wechat_desktop_agent_notice_sent"] = bool(
+                getattr(event, "_preflight_attachment_notice_sent", False)
+            )
             self._driver.begin_reply_cycle(
                 event.conversation_name, event.conversation_id
             )
             try:
+                notice_data = None
+                if bool(self.config.get("agent_preflight_notice_enabled", True)):
+                    notice_data = _preflight_tool_notice_data(event)
+                if (
+                    notice_data
+                    and not context["wechat_desktop_agent_notice_sent"]
+                    and bool(
+                    self.config.get("agent_tool_notice_enabled", True)
+                    )
+                ):
+                    try:
+                        context["wechat_desktop_agent_notice_sent"] = (
+                            self._send_agent_tool_notice(context, notice_data)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[WechatDesktop] Agent preflight notice failed: %s", exc
+                        )
+                context["on_event"] = self._make_agent_event_callback(context)
                 self.produce(context)
             except Exception:
                 context["wechat_desktop_reply_cycle"] = False
@@ -865,11 +1456,16 @@ class WechatDesktopChannel(ChatChannel):
         downstream = context.get("on_event")
         lock = threading.Lock()
         seen_tool_calls: set[str] = set()
-        notice_sent = False
+        notice_sent = bool(context.get("wechat_desktop_agent_notice_sent", False))
 
         def on_event(event: dict):
             nonlocal notice_sent
             try:
+                if event.get("type") == "tool_execution_start":
+                    self._mark_lifecycle(
+                        context.get("wechat_desktop_source_event_ids", []),
+                        "first_tool",
+                    )
                 if (
                     event.get("type") == "tool_execution_start"
                     and bool(self.config.get("agent_tool_notice_enabled", True))
@@ -900,10 +1496,6 @@ class WechatDesktopChannel(ChatChannel):
         return on_event
 
     def _send_agent_tool_notice(self, context: Context, data: dict) -> bool:
-        queue_token = str(context.get("wechat_desktop_queue_token") or "")
-        if queue_token and not self._reply_queue.is_active(queue_token):
-            return False
-
         msg = context.get("msg")
         target_name = (
             getattr(msg, "other_user_nickname", "")
@@ -913,6 +1505,15 @@ class WechatDesktopChannel(ChatChannel):
             getattr(msg, "other_user_id", "")
             or context.get("receiver", "")
         )
+        event = getattr(msg, "event", None)
+        conversation_id = str(
+            getattr(event, "conversation_id", "") or target_id
+        )
+        queue_token = str(context.get("wechat_desktop_queue_token") or "")
+        if queue_token and not self._reply_queue.is_relevant(
+            queue_token, conversation_id
+        ):
+            return False
         send_target = (
             target_id
             if str(target_id).startswith("uia-session:")
@@ -946,13 +1547,14 @@ class WechatDesktopChannel(ChatChannel):
         except (KeyError, ValueError):
             notice = f"我准备调用 `{name}` {kind}，稍等一下 🛠️"
 
-        event = getattr(msg, "event", None)
-        conversation_id = str(
-            getattr(event, "conversation_id", "") or target_id
-        )
         self._driver.register_interim_text(conversation_id, notice)
         try:
-            result = self._driver.send_text(send_target, notice)
+            send_interim = getattr(self._driver, "send_interim_text", None)
+            result = (
+                send_interim(send_target, notice)
+                if send_interim
+                else self._driver.send_text(send_target, notice)
+            )
             if not result.get("success"):
                 raise RuntimeError(str(result.get("message") or "send failed"))
         except Exception:
@@ -989,7 +1591,7 @@ class WechatDesktopChannel(ChatChannel):
 
     def _accept_replacement_event(self, event: WechatDesktopEvent):
         """Apply the same safety gates before queuing a send-time replacement."""
-        self._preserve_event_evidence(event)
+        self._start_lifecycle(event)
         recorded = self._store.record_event(event)
         if recorded:
             self._store.append_event_history(event)
@@ -1059,6 +1661,10 @@ class WechatDesktopChannel(ChatChannel):
         context = kwargs.get("context")
         self._finish_reply_cycle(context)
         if context:
+            self._mark_lifecycle(
+                context.get("wechat_desktop_source_event_ids", []),
+                "agent_done",
+            )
             self._reply_queue.signal(
                 str(context.get("wechat_desktop_queue_token") or ""),
                 str(context.get("wechat_desktop_queue_terminal") or "completed"),
@@ -1069,6 +1675,10 @@ class WechatDesktopChannel(ChatChannel):
         context = kwargs.get("context")
         self._finish_reply_cycle(context)
         if context:
+            self._mark_lifecycle(
+                context.get("wechat_desktop_source_event_ids", []),
+                "agent_done",
+            )
             self._reply_queue.signal(
                 str(context.get("wechat_desktop_queue_token") or ""),
                 "failed",
@@ -1081,6 +1691,9 @@ class WechatDesktopChannel(ChatChannel):
 
     def _send_reply_impl(self, reply: Reply, context: Context):
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
+        source_event_ids = list(
+            context.get("wechat_desktop_source_event_ids", []) or []
+        )
         if queue_token and not self._reply_queue.is_active(queue_token):
             self._store.audit(
                 "send_text",
@@ -1177,9 +1790,9 @@ class WechatDesktopChannel(ChatChannel):
                                 self._accept_replacement_event(
                                     validation.replacement_event
                                 )
-                            context["wechat_desktop_queue_terminal"] = "superseded"
+                            context["wechat_desktop_queue_terminal"] = "skipped"
                             self._trace(
-                                "11-send-superseded",
+                                "11-send-target-invalid",
                                 "target=%s reason=%s",
                                 target_name,
                                 reason,
@@ -1187,14 +1800,20 @@ class WechatDesktopChannel(ChatChannel):
                             self._store.audit(
                                 "send_text",
                                 target_name,
-                                "superseded",
+                                "stale_target",
                                 self._content_hash(reply_text),
                                 detail=reason,
                             )
                             return
+                    self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._driver.send_text(send_target, reply_text)
                     if result.get("success"):
                         verified = bool(result.get("verified"))
+                        self._mark_lifecycle(
+                            source_event_ids,
+                            "send_verified" if verified else "send_started",
+                            send_result="verified" if verified else "unverified",
+                        )
                         self._trace(
                             "12-send-success" if verified else "12-send-unverified",
                             "target=%s chars=%s verified=%s",
@@ -1224,6 +1843,11 @@ class WechatDesktopChannel(ChatChannel):
                         return
                     raise RuntimeError(str(result.get("message") or "send failed"))
                 except Exception as exc:
+                    self._mark_lifecycle(
+                        source_event_ids,
+                        "send_started",
+                        send_result="failed",
+                    )
                     logger.warning(f"[WechatDesktop] automatic send failed: {exc}")
                     self._trace(
                         "12-send-failed",
@@ -1248,8 +1872,15 @@ class WechatDesktopChannel(ChatChannel):
             )
             if can_auto:
                 try:
+                    self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._driver.send_image(send_target, str(reply.content))
                     if result.get("success"):
+                        verified = bool(result.get("verified"))
+                        self._mark_lifecycle(
+                            source_event_ids,
+                            "send_verified" if verified else "send_started",
+                            send_result="verified" if verified else "unverified",
+                        )
                         context["wechat_desktop_queue_terminal"] = "completed"
                         self._store.audit(
                             "send_image",
@@ -1282,10 +1913,12 @@ class WechatDesktopChannel(ChatChannel):
     ):
         self._finish_reply_cycle(context)
         discarded_event_ids = self._reply_queue.clear_pending()
-        discarded_event_ids.extend(self._clear_pending_attachments())
+        discarded_event_ids.extend(self._clear_pending_private_batches())
+        discarded_event_ids.extend(self._clear_pending_materializations())
         discarded_event_ids = list(dict.fromkeys(discarded_event_ids))
         for event_id in discarded_event_ids:
             self._store.mark_event_processed(event_id)
+        self._finish_lifecycle(discarded_event_ids, "failed")
         notice = "目前网络不稳定，请稍后再试。"
         error_detail = str(reply.content or "")
         self._trace(
