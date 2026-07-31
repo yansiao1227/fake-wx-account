@@ -74,9 +74,9 @@ DEFAULT_CONFIG = {
         "正在召唤 `{name}` skill，答案已经在路上了 ✨",
     ],
     "agent_tool_notice_templates": [
-        "我准备调用 `{name}` tool 查一查，稍等我操作一下 🔧",
-        "轮到 `{name}` tool 上场了，我去后台忙活一下 🛠️",
-        "先让 `{name}` tool 跑一趟，别走开，马上带结果回来 🚀",
+        "我正在使用工具，稍等我操作一下 🔧",
+        "我正在使用工具，去后台忙活一下，请稍等 🛠️",
+        "我正在使用工具，别走开，马上带结果回来 🚀",
     ],
     "auto_reply_contacts": [],
     "auto_reply_groups": [],

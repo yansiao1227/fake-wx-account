@@ -1,0 +1,14 @@
+{
+  "total": 2,
+  "success": 2,
+  "failed": 0,
+  "daily": {
+    "2026-07-31": {
+      "count": 2,
+      "success": 2,
+      "failed": 0
+    }
+  },
+  "daily_quota": 5000,
+  "last_check": null
+}
