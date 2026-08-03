@@ -1,3 +1,17 @@
+"""微信桌面通道的业务编排层。
+
+窗口查找、消息解析和实际点击由 ``desktop_backend`` 实现；本模块负责把后端事件
+组织成一条可控的自动回复流水线：
+
+1. 扫描线程发现消息并完成去重、策略过滤；
+2. 私聊短时间聚合后进入附件物化队列，群聊直接进入该队列；
+3. 物化线程只解析真正需要的图片/文件，并将任务写入全局回复 FIFO；
+4. 回复线程串行调用 Agent，等待回调，然后在发送前再次校验会话目标。
+
+这三个阶段刻意分离：耗时的附件读取和 Agent 推理不能阻塞微信消息扫描；所有真正
+发送到微信的动作仍通过回复 FIFO 串行执行，避免多个线程同时操作同一个客户端窗口。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,12 +31,12 @@ from pathlib import Path
 from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel
+from channel.wechat_desktop.backend import create_wechat_desktop_backend
 from channel.wechat_desktop.fifo_queue import ReplyQueueItem, WechatReplyQueue
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.policy import WechatDesktopPolicy
 from channel.wechat_desktop.service import get_wechat_desktop_service
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
-from channel.wechat_desktop.uia_driver import WechatUiaDriver
 from common.log import logger
 from common.singleton import singleton
 from common.utils import expand_path
@@ -31,6 +45,8 @@ from plugins import Event, EventContext, PluginManager
 
 
 DEFAULT_CONFIG = {
+    # 后端与 UI 操作节奏。后端名称是迁移扩展点，当前实现为 Windows UIA。
+    "desktop_backend": "uia",
     "uia_focus_settle_ms": 350,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
@@ -49,21 +65,31 @@ DEFAULT_CONFIG = {
     "uia_send_interval_ms_max": 5000,
     "uia_conversation_cooldown_seconds": 5,
     "outgoing_echo_suppression_seconds": 300,
-    "uia_history_sender_resolution_enabled": True,
-    "uia_history_settle_ms_min": 800,
-    "uia_history_settle_ms_max": 1300,
+
+    # 消息观察与会话历史解析。
+    "uia_group_sender_ocr_enabled": True,
+    "uia_group_sender_ocr_body_min_score": 0.6,
+    "uia_group_sender_ocr_name_min_score": 0.75,
+    "uia_group_sender_ocr_text_similarity": 0.78,
+    "uia_group_sender_ocr_name_gap_px": 48,
     "shell_hook_reconcile_seconds": 15,
     "shell_hook_reconcile_enabled": False,
     "shell_hook_debounce_ms": 250,
     "reply_monitor_interval_seconds": 1.0,
     "active_conversation_burst_limit": 5,
+
+    # 自动回复准入策略。shadow_mode=True 时只观察，不向微信发送内容。
     "auto_reply_private_all": False,
     "auto_reply_groups_all": False,
     "auto_reply_blacklist": [],
     "conversation_history_retention_days": 90,
+
+    # 可选的公众号知识沉淀与诊断能力。
     "learn_from_official_accounts": False,
     "official_account_knowledge_max_chars": 4000,
     "diagnostic_logging": False,
+
+    # Agent 回复周期与工具调用进度通知。
     "reply_cycle_timeout_seconds": 180,
     "agent_tool_notice_enabled": True,
     "agent_tool_notice_once_per_reply": True,
@@ -74,9 +100,9 @@ DEFAULT_CONFIG = {
         "正在召唤 `{name}` skill，答案已经在路上了 ✨",
     ],
     "agent_tool_notice_templates": [
-        "我正在使用工具，稍等我操作一下 🔧",
-        "我正在使用工具，去后台忙活一下，请稍等 🛠️",
-        "我正在使用工具，别走开，马上带结果回来 🚀",
+        "我准备调用 `{tool_name}` tool 查一查，稍等我操作一下 🔧",
+        "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
+        "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
     ],
     "auto_reply_contacts": [],
     "auto_reply_groups": [],
@@ -84,16 +110,20 @@ DEFAULT_CONFIG = {
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",
     "shadow_mode": True,
+
+    # 图片、文件和引用附件的提取策略。
     "auto_send_images": False,
     "analyze_incoming_images": True,
     "resolve_message_references": True,
     "uia_image_viewer_enabled": True,
+    "uia_image_viewer_before_close_ms_min": 300,
+    "uia_image_viewer_before_close_ms_max": 500,
     "uia_file_download_enabled": True,
     "uia_file_save_as_enabled": True,
     "uia_file_download_timeout_seconds": 10,
-    "private_message_aggregation_min_ms": 500,
-    "private_message_aggregation_max_ms": 1200,
-    "private_message_aggregation_max_wait_ms": 4000,
+
+    # 私聊聚合、发送限流、数据保留与首次启动行为。
+    "private_message_aggregation_ms": 800,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
@@ -104,10 +134,11 @@ DEFAULT_CONFIG = {
 ATTACHMENT_REFERENCE_REQUIRED_REPLY = (
     "为了确保我读取的是正确的图片或文件，请在微信中引用对应的图片或文件消息后再提问。"
 )
+DEFAULT_BOT_MENTION_ALIASES = ("颜料盒bot",)
 
 
 def _normalize_auto_reply_text(value) -> str:
-    """Remove drafting wrappers while preserving the actual reply body."""
+    """去掉“建议回复：”等代写包装，只保留要发给微信用户的正文。"""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -129,16 +160,52 @@ def _normalize_auto_reply_text(value) -> str:
     return text
 
 
+def _strip_group_bot_mentions(value: str, aliases) -> str:
+    """从群聊提示词移除机器人的 @，保留对其他成员的显式 @。"""
+    text = str(value or "")
+    normalized_aliases = list(
+        dict.fromkeys(
+            str(alias or "").strip().lstrip("@").casefold()
+            for alias in aliases or []
+            if str(alias or "").strip().lstrip("@")
+        )
+    )
+    for alias in normalized_aliases:
+        pattern = re.compile(
+            rf"@{re.escape(alias)}(?=$|[\s\u2005\u00a0,，。.!！?？:：])",
+            re.IGNORECASE,
+        )
+        text = pattern.sub("", text)
+    # 微信会在 @ 后插入特殊空格；删除名字后顺手收敛横向空白，但不合并换行。
+    text = re.sub(r"[\t \u2005\u00a0]{2,}", " ", text)
+    text = re.sub(r"^[\t \u2005\u00a0]+", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
 def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[str]]:
+    """将事件快照渲染成提示词片段，不在这里重新读取微信 UI。
+
+    引用消息只返回被引用的一层内容；普通消息返回候选历史，后续由提示词要求
+    Agent 按相关性筛选。这样可以保证排队期间 UI 变化不会改变回复依据。
+    """
+    if event.reference:
+        reference = event.reference
+        speaker = str(reference.get("sender_name") or "原消息发送者")
+        reference_type = str(reference.get("content_type") or "text").lower()
+        reference_path = str(reference.get("file_path") or "").strip()
+        reference_content = str(reference.get("content") or "").strip()
+        if reference_type == "image" and reference_path:
+            reference_content = f"[图片: {reference_path}]"
+        elif reference_type == "file" and reference_path:
+            reference_content = f"[文件: {reference_path}]"
+        elif not reference_content:
+            labels = {"image": "图片", "file": "文件"}
+            reference_content = f"[{labels.get(reference_type, '原消息')}内容不可用]"
+        return "[被引用的内容]", [f"{speaker}: {reference_content}"]
+
     history_lines = []
     for item in event.history:
-        if event.reference:
-            speaker = str(
-                item.get("sender_name")
-                or event.reference.get("sender_name")
-                or "原消息发送者"
-            )
-        elif event.is_group:
+        if event.is_group:
             speaker = str(
                 item.get("sender_name") or item.get("sender") or "群成员"
             )
@@ -147,16 +214,43 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
         history_lines.append(
             f"{speaker}: {item.get('content') or '[非文字消息]'}"
         )
-    heading = (
-        "[被引用的原消息，仅追溯这一层]"
-        if event.reference
-        else "[本地会话历史，仅供理解上下文，不要逐条回复]"
+    return "[候选会话上下文，需按关联度筛选]", history_lines
+
+
+def _reply_requirements(event: WechatDesktopEvent) -> str:
+    """生成引用消息与普通消息各自的回复约束。"""
+    style = (
+        "像本人聊天一样直接回复正文，尽量自然、简短、口语化。"
+        "不要出现“可以回复”“可以回”“建议回复”“回复如下”等"
+        "提示语，也不要用引号、Markdown 加粗或解释你正在代写。"
     )
-    return heading, history_lines
+    group_rule = (
+        "群聊中，只有待回复消息明确使用“@成员”时，才认为发送者在询问、"
+        "指向或要求该成员回应；没有 @ 时，不要仅因正文出现成员姓名就作此推断。"
+        if event.is_group
+        else ""
+    )
+    if event.reference:
+        return (
+            style
+            + "当前是引用消息，只根据“被引用的内容”和“需要回复的引用消息”作答；"
+            "不要使用、补充或推断引用之外的会话上下文。"
+            + group_rule
+        )
+    return (
+        style
+        + group_rule
+        + "先判断候选会话上下文与待回复消息的语义关联度，"
+        "只保留并使用关联度高、能帮助理解当前意图的内容；"
+        "关联度低、已结束或属于其他话题的内容直接忽略。"
+        "不要逐条回复上下文，也不要在答复中复述筛选过程。"
+        "若候选上下文包含本地文件或图片，只在待回复消息确实要求处理该附件时"
+        "调用相应工具读取；否则不要擅自分析附件。"
+    )
 
 
 def _tool_notice_subject(data: dict) -> tuple[str, str]:
-    """Return (kind, display name), recognizing reads of a skill's SKILL.md."""
+    """返回通知类型和展示名，并把读取 SKILL.md 识别为技能调用。"""
     tool_name = str(data.get("tool_name") or "tool").strip() or "tool"
     arguments = data.get("arguments", {})
     if isinstance(arguments, str):
@@ -173,14 +267,36 @@ def _tool_notice_subject(data: dict) -> tuple[str, str]:
     return "tool", tool_name
 
 
+def _format_agent_notice(templates: list[str], kind: str, name: str) -> str:
+    """渲染工具/技能通知；旧模板没有占位符时自动补上工具名。"""
+    fallback = f"我准备调用 `{name}` {kind}，稍等一下 🛠️"
+    if not templates:
+        return fallback
+    try:
+        notice = random.choice(templates).format(
+            name=name,
+            tool_name=name,
+            kind=kind,
+        )
+    except (KeyError, ValueError):
+        return fallback
+    # Older custom tool templates may not contain a placeholder. Tool notices
+    # must still disclose the concrete tool being executed.
+    if kind == "tool" and name.casefold() not in notice.casefold():
+        notice = f"{notice.rstrip()} 当前工具：`{name}`。"
+    return notice
+
+
 def _preflight_tool_notice_data(event: WechatDesktopEvent) -> dict | None:
-    """Predict attachment tools so a notice can be sent before the first LLM turn."""
+    """根据附件类型预判首个工具，使耗时读取开始前就能发送进度通知。"""
     content_type = str(event.content_type or "").lower()
     path = str(event.content or "")
     if event.reference:
         reference_type = str(event.reference.get("content_type") or "").lower()
         reference_path = str(event.reference.get("file_path") or "")
         if reference_type in {"image", "file"}:
+            if not reference_path:
+                return None
             content_type, path = reference_type, reference_path
     if content_type == "image":
         return {"tool_name": "vision", "arguments": {"path": path}}
@@ -204,6 +320,7 @@ def _preflight_tool_notice_data(event: WechatDesktopEvent) -> dict | None:
 
 
 def _is_network_reply_error(value) -> bool:
+    """判断 Agent 错误是否属于应终止当前排队任务的网络故障。"""
     text = str(value or "").casefold()
     return any(
         marker in text
@@ -224,27 +341,46 @@ def _is_network_reply_error(value) -> bool:
 
 @singleton
 class WechatDesktopChannel(ChatChannel):
-    """Control a normal Windows WeChat client through its visible UI."""
+    """连接桌面微信后端、Agent 桥接层和回复策略的单例通道。
+
+    线程模型：
+
+    - ``_scan_thread`` 只发现和路由事件；
+    - ``_materialize_thread`` 解析附件并生成稳定的回复任务；
+    - ``_queue_thread`` 串行消费回复任务，等待 Agent 和发送结果。
+
+    后端通过工厂注入，因此这里不应出现 UIA 控件选择器或窗口句柄操作。
+    """
 
     NOT_SUPPORT_REPLYTYPE = [ReplyType.VOICE, ReplyType.FILE, ReplyType.VIDEO, ReplyType.VIDEO_URL]
     _knowledge_write_lock = threading.RLock()
 
     def __init__(self):
+        """加载配置，并创建尚未启动的队列、锁、服务和后端对象。"""
         super().__init__()
         configured = conf().get("wechat_desktop", {})
         self.config = dict(DEFAULT_CONFIG)
         if isinstance(configured, dict):
             self.config.update(configured)
         self._stop_event = threading.Event()
-        self._driver = WechatUiaDriver(self.config)
+        # 后端通过工厂创建，为未来迁移到非 UIA 实现保留稳定替换点。
+        self._driver = create_wechat_desktop_backend(self.config)
+
+        # 最终回复必须全局串行；队列项同时固化入队时的上下文快照。
         self._reply_queue = WechatReplyQueue(
             int(self.config.get("active_conversation_burst_limit", 5))
         )
+
+        # 私聊消息先按会话短暂聚合，避免连续气泡触发多次独立回复。值为
+        # ``conversation_id -> (尚未释放的事件, 滑动窗口定时器)``。
         self._pending_private_lock = threading.RLock()
         self._pending_private_batches: dict[
             str, tuple[list[WechatDesktopEvent], threading.Timer, float]
         ] = {}
         self._private_batch_timer_factory = threading.Timer
+
+        # 附件物化与消息扫描解耦。提交锁只保护“停止/入队”的原子性，耗时解析
+        # 在独立线程执行，不持有该锁。
         self._materialize_submit_lock = threading.RLock()
         self._materialize_queue: queue.Queue = queue.Queue()
         self._materialize_stop = object()
@@ -252,6 +388,8 @@ class WechatDesktopChannel(ChatChannel):
         self._queue_thread = None
         self._scan_thread = None
         self._materialize_thread = None
+
+        # 生命周期表只用于诊断耗时，不参与消息业务判断。
         self._lifecycle_lock = threading.RLock()
         self._lifecycles: dict[str, dict] = {}
         self._scan_count = 0
@@ -279,6 +417,7 @@ class WechatDesktopChannel(ChatChannel):
         self.name = str(self.config.get("self_display_name", "") or "我")
 
     def _trace(self, stage: str, message: str, *args):
+        """按配置输出细粒度诊断日志；关闭时不承担格式化成本。"""
         if bool(self.config.get("diagnostic_logging", False)):
             logger.info(
                 "[WechatDesktop][trace:%s] " + message,
@@ -287,6 +426,7 @@ class WechatDesktopChannel(ChatChannel):
             )
 
     def _start_lifecycle(self, event: WechatDesktopEvent):
+        """为新观察到的事件创建端到端耗时记录。"""
         now = time.monotonic()
         with self._lifecycle_lock:
             self._lifecycles.setdefault(
@@ -319,6 +459,7 @@ class WechatDesktopChannel(ChatChannel):
         attachment_resolve_count: int = 0,
         send_result: str = "",
     ):
+        """记录生命周期阶段的首次到达时间和少量累计指标。"""
         now = time.monotonic()
         with self._lifecycle_lock:
             for event_id in event_ids:
@@ -337,6 +478,7 @@ class WechatDesktopChannel(ChatChannel):
                     lifecycle["send_result"] = send_result
 
     def _finish_lifecycle(self, event_ids, terminal: str):
+        """结束生命周期并输出从发现到发送完成的阶段耗时。"""
         rows = []
         with self._lifecycle_lock:
             for event_id in event_ids:
@@ -348,6 +490,7 @@ class WechatDesktopChannel(ChatChannel):
             detected = lifecycle["detected"]
 
             def elapsed(field):
+                """把阶段时间转换为相对发现时刻的毫秒字符串。"""
                 value = lifecycle.get(field)
                 return "-" if value is None else str(max(0, int((value - detected) * 1000)))
 
@@ -376,6 +519,7 @@ class WechatDesktopChannel(ChatChannel):
             )
 
     def startup(self):
+        """初始化运行状态、启动三个工作线程，并阻塞到通道停止。"""
         self._stop_event.clear()
         try:
             activated = self._driver.ensure_foreground()
@@ -456,6 +600,7 @@ class WechatDesktopChannel(ChatChannel):
             pass
 
     def _scan_loop(self):
+        """等待后端变化信号并触发扫描；异常只影响本轮，不结束线程。"""
         first_observation = True
         while not self._stop_event.is_set():
             try:
@@ -470,6 +615,7 @@ class WechatDesktopChannel(ChatChannel):
                 self._service.update_status(last_error=str(exc), login_status="error")
 
     def stop(self):
+        """停止接收新任务，清空各阶段待处理项，并有限等待工作线程退出。"""
         self._stop_event.set()
         pending_ids = self._clear_pending_private_batches()
         for event_id in pending_ids:
@@ -501,6 +647,11 @@ class WechatDesktopChannel(ChatChannel):
             logger.info("[WechatDesktop] discarded %s queued messages on stop", discarded)
 
     def _poll_once(self):
+        """执行一次观察、持久化、策略过滤和路由。
+
+        首次扫描默认建立基线而不回复旧消息，但会按配置处理会话列表明确标记的
+        未读消息。通过全部安全门的事件才会进入后续队列。
+        """
         with self._lifecycle_lock:
             self._scan_count += 1
         observation, events = self._driver.observe_events()
@@ -667,6 +818,11 @@ class WechatDesktopChannel(ChatChannel):
             self._last_cleanup_at = now
 
     def _route_reply_event(self, event: WechatDesktopEvent):
+        """按事件形态选择最早可安全执行的下一阶段。
+
+        控制命令直接交给 Agent；独立图片只登记身份，独立文件只做缓存；群聊不
+        聚合；普通私聊进入滑动窗口。引用附件必须保留当前消息，稍后再物化。
+        """
         if self._is_control_event(event):
             self._dispatch_control_event(event)
             return
@@ -682,6 +838,7 @@ class WechatDesktopChannel(ChatChannel):
         self._defer_private_event(event)
 
     def _ignore_standalone_attachment(self, event: WechatDesktopEvent):
+        """登记孤立图片但不主动分析，等待后续文字明确引用或提问。"""
         self._store.mark_event_processed(event.event_id)
         self._trace(
             "09-attachment-observed",
@@ -694,12 +851,14 @@ class WechatDesktopChannel(ChatChannel):
 
     @staticmethod
     def _is_control_event(event: WechatDesktopEvent) -> bool:
+        """识别应绕过普通回复队列的 Agent 控制命令。"""
         if event.content_type != "text":
             return False
         text = str(event.content or "").strip().lower()
         return text == "/cancel" or re.match(r"^/steer(?:\s|$)", text) is not None
 
     def _dispatch_control_event(self, event: WechatDesktopEvent):
+        """直接投递 /cancel、/steer，不进行私聊聚合和附件物化。"""
         context = self._compose_context(
             ContextType.TEXT,
             str(event.content or ""),
@@ -725,7 +884,19 @@ class WechatDesktopChannel(ChatChannel):
         self._finish_lifecycle([event.event_id], terminal)
 
     def _defer_private_event(self, event: WechatDesktopEvent):
-        release_now = None
+        """把同一私聊会话的连续气泡合并到一个滑动时间窗口。
+
+        每条新消息都会取消旧定时器并重新计时；事件对象已经携带观察当时的历史
+        快照，因此释放批次时不需要重新打开该会话获取上文。
+        """
+        wait_seconds = max(
+            0.05,
+            min(
+                float(self.config.get("private_message_aggregation_ms", 800))
+                / 1000.0,
+                5.0,
+            ),
+        )
         with self._pending_private_lock:
             previous = self._pending_private_batches.pop(
                 event.conversation_id, None
@@ -816,6 +987,7 @@ class WechatDesktopChannel(ChatChannel):
         )
 
     def _release_private_batch(self, conversation_id: str, last_event_id: str):
+        """定时器到期后释放仍为最新版本的私聊批次。"""
         if self._stop_event.is_set():
             return
         with self._pending_private_lock:
@@ -830,6 +1002,7 @@ class WechatDesktopChannel(ChatChannel):
         self._submit_materialization(events)
 
     def _clear_pending_private_batches(self) -> list[str]:
+        """取消所有尚未释放的私聊定时器，返回受影响的事件 ID。"""
         with self._pending_private_lock:
             event_ids = []
             for events, timer, _ in self._pending_private_batches.values():
@@ -839,6 +1012,7 @@ class WechatDesktopChannel(ChatChannel):
         return event_ids
 
     def _submit_materialization(self, events: list[WechatDesktopEvent]):
+        """原子地提交一个消息批次到附件物化线程。"""
         if not events:
             return False
         with self._materialize_submit_lock:
@@ -855,6 +1029,7 @@ class WechatDesktopChannel(ChatChannel):
         return accepted
 
     def _clear_pending_materializations(self) -> list[str]:
+        """清空尚未开始的物化批次，供停止和网络故障收尾使用。"""
         event_ids = []
         with self._materialize_submit_lock:
             while True:
@@ -869,6 +1044,7 @@ class WechatDesktopChannel(ChatChannel):
 
     @staticmethod
     def _attachment_marker(event: WechatDesktopEvent) -> str:
+        """将已落盘附件表示成可放入 Agent 上下文的稳定文本标记。"""
         if event.content_type == "file":
             return f"[文件: {event.content}]"
         if event.content_type == "image":
@@ -877,6 +1053,11 @@ class WechatDesktopChannel(ChatChannel):
 
     @staticmethod
     def _requires_attachment_reference(event: WechatDesktopEvent) -> bool:
+        """判断用户是否在未引用具体附件的情况下要求读取“这张图/文件”。
+
+        这种请求无法可靠确定目标，不能猜测最近附件；消费者会直接提示用户使用
+        微信引用功能后重试。生成图片之类的创作意图不属于此情况。
+        """
         if event.content_type != "text":
             return False
         reference_type = str(event.reference.get("content_type") or "").lower()
@@ -901,6 +1082,12 @@ class WechatDesktopChannel(ChatChannel):
     def _materialize_batch(
         self, events: list[WechatDesktopEvent]
     ) -> WechatDesktopEvent:
+        """解析批次附件，并把多条消息折叠为一个可回复事件。
+
+        最后一条消息是回复目标，前面的同批消息并入它的历史。只有显式引用的附件
+        才会继续出现在普通文本上下文中，防止 Agent 把缓存中的旧图片误当成目标。
+        返回事件上的 ``_source_event_ids`` 和 ``_batch_id`` 用于生命周期追踪。
+        """
         resolved_events = []
         for event in events:
             event, resolve_count = self._driver.materialize_event(event)
@@ -986,6 +1173,7 @@ class WechatDesktopChannel(ChatChannel):
 
     @staticmethod
     def _has_referenced_attachment(event: WechatDesktopEvent) -> bool:
+        """引用图片/文件需要在真正消费回复任务时占用微信窗口解析。"""
         return str(event.reference.get("content_type") or "").lower() in {
             "file",
             "image",
@@ -994,6 +1182,11 @@ class WechatDesktopChannel(ChatChannel):
     def _prepare_deferred_materialization(
         self, events: list[WechatDesktopEvent]
     ) -> WechatDesktopEvent:
+        """为引用附件创建轻量队列项，把实际解析推迟到回复 FIFO 队首。
+
+        图片查看器和原文件定位会操作当前微信窗口；若在物化线程提前执行，可能与
+        正在发送的上一条回复抢占窗口，因此这里只保存原始事件列表。
+        """
         target = events[-1]
         source_event_ids = [event.event_id for event in events]
         batch_id = uuid.uuid4().hex
@@ -1004,6 +1197,7 @@ class WechatDesktopChannel(ChatChannel):
         return target
 
     def _consume_materialization_queue(self):
+        """后台解析附件，并把结果转交回复 FIFO 或仅作为文件缓存结束。"""
         while not self._stop_event.is_set():
             try:
                 events = self._materialize_queue.get(timeout=0.25)
@@ -1050,6 +1244,7 @@ class WechatDesktopChannel(ChatChannel):
                 self._materialize_queue.task_done()
 
     def _enqueue_reply_event(self, event: WechatDesktopEvent):
+        """把稳定事件写入全局回复 FIFO，并标记其生命周期进入排队阶段。"""
         enqueue_result = self._reply_queue.enqueue(event)
         source_event_ids = list(
             getattr(event, "_source_event_ids", None) or [event.event_id]
@@ -1075,6 +1270,7 @@ class WechatDesktopChannel(ChatChannel):
         self._service.update_status(**self._reply_queue.status())
 
     def _send_attachment_reference_prompt(self, item: ReplyQueueItem) -> str:
+        """拒绝猜测未明确指向的附件，并直接发送“请引用后再问”的提示。"""
         event = item.event
         target_name = event.conversation_name
         target_id = event.conversation_id
@@ -1150,6 +1346,7 @@ class WechatDesktopChannel(ChatChannel):
         return "completed"
 
     def _send_deferred_attachment_notice(self, item: ReplyQueueItem) -> bool:
+        """引用附件解析前尽早发送工具进度通知，降低用户等待的不确定感。"""
         event = item.event
         notice_data = _preflight_tool_notice_data(event)
         if not notice_data or not bool(
@@ -1172,6 +1369,12 @@ class WechatDesktopChannel(ChatChannel):
             return False
 
     def _consume_reply_queue(self):
+        """串行消费最终回复任务，并等待每个 Agent 周期到达终态。
+
+        引用附件先在队首完成延迟物化；之后恢复入队时固化的上文，避免等待期间
+        微信 UI 变化导致上下文漂移。普通任务由 Agent 回调设置 ``item.done``；超时
+        时令牌失效，迟到结果会在发送路径被丢弃。
+        """
         while not self._stop_event.is_set():
             item = self._reply_queue.get(timeout=0.25)
             if item is None:
@@ -1192,6 +1395,7 @@ class WechatDesktopChannel(ChatChannel):
             )
             if deferred_events:
                 try:
+                    # 延迟物化会打开图片查看器或定位文件，必须纳入独占回复周期。
                     self._driver.begin_reply_cycle(
                         item.event.conversation_name,
                         item.event.conversation_id,
@@ -1209,6 +1413,9 @@ class WechatDesktopChannel(ChatChannel):
                     logger.exception(
                         "[WechatDesktop] deferred attachment materialization failed"
                     )
+            # The UI may have moved on while this task waited in the FIFO.
+            # Always reply with the conversation context captured at enqueue.
+            item.restore_context()
             reference_required = bool(
                 getattr(item.event, "_attachment_reference_required", False)
             )
@@ -1281,6 +1488,7 @@ class WechatDesktopChannel(ChatChannel):
                 )
 
     def _preserve_event_evidence(self, event: WechatDesktopEvent):
+        """把临时截图/附件复制到 Agent 工作区，避免微信缓存清理后路径失效。"""
         source = str(event.evidence_path or "")
         if not source or not os.path.isfile(source):
             return
@@ -1301,17 +1509,20 @@ class WechatDesktopChannel(ChatChannel):
             logger.warning(f"[WechatDesktop] failed to preserve evidence: {exc}")
 
     def _image_agent_prompt(self, event: WechatDesktopEvent) -> str:
+        """把本地图片路径转换为明确要求调用 vision 的文字提示。"""
         if not bool(self.config.get("analyze_incoming_images", True)):
             return "[收到一张图片，当前 AI 仅处理文字，请人工查看]"
         if not event.content or not Path(event.content).is_file():
             return "[收到一张图片，但无法提取图像区域]"
         return (
             f"[需要回复的微信图片已保存到本地: {event.content}]\n"
-            "请使用 vision 工具读取这张图片，并结合图片附近的会话历史判断发送者的意图后自然回复。"
+            "请使用 vision 工具读取这张图片，并先筛选图片附近会话历史中与其高度相关的内容，"
+            "再判断发送者的意图并自然回复。"
             "不要只做机械的图片描述；如果发送者是在提问、确认或延续前文，应直接回应其真实意图。"
         )
 
     def _learn_from_official_account(self, event: WechatDesktopEvent):
+        """按日期保存公众号文本并刷新知识索引，不把其中指令当作可信操作。"""
         if not bool(self.config.get("learn_from_official_accounts", False)):
             return
         if event.content_type != "text":
@@ -1380,6 +1591,12 @@ class WechatDesktopChannel(ChatChannel):
             )
 
     def _dispatch_message(self, event: WechatDesktopEvent, queue_token: str = "") -> bool:
+        """构造 Agent 上下文并启动一次异步回复周期。
+
+        引用消息只包含被引用内容和当前消息；普通消息携带入队时的候选上文并要求
+        Agent 做相关性筛选。图片和文件仍以文本上下文投递，但附加必须调用对应工具
+        的指令。返回 ``True`` 表示已成功交给 Agent，最终发送状态由回调完成。
+        """
         msg = WechatDesktopMessage(event)
         ctype = msg.ctype
         content = msg.content
@@ -1393,13 +1610,14 @@ class WechatDesktopChannel(ChatChannel):
                 and Path(event.content).is_file()
             ):
                 attachment_instruction = (
-                    "当前消息是一张图片，必须先使用 vision 工具读取图片，再结合附近上下文回复。"
+                    "当前消息是一张图片，必须先使用 vision 工具读取图片，"
+                    "再结合筛选出的高相关上下文回复。"
                 )
         elif ctype == ContextType.FILE:
             ctype = ContextType.TEXT
             content = f"[微信文件已保存到本地: {event.content}]"
             attachment_instruction = (
-                "当前消息是一个文件，请读取该文件，并结合附近上下文自然回复发送者。"
+                "当前消息是一个文件，请读取该文件，并结合筛选出的高相关上下文自然回复发送者。"
             )
         if event.reference:
             reference_type = str(event.reference.get("content_type") or "text")
@@ -1412,7 +1630,18 @@ class WechatDesktopChannel(ChatChannel):
             elif reference_type == "file" and reference_path:
                 attachment_instruction = (
                     f"被引用的原文件已保存到本地: {reference_path}。"
-                    "请按当前消息的意图读取该文件后回答。"
+                    "必须先根据文件扩展名调用适配的工具或技能读取该文件，"
+                    "再结合当前消息回答。"
+                )
+            elif reference_type == "image":
+                attachment_instruction = (
+                    "被引用的图片未能从微信查看器中安全截取。"
+                    "不要猜测图片内容，直接说明目前无法读取该图片。"
+                )
+            elif reference_type == "file":
+                attachment_instruction = (
+                    "被引用的文件未能从微信缓存中取得。"
+                    "不要猜测文件内容，直接说明目前无法读取该文件。"
                 )
         if ctype == ContextType.TEXT:
             history_items = list(event.history)
@@ -1435,25 +1664,31 @@ class WechatDesktopChannel(ChatChannel):
                 )
             sections.extend(
                 [
-                    "[需要回复的新消息]",
+                    (
+                        "[需要回复的引用消息]"
+                        if event.reference
+                        else "[需要回复的新消息]"
+                    ),
                     (
                         f"{event.sender_name or '群成员'}: {content}"
                         if event.is_group
                         else str(content)
                     ),
                     "[回复要求]",
-                    (
-                        "像本人聊天一样直接回复正文，尽量自然、简短、口语化。"
-                        "不要出现“可以回复”“可以回”“建议回复”“回复如下”等"
-                        "提示语，也不要用引号、Markdown 加粗或解释你正在代写。"
-                        "若上文包含本地文件或图片，只在新消息确实要求处理该附件时调用相应工具读取；"
-                        "否则按普通聊天回复，不要擅自分析附件。"
-                    ),
+                    _reply_requirements(event),
                 ]
             )
             if attachment_instruction:
                 sections.append(attachment_instruction)
             content = "\n".join(sections)
+            if event.is_group:
+                content = _strip_group_bot_mentions(
+                    content,
+                    [
+                        *DEFAULT_BOT_MENTION_ALIASES,
+                        self.config.get("self_display_name", ""),
+                    ],
+                )
         context = self._compose_context(
             ctype,
             content,
@@ -1521,12 +1756,14 @@ class WechatDesktopChannel(ChatChannel):
         return False
 
     def _make_agent_event_callback(self, context: Context):
+        """包装 Agent 流事件，记录首次工具调用并按配置发送一次进度通知。"""
         downstream = context.get("on_event")
         lock = threading.Lock()
         seen_tool_calls: set[str] = set()
         notice_sent = bool(context.get("wechat_desktop_agent_notice_sent", False))
 
         def on_event(event: dict):
+            """处理通道关心的流事件后，保持原回调链继续向下传递。"""
             nonlocal notice_sent
             try:
                 if event.get("type") == "tool_execution_start":
@@ -1564,6 +1801,11 @@ class WechatDesktopChannel(ChatChannel):
         return on_event
 
     def _send_agent_tool_notice(self, context: Context, data: dict) -> bool:
+        """向当前微信会话发送工具/技能进度，并登记为不参与回复识别的临时文本。
+
+        发送前再次检查队列令牌、暂停状态、影子模式和白名单，防止过期 Agent 周期
+        或只观察模式产生额外消息。
+        """
         msg = context.get("msg")
         target_name = (
             getattr(msg, "other_user_nickname", "")
@@ -1608,12 +1850,7 @@ class WechatDesktopChannel(ChatChannel):
             for item in self.config.get(template_key, [])
             if str(item).strip()
         ]
-        if not templates:
-            templates = ["我准备调用 `{name}` " + kind + "，稍等一下 🛠️"]
-        try:
-            notice = random.choice(templates).format(name=name)
-        except (KeyError, ValueError):
-            notice = f"我准备调用 `{name}` {kind}，稍等一下 🛠️"
+        notice = _format_agent_notice(templates, kind, name)
 
         self._driver.register_interim_text(conversation_id, notice)
         try:
@@ -1658,7 +1895,7 @@ class WechatDesktopChannel(ChatChannel):
         return True
 
     def _accept_replacement_event(self, event: WechatDesktopEvent):
-        """Apply the same safety gates before queuing a send-time replacement."""
+        """发送前发现目标已更新时，用相同安全门重新接纳替代事件。"""
         self._start_lifecycle(event)
         recorded = self._store.record_event(event)
         if recorded:
@@ -1676,7 +1913,11 @@ class WechatDesktopChannel(ChatChannel):
         self._route_reply_event(event)
 
     def _compose_context(self, ctype: ContextType, content, **kwargs):
-        """Compose CowAgent context without relying on global channel allowlists."""
+        """创建 CowAgent Context，并允许插件在投递前修改或拦截。
+
+        微信桌面通道已经在自身策略层完成准入判断，因此这里不依赖其他 Channel 的
+        全局白名单；图片、语音等最终也会被规范为 Agent 可消费的文本上下文。
+        """
         context = Context(ctype, content)
         context.kwargs = kwargs
         context["channel_type"] = "wechat_desktop"
@@ -1703,21 +1944,21 @@ class WechatDesktopChannel(ChatChannel):
                     if prefix and text.startswith(prefix):
                         text = text[len(prefix):].lstrip()
                         break
-                self_name = str(self.config.get("self_display_name", "") or "")
-                if self_name:
-                    text = text.replace(f"@{self_name}", "", 1).strip()
             context.type = ContextType.TEXT
             context.content = text
         return context
 
     @staticmethod
     def _content_hash(content) -> str:
+        """生成审计用摘要，避免在审计记录里重复保存完整正文。"""
         return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
 
     def send(self, reply: Reply, context: Context):
+        """ChatChannel 发送入口；所有安全判断集中在 ``_send_reply_impl``。"""
         return self._send_reply_impl(reply, context)
 
     def _finish_reply_cycle(self, context):
+        """幂等释放后端回复周期，防止回调和异常路径重复解锁。"""
         if not context or not bool(
             context.get("wechat_desktop_reply_cycle", False)
         ):
@@ -1726,6 +1967,7 @@ class WechatDesktopChannel(ChatChannel):
         self._driver.end_reply_cycle()
 
     def _success_callback(self, session_id, **kwargs):
+        """Agent 成功结束时释放后端并唤醒等待中的 FIFO 消费者。"""
         context = kwargs.get("context")
         self._finish_reply_cycle(context)
         if context:
@@ -1740,6 +1982,7 @@ class WechatDesktopChannel(ChatChannel):
         return super()._success_callback(session_id, **kwargs)
 
     def _fail_callback(self, session_id, exception, **kwargs):
+        """Agent 失败时释放后端，并把当前队列项标记为失败。"""
         context = kwargs.get("context")
         self._finish_reply_cycle(context)
         if context:
@@ -1758,6 +2001,13 @@ class WechatDesktopChannel(ChatChannel):
         )
 
     def _send_reply_impl(self, reply: Reply, context: Context):
+        """执行最终发送安全门、目标复核、微信发送和审计。
+
+        队列令牌首先阻止超时后的迟到结果；随后检查来源、暂停状态、回复策略和
+        限流。文本发送前还会让后端复核原消息目标，避免 Agent 推理期间会话变化
+        导致回错人。发送成功但无法验证气泡时记为 ``unverified``，不会自动重试，
+        以避免重复发送。
+        """
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
         source_event_ids = list(
             context.get("wechat_desktop_source_event_ids", []) or []
@@ -1979,6 +2229,11 @@ class WechatDesktopChannel(ChatChannel):
         send_target: str,
         target_name: str,
     ):
+        """处理 Agent 网络故障：终止当前周期、清空待办并尝试通知当前用户。
+
+        网络状态未知时继续消费会造成大量过期回复，所以这里主动清空三个阶段中
+        尚未开始的任务；正在处理的当前任务由外层消费者完成收尾。
+        """
         self._finish_reply_cycle(context)
         discarded_event_ids = self._reply_queue.clear_pending()
         discarded_event_ids.extend(self._clear_pending_private_batches())
@@ -2050,6 +2305,11 @@ class WechatDesktopChannel(ChatChannel):
             )
 
     def _execute_agent_action(self, action: str, **params) -> dict:
+        """供 Agent 主动发送微信文字的受限入口。
+
+        当前仅支持 ``send_text``。该路径同样遵守暂停、黑名单、白名单和限流规则，
+        并要求后端验证发送结果；它不绕过桌面通道的安全策略。
+        """
         if action != "send_text":
             return {
                 "status": "error",

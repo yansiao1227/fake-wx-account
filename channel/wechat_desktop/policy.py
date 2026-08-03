@@ -6,6 +6,8 @@ from channel.wechat_desktop.models import WechatDesktopEvent
 
 
 class WechatDesktopPolicy:
+    """集中处理白名单、黑名单、群触发方式和发送频率限制。"""
+
     def __init__(self, config: dict, store):
         self.config = config
         self.store = store
@@ -16,6 +18,8 @@ class WechatDesktopPolicy:
         return any(normalized == str(item).strip().casefold() for item in allowed or [])
 
     def is_allowlisted(self, target: str, is_group: bool) -> bool:
+        """检查联系人或群聊是否允许自动回复。"""
+
         allow_all_key = (
             "auto_reply_groups_all" if is_group else "auto_reply_private_all"
         )
@@ -25,11 +29,15 @@ class WechatDesktopPolicy:
         return self._matches(target, self.config.get(key, []))
 
     def is_blocked(self, target: str) -> bool:
+        """黑名单优先级高于全部放行和白名单。"""
+
         return self._matches(
             target, self.config.get("auto_reply_blacklist", [])
         )
 
     def group_triggered(self, event: WechatDesktopEvent) -> bool:
+        """根据群回复模式判断消息是否触发 Agent。"""
+
         if not event.is_group:
             return True
         mode = self.config.get("group_reply_mode", "at_or_prefix")
@@ -44,6 +52,8 @@ class WechatDesktopPolicy:
         return bool(event.is_at or prefix_hit)
 
     def can_auto_send(self, target: str, is_group: bool, content_type: str) -> bool:
+        """执行最终发送门禁；影子模式下永远不自动发送。"""
+
         if bool(self.config.get("shadow_mode", True)):
             return False
         if self.is_blocked(target):

@@ -317,11 +317,6 @@ def main() -> int:
         action="store_true",
         help="select the current account in the opened history member filter",
     )
-    parser.add_argument(
-        "--resolve-history-direction",
-        action="store_true",
-        help="use the group history member filter to resolve message directions",
-    )
     args = parser.parse_args()
 
     client = WechatUiaClient(
@@ -381,14 +376,6 @@ def main() -> int:
                 # blank with a second session-row click.
                 messages = client.get_chat_history(target, args.limit)
                 header = client.get_title()
-                if (
-                    args.resolve_history_direction
-                    and expected_type == "group"
-                    and any(message.direction == "unknown" for message in messages)
-                ):
-                    messages = client.resolve_group_message_directions(
-                        target, messages, owner.nick_name
-                    )
                 item = {
                     "located": located,
                     "expected_type": expected_type,
@@ -410,10 +397,6 @@ def main() -> int:
                     for message in messages
                 )
                 if expected_type == "group":
-                    if args.resolve_history_direction:
-                        item["direction_resolution"] = dict(
-                            client.last_direction_resolution
-                        )
                     item["mention_marker"] = {
                         "matched": row_marker or bubble_marker,
                         "conversation_row": row_marker,

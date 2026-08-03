@@ -19,8 +19,15 @@ from typing import Iterable, Optional
 from common.log import logger
 from channel.wechat_desktop.models import (
     ReplyTargetValidation,
+    UNKNOWN_SENDER_NAME,
     UiaChatMessage,
     WechatDesktopEvent,
+)
+from channel.wechat_desktop.backend import WechatDesktopBackend
+from channel.wechat_desktop.operations import (
+    WechatConversationSelector,
+    WechatSendOperations,
+    resolve_conversation_selector,
 )
 from channel.wechat_desktop.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia_client import WechatUiaClient
@@ -68,7 +75,9 @@ class _UiaPriorityCoordinator:
                     self._condition.notify_all()
 
 
-class WechatUiaDriver:
+class WechatUiaDriver(WechatDesktopBackend):
+    """微信 UIA 后端：负责事件转换、状态缓存和操作优先级协调。"""
+
     def __init__(
         self,
         config: dict,
@@ -111,6 +120,12 @@ class WechatUiaDriver:
         self._owner_name = ""
         self._owner_source = "unknown"
         self._scan_focus_retry_after = 0.0
+        self._send_operations = WechatSendOperations(
+            self.client,
+            self._resolve_selector,
+            self._reply_uia,
+            lambda: self._observation(read_owner=False),
+        )
 
     def _scan_uia(self, operation, *args, **kwargs):
         with self._uia_priority.lease(reply=False):
@@ -350,6 +365,7 @@ class WechatUiaDriver:
         """Carry message identities across scrolling UIA snapshots."""
         previous = list(self._message_snapshots.get(conversation_id, []))
         stable_ids = ["" for _ in messages]
+        matched_previous_indexes = [None for _ in messages]
         used_previous: set[int] = set()
 
         runtime_matches: dict[tuple[str, tuple[str, str]], list[int]] = {}
@@ -369,6 +385,7 @@ class WechatUiaDriver:
             )
             if previous_index is not None:
                 stable_ids[current_index] = previous[previous_index].stable_id
+                matched_previous_indexes[current_index] = previous_index
                 used_previous.add(previous_index)
 
         # Runtime IDs may change when WeChat recreates controls. Match the
@@ -400,13 +417,31 @@ class WechatUiaDriver:
             )
             if previous_index is not None:
                 stable_ids[current_index] = previous[previous_index].stable_id
+                matched_previous_indexes[current_index] = previous_index
                 used_previous.add(previous_index)
                 search_start = previous_index + 1
 
-        stabilized = [
-            replace(message, stable_id=stable_ids[index] or uuid.uuid4().hex)
-            for index, message in enumerate(messages)
-        ]
+        stabilized = []
+        for index, message in enumerate(messages):
+            previous_index = matched_previous_indexes[index]
+            previous_sender = (
+                previous[previous_index].sender_name
+                if previous_index is not None
+                else ""
+            )
+            current_sender = message.sender_name
+            if current_sender in {"", UNKNOWN_SENDER_NAME} and previous_sender not in {
+                "",
+                UNKNOWN_SENDER_NAME,
+            }:
+                current_sender = previous_sender
+            stabilized.append(
+                replace(
+                    message,
+                    stable_id=stable_ids[index] or uuid.uuid4().hex,
+                    sender_name=current_sender or UNKNOWN_SENDER_NAME,
+                )
+            )
         self._message_snapshots[conversation_id] = stabilized
         return stabilized
 
@@ -593,14 +628,50 @@ class WechatUiaDriver:
                 )
 
         resolve_count = 0
-        if message.reference is not None and bool(
+        reference_type = (
+            str(message.reference.message_type or "").lower()
+            if message.reference is not None
+            else ""
+        )
+        if reference_type == "image":
+            fetch_referenced_image = getattr(
+                self.client, "fetch_referenced_message_image", None
+            )
+            image_path = ""
+            if fetch_referenced_image:
+                resolve_count += 1
+                image_path = fetch_referenced_image(message)
+            message = replace(
+                message,
+                reference=replace(
+                    message.reference,
+                    file_path=image_path,
+                    resolved=bool(image_path),
+                    degraded=not bool(image_path),
+                    strategy="wechat_reference_image_viewer",
+                ),
+            )
+        elif reference_type == "file" and bool(
             self.config.get("resolve_message_references", True)
         ):
             resolver = getattr(self.client, "resolve_message_reference", None)
             if resolver:
                 resolve_count += 1
                 message = resolver(message)
-        if message.message_type == "image":
+        elif message.reference is not None:
+            # Text references already contain their usable preview in the
+            # flattened UIA Name; locating the original adds risk and no value.
+            message = replace(
+                message,
+                reference=replace(
+                    message.reference,
+                    resolved=True,
+                    degraded=False,
+                    strategy="uia_reference_preview",
+                ),
+            )
+
+        if message.reference is None and message.message_type == "image":
             fetch_image = getattr(self.client, "fetch_message_image", None)
             image_path = ""
             if fetch_image:
@@ -611,7 +682,11 @@ class WechatUiaDriver:
                     image_path = message.file_path or fetch_image(message)
             if image_path:
                 message = replace(message, file_path=image_path)
-        elif message.message_type == "file" and not message.file_path:
+        elif (
+            message.reference is None
+            and message.message_type == "file"
+            and not message.file_path
+        ):
             resolve_count += 1
             file_path = self.client.fetch_message_file(message)
             if file_path:
@@ -674,15 +749,38 @@ class WechatUiaDriver:
     def _cached_file_by_name(
         self, conversation_id: str, content: str
     ) -> str:
+        conversation_key = str(conversation_id or "")
+        candidates = self._file_name_candidates(content)
         with self._attachment_cache_lock:
-            for name in self._file_name_candidates(content):
-                key = (str(conversation_id or ""), name)
+            for name in candidates:
+                key = (conversation_key, name)
                 path = self._file_path_cache_by_name.get(key, "")
                 if path and os.path.isfile(path):
                     self._file_path_cache_by_name.move_to_end(key)
                     return path
                 if path:
                     self._file_path_cache_by_name.pop(key, None)
+
+            # 微信引用预览与本地重复下载文件可能出现 ``报告.pdf`` /
+            # ``报告(1).pdf`` 之类差异。精确匹配失败后，仅在同扩展名下做
+            # stem 前缀匹配，避免把不同文档类型串到一起。
+            cached_items = list(reversed(self._file_path_cache_by_name.items()))
+            for candidate in candidates:
+                candidate_path = Path(candidate)
+                for key, path in cached_items:
+                    cached_conversation, cached_name = key
+                    cached_path = Path(cached_name)
+                    if (
+                        cached_conversation != conversation_key
+                        or cached_path.suffix != candidate_path.suffix
+                        or not cached_path.stem.startswith(candidate_path.stem)
+                    ):
+                        continue
+                    if path and os.path.isfile(path):
+                        self._file_path_cache_by_name.move_to_end(key)
+                        return path
+                    if path:
+                        self._file_path_cache_by_name.pop(key, None)
         return ""
 
     @staticmethod
@@ -1021,12 +1119,6 @@ class WechatUiaDriver:
                         )
                     if already_emitted:
                         continue
-                    if (
-                        is_group
-                        and not message.sender_name
-                        and row.preview_has_sender_prefix
-                    ):
-                        message = replace(message, sender_name=row.preview_sender)
                     history = self._history_snapshot(
                         messages, target_index, is_group, row_key
                     )
@@ -1057,12 +1149,18 @@ class WechatUiaDriver:
                     uia_available=False,
                 ), []
 
-    def _selector(self, conversation: str):
+    def _resolve_selector(self, conversation: str) -> WechatConversationSelector:
+        """在状态锁内读取会话缓存，再交给纯函数生成定位参数。"""
+
         with self._operation_lock:
-            row = self._conversation_selectors.get(conversation)
-        if row is None:
-            return conversation, "", -1
-        return row.conversation_title, row.runtime_id, row.row_index
+            selectors = dict(self._conversation_selectors)
+        return resolve_conversation_selector(selectors, conversation)
+
+    def _selector(self, conversation: str):
+        """兼容旧的三元组调用；新代码应使用 ``_resolve_selector``。"""
+
+        selector = self._resolve_selector(conversation)
+        return selector.title, selector.runtime_id, selector.row_index
 
     def validate_reply_target(self, event: WechatDesktopEvent) -> ReplyTargetValidation:
         """Re-read the UI and return a replacement event when the target changed."""
@@ -1119,13 +1217,6 @@ class WechatUiaDriver:
 
         replacement_event = None
         if self._emitted_targets.get(event.conversation_id) != target_key:
-            row = self._conversation_selectors[event.conversation_id]
-            if (
-                event.is_group
-                and not target.sender_name
-                and row.preview_has_sender_prefix
-            ):
-                target = replace(target, sender_name=row.preview_sender)
             replacement_event = self._event(
                 event.conversation_id,
                 title,
@@ -1218,48 +1309,16 @@ class WechatUiaDriver:
         return event, resolve_count
 
     def send_text(self, conversation: str, text: str) -> dict:
-        with self._reply_uia():
-            title, runtime_id, row_index = self._selector(conversation)
-            result = self.client.send_message(
-                title, text, runtime_id=runtime_id, row_index=row_index
-            )
-        return {
-            **result,
-            "accepted_by": "uia",
-            "verification": "outgoing_uia_bubble" if result.get("verified") else "unverified",
-            "observation": self._observation(read_owner=False),
-        }
+        """通过独立发送组件发送普通回复。"""
+
+        return self._send_operations.send_text(conversation, text)
 
     def send_interim_text(self, conversation: str, text: str) -> dict:
-        """Send a progress notice without the human-like reply pacing delay."""
-        with self._reply_uia():
-            title, runtime_id, row_index = self._selector(conversation)
-            result = self.client.send_message(
-                title,
-                text,
-                runtime_id=runtime_id,
-                row_index=row_index,
-                expedited=True,
-            )
-        return {
-            **result,
-            "accepted_by": "uia",
-            "verification": (
-                "outgoing_uia_bubble" if result.get("verified") else "unverified"
-            ),
-            "observation": self._observation(read_owner=False),
-        }
+        """发送进度提示，不等待普通回复的拟人化节流间隔。"""
+
+        return self._send_operations.send_text(conversation, text, expedited=True)
 
     def send_image(self, conversation: str, image_path: str) -> dict:
-        with self._reply_uia():
-            path = str(Path(image_path).resolve())
-            title, runtime_id, row_index = self._selector(conversation)
-            result = self.client.send_file(
-                title, [path], runtime_id=runtime_id, row_index=row_index
-            )
-        return {
-            **result,
-            "accepted_by": "uia",
-            "verification": "outgoing_uia_bubble" if result.get("verified") else "unverified",
-            "observation": self._observation(read_owner=False),
-        }
+        """通过独立发送组件发送图片。"""
+
+        return self._send_operations.send_image(conversation, image_path)
