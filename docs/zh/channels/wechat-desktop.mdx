@@ -15,20 +15,18 @@ python -m pip install -r requirements-windows.txt
 
 启动并登录且只登录一个桌面微信实例，然后配置：
 
+通道配置写在 `channel/wechat_desktop/config.py`（唯一源），根目录 `config.json`
+**不必**再写 `wechat_desktop` 段。启用通道时全局只需：
+
 ```json
 {
-  "channel_type": "web,wechat_desktop",
-  "wechat_desktop": {
-    "shell_hook_reconcile_seconds": 15,
-    "self_display_name": "自己的微信昵称",
-    "shadow_mode": true,
-    "auto_reply_contacts": ["文件传输助手"],
-    "auto_reply_groups": ["测试群"]
-  }
+  "channel_type": "web,wechat_desktop"
 }
 ```
 
-微信没有通过 UIA 暴露当前账号时使用 `self_display_name`。如果配置昵称与 UIA 读取结果不一致，自动发送会停止。
+在 `channel/wechat_desktop/config.py` 中配置 `self_display_name`、`shadow_mode`、
+白名单、每日热点等。微信没有通过 UIA 暴露当前账号时使用 `self_display_name`；
+若配置昵称与 UIA 读取结果不一致，自动发送会停止。
 
 ## 消息处理
 
@@ -57,4 +55,31 @@ python scripts/test_wechat_uia.py --conversation "文件传输助手"
 
 不要未经检查直接对外发送诊断报告。只有同时提供 `--send-to` 和 `--text` 才会发送消息。
 
-自动化期间可在任意窗口按 `Ctrl+Alt+Shift+Q` 停止 CowAgent，无需操作鼠标。
+## 每日热点广播
+
+可在每天固定本地时间向 `auto_reply_groups` 白名单群推送百度热搜首条。准备在子线程完成，发送任务写入全局回复 FIFO，不会打断正在进行的回复。
+
+文案流程：
+
+1. 调千帆 `baidu_trending` 取榜单首条（标题、热度、原链接）
+2. 再调千帆百度搜索（`ai_search/web_search` + `baidu_search_v2`）检索该词条详情
+3. 用全局对话模型（优先 `custom_api_*`）做事实概括 + 趣味评论/思考
+4. 消息末尾固定附上原热搜链接
+
+在 `channel/wechat_desktop/config.py` 中设置，例如：
+
+```python
+"daily_hot_broadcast_enabled": True,
+"daily_hot_broadcast_time": "18:00",
+"auto_reply_groups": ["测试群"],
+"shadow_mode": False,
+```
+
+说明：
+
+- 每日热点与其它通道项一样，只改 `channel/wechat_desktop/config.py`。
+- 千帆密钥写在 `~/.cow/.env` 的 `QIANFAN_API_KEY`（不要写进仓库 `config.json`）。
+- 概括模型走全局 `config.json` 的 `custom_api_base` / `custom_api_key` / `model`；不可用时回退千帆对话，再不行用检索片段规则兜底。
+- `shadow_mode=true`、通道暂停、黑名单或限流时不会实际发送。
+- 同一天只成功准备并触发一次；拉榜失败会在当日后续 tick 重试。
+- 榜单类型与 skill `baidu-hot-cn` 一致，默认 `livelihood`（民生榜）。

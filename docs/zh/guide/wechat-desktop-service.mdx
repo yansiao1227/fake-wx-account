@@ -44,7 +44,7 @@ description: "在 Windows 和 cowagent-wechat Conda 环境中管理 CowAgent"
 .\cow.ps1 status
 ```
 
-状态命令会显示服务是否运行、PID、监听端口和当前紧急停止热键。
+状态命令会显示服务是否运行、PID 和监听端口。
 
 ### 重启
 
@@ -62,25 +62,13 @@ description: "在 Windows 和 cowagent-wechat Conda 环境中管理 CowAgent"
 
 停止后，微信桌面通道不再接收新事件，内存中的待回复队列不会在下次启动时恢复。
 
-### 紧急热键停止
-
-自动化期间鼠标或窗口不便操作时，按 `Ctrl+Alt+Shift+Q`。热键可以在
-`config.json` 中修改或关闭：
-
-```json
-{
-  "emergency_stop_hotkey_enabled": true,
-  "emergency_stop_hotkey": "ctrl+alt+shift+q"
-}
-```
-
 ## 查看日志
 
 `.\cow.ps1 start` 会直接在当前终端打印标准输出和错误日志，不再创建后台日志
 文件。日志可能包含会话名称或消息诊断信息，对外转发前应先检查并脱敏。
 
 正常结束当前前台进程请按 `Ctrl+C`。如果需要从另一个终端结束它，可以执行
-`.\cow.ps1 stop`，也可以使用紧急停止热键。
+`.\cow.ps1 stop`。
 
 ## 微信 UIA 冒烟测试
 
@@ -129,5 +117,4 @@ conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py -
 | 停止 | `.\cow.ps1 stop` |
 | 重启 | `.\cow.ps1 restart` |
 | 状态 | `.\cow.ps1 status` |
-| 紧急停止 | `Ctrl+Alt+Shift+Q` |
 | Web 控制台（手动打开） | `http://127.0.0.1:9899` |

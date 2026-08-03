@@ -32,6 +32,8 @@ from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from channel.chat_channel import ChatChannel
 from channel.wechat_desktop.backend import create_wechat_desktop_backend
+from channel.wechat_desktop.config import DEFAULT_CONFIG, load_wechat_desktop_config
+from channel.wechat_desktop.daily_hot_scheduler import DailyHotScheduler
 from channel.wechat_desktop.fifo_queue import ReplyQueueItem, WechatReplyQueue
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.policy import WechatDesktopPolicy
@@ -43,103 +45,8 @@ from common.utils import expand_path
 from config import conf
 from plugins import Event, EventContext, PluginManager
 
-
-DEFAULT_CONFIG = {
-    # 后端与 UI 操作节奏。后端名称是迁移扩展点，当前实现为 Windows UIA。
-    "desktop_backend": "uia",
-    "uia_focus_settle_ms": 350,
-    "uia_recovery_attempts": 3,
-    "uia_recovery_settle_ms": 500,
-    "uia_selection_settle_ms": 150,
-    "uia_hook_settle_ms_min": 300,
-    "uia_hook_settle_ms_max": 800,
-    "uia_focus_settle_ms_min": 350,
-    "uia_focus_settle_ms_max": 700,
-    "uia_selection_settle_ms_min": 250,
-    "uia_selection_settle_ms_max": 500,
-    "uia_paste_settle_ms_min": 150,
-    "uia_paste_settle_ms_max": 300,
-    "uia_pre_send_settle_ms_min": 100,
-    "uia_pre_send_settle_ms_max": 250,
-    "uia_send_interval_ms_min": 2000,
-    "uia_send_interval_ms_max": 5000,
-    "uia_conversation_cooldown_seconds": 5,
-    "outgoing_echo_suppression_seconds": 300,
-    "uia_owner_lookup_timeout_seconds": 2.0,
-    "uia_owner_failure_cache_seconds": 60.0,
-
-    # 消息观察与会话历史解析。
-    "uia_group_sender_ocr_enabled": True,
-    "uia_group_sender_ocr_body_min_score": 0.6,
-    "uia_group_sender_ocr_name_min_score": 0.75,
-    "uia_group_sender_ocr_text_similarity": 0.78,
-    "uia_group_sender_ocr_name_gap_px": 48,
-    "shell_hook_reconcile_seconds": 15,
-    "shell_hook_reconcile_enabled": False,
-    "shell_hook_debounce_ms": 250,
-    "reply_monitor_interval_seconds": 1.0,
-    "active_conversation_burst_limit": 5,
-
-    # 自动回复准入策略。shadow_mode=True 时只观察，不向微信发送内容。
-    "auto_reply_private_all": False,
-    "auto_reply_groups_all": False,
-    "auto_reply_blacklist": [],
-    "conversation_history_retention_days": 90,
-
-    # 可选的公众号知识沉淀与诊断能力。
-    "learn_from_official_accounts": False,
-    "official_account_knowledge_max_chars": 4000,
-    "diagnostic_logging": False,
-
-    # Agent 回复周期与工具调用进度通知。
-    "reply_cycle_timeout_seconds": 180,
-    "agent_tool_notice_enabled": True,
-    "agent_tool_notice_once_per_reply": True,
-    "agent_preflight_notice_enabled": True,
-    "agent_skill_notice_templates": [
-        "这题得请 `{name}` skill 出场了，我去搬个救兵，稍等一下 🧰",
-        "我先翻开 `{name}` skill 的小抄，马上回来 📖",
-        "正在召唤 `{name}` skill，答案已经在路上了 ✨",
-    ],
-    "agent_tool_notice_templates": [
-        "我准备调用 `{tool_name}` tool 查一查，稍等我操作一下 🔧",
-        "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
-        "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
-    ],
-    "agent_failure_notice_enabled": True,
-    "agent_failure_notice_templates": [
-        "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
-        "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
-        "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
-    ],
-    "auto_reply_contacts": [],
-    "auto_reply_groups": [],
-    "group_reply_mode": "at_only",
-    "group_command_prefixes": ["/cow"],
-    "self_display_name": "",
-    "shadow_mode": True,
-
-    # 图片、文件和引用附件的提取策略。
-    "auto_send_images": False,
-    "analyze_incoming_images": True,
-    "resolve_message_references": True,
-    "uia_image_viewer_enabled": True,
-    "uia_image_viewer_before_close_ms_min": 300,
-    "uia_image_viewer_before_close_ms_max": 500,
-    "uia_file_download_enabled": True,
-    "uia_file_save_as_enabled": True,
-    "uia_file_download_timeout_seconds": 10,
-
-    # 私聊聚合、发送限流、数据保留与首次启动行为。
-    "private_message_aggregation_min_ms": 500,
-    "private_message_aggregation_max_ms": 1200,
-    "private_message_aggregation_max_wait_ms": 4000,
-    "max_send_per_minute": 5,
-    "max_send_per_hour": 60,
-    "retention_days": 7,
-    "bootstrap_existing_messages": False,
-    "process_startup_unread_messages": True,
-}
+# Re-export for callers that historically imported defaults from this module.
+__all__ = ["WechatDesktopChannel", "DEFAULT_CONFIG"]
 
 ATTACHMENT_REFERENCE_REQUIRED_REPLY = (
     "为了确保我读取的是正确的图片或文件，请在微信中引用对应的图片或文件消息后再提问。"
@@ -375,10 +282,7 @@ class WechatDesktopChannel(ChatChannel):
     def __init__(self):
         """加载配置，并创建尚未启动的队列、锁、服务和后端对象。"""
         super().__init__()
-        configured = conf().get("wechat_desktop", {})
-        self.config = dict(DEFAULT_CONFIG)
-        if isinstance(configured, dict):
-            self.config.update(configured)
+        self.config = load_wechat_desktop_config()
         self._stop_event = threading.Event()
         # 后端通过工厂创建，为未来迁移到非 UIA 实现保留稳定替换点。
         self._driver = create_wechat_desktop_backend(self.config)
@@ -405,6 +309,7 @@ class WechatDesktopChannel(ChatChannel):
         self._queue_thread = None
         self._scan_thread = None
         self._materialize_thread = None
+        self._daily_hot_scheduler: DailyHotScheduler | None = None
 
         # 生命周期表只用于诊断耗时，不参与消息业务判断。
         self._lifecycle_lock = threading.RLock()
@@ -600,6 +505,14 @@ class WechatDesktopChannel(ChatChannel):
         self._queue_thread.start()
         self._materialize_thread.start()
         self._scan_thread.start()
+        self._daily_hot_scheduler = DailyHotScheduler(
+            config=self.config,
+            store=self._store,
+            enqueue_callback=self.enqueue_daily_hot_broadcast,
+            is_paused=lambda: bool(self._service.status().get("paused")),
+        )
+        self._daily_hot_scheduler.start()
+        self._service.update_status(**self._daily_hot_scheduler.status())
         self.report_startup_success()
         logger.info(
             "[WechatDesktop] Channel started in %s mode",
@@ -607,12 +520,14 @@ class WechatDesktopChannel(ChatChannel):
         )
         self._trace(
             "00-startup",
-            "reconcile_enabled=%s reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
+            "reconcile_enabled=%s reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s daily_hot=%s@%s",
             bool(self.config.get("shell_hook_reconcile_enabled", False)),
             self.config.get("shell_hook_reconcile_seconds"),
             bool(self.config.get("auto_reply_private_all")),
             self.config.get("group_reply_mode"),
             list(self.config.get("auto_reply_blacklist", [])),
+            bool(self.config.get("daily_hot_broadcast_enabled", False)),
+            self.config.get("daily_hot_broadcast_time", "18:00"),
         )
         while not self._stop_event.wait(0.25):
             pass
@@ -635,6 +550,9 @@ class WechatDesktopChannel(ChatChannel):
     def stop(self):
         """停止接收新任务，清空各阶段待处理项，并有限等待工作线程退出。"""
         self._stop_event.set()
+        scheduler = self._daily_hot_scheduler
+        if scheduler is not None:
+            scheduler.stop()
         pending_ids = self._clear_pending_private_batches()
         for event_id in pending_ids:
             self._store.mark_event_processed(event_id)
@@ -1284,6 +1202,178 @@ class WechatDesktopChannel(ChatChannel):
         )
         self._service.update_status(**self._reply_queue.status())
 
+    def enqueue_daily_hot_broadcast(self, message: str) -> int:
+        """把已准备好的每日热点文案按白名单群拆成预写发送任务并入全局 FIFO。
+
+        返回成功入队的群数量。网络准备在调度器子线程完成；这里只做目标过滤与入队。
+        """
+        text = str(message or "").strip()
+        if not text:
+            return 0
+        if bool(self.config.get("shadow_mode", True)):
+            logger.info(
+                "[WechatDesktop][DailyHot] skip enqueue because shadow_mode is on"
+            )
+            return 0
+        if bool(self._service.status().get("paused")):
+            logger.info("[WechatDesktop][DailyHot] skip enqueue because paused")
+            return 0
+
+        groups = [
+            str(name).strip()
+            for name in self.config.get("auto_reply_groups", []) or []
+            if str(name).strip()
+        ]
+        queued = 0
+        for group_name in groups:
+            if self._policy.is_blocked(group_name):
+                self._store.audit(
+                    "daily_hot_broadcast",
+                    group_name,
+                    "blocked",
+                    self._content_hash(text),
+                    detail="blacklist",
+                )
+                continue
+            if not self._policy.is_allowlisted(group_name, True):
+                continue
+            event = WechatDesktopEvent(
+                kind="proactive_send",
+                conversation_id=group_name,
+                conversation_name=group_name,
+                sender_id="system",
+                sender_name="daily_hot_broadcast",
+                content_type="text",
+                content=text,
+                direction="outgoing",
+                is_group=True,
+                source_type="group",
+            )
+            setattr(event, "_proactive_send", True)
+            setattr(event, "_precomposed_reply_text", text)
+            setattr(event, "_source_event_ids", [event.event_id])
+            setattr(event, "_batch_id", event.event_id)
+            self._start_lifecycle(event)
+            self._store.record_event(event)
+            self._enqueue_reply_event(event)
+            queued += 1
+            self._store.audit(
+                "daily_hot_broadcast",
+                group_name,
+                "queued",
+                self._content_hash(text),
+                detail=f"event_id={event.event_id}",
+            )
+        if queued == 0:
+            self._store.audit(
+                "daily_hot_broadcast",
+                "",
+                "no_targets",
+                self._content_hash(text),
+                detail="no allowlisted groups",
+            )
+        if self._daily_hot_scheduler is not None:
+            self._service.update_status(**self._daily_hot_scheduler.status())
+        return queued
+
+    def _send_precomposed_reply(self, item: ReplyQueueItem) -> str:
+        """发送入队前已准备好的文案（如每日热点），不调用 Agent。"""
+        event = item.event
+        text = str(
+            getattr(event, "_precomposed_reply_text", None) or event.content or ""
+        ).strip()
+        target_name = event.conversation_name
+        target_id = event.conversation_id
+        if not text:
+            return "skipped"
+        if bool(self._service.status().get("paused")) or not self._policy.can_auto_send(
+            target_name,
+            event.is_group,
+            "text",
+        ):
+            self._store.audit(
+                "daily_hot_broadcast",
+                target_name,
+                "skipped",
+                self._content_hash(text),
+                detail="paused or policy blocked",
+            )
+            return "skipped"
+
+        send_target = (
+            target_id
+            if str(target_id).startswith("uia-session:")
+            else target_name
+        )
+        self._driver.begin_reply_cycle(target_name, target_id)
+        self._mark_lifecycle(item.source_event_ids, "send_started")
+        try:
+            result = self._driver.send_text(send_target, text)
+        except Exception as exc:
+            self._mark_lifecycle(
+                item.source_event_ids,
+                "send_started",
+                send_result="failed",
+            )
+            logger.warning(
+                "[WechatDesktop] precomposed send failed target=%s: %s",
+                target_name,
+                exc,
+            )
+            self._store.audit(
+                "send_text",
+                target_name,
+                "failed",
+                self._content_hash(text),
+                detail=f"precomposed:{exc}",
+            )
+            return "failed"
+        if not result.get("success"):
+            self._mark_lifecycle(
+                item.source_event_ids,
+                "send_started",
+                send_result="failed",
+            )
+            self._store.audit(
+                "send_text",
+                target_name,
+                "failed",
+                self._content_hash(text),
+                detail="precomposed send unsuccessful",
+            )
+            return "failed"
+
+        verified = bool(result.get("verified"))
+        self._mark_lifecycle(
+            item.source_event_ids,
+            "send_verified" if verified else "send_started",
+            send_result="verified" if verified else "unverified",
+        )
+        self._store.audit(
+            "send_text",
+            target_name,
+            "success" if verified else "unverified",
+            self._content_hash(text),
+            detail="daily_hot_broadcast",
+        )
+        self._store.append_conversation_history(
+            conversation_id=target_id,
+            conversation_name=target_name,
+            sender_name=str(self.config.get("self_display_name") or "我"),
+            direction="outgoing",
+            content_type="text",
+            content=text,
+            source_type=event.source_type or "group",
+        )
+        self._trace(
+            "12-precomposed-send",
+            "target=%s chars=%s verified=%s",
+            target_name,
+            len(text),
+            verified,
+        )
+        return "completed"
+
     def _send_attachment_reference_prompt(self, item: ReplyQueueItem) -> str:
         """拒绝猜测未明确指向的附件，并直接发送“请引用后再问”的提示。"""
         event = item.event
@@ -1434,7 +1524,11 @@ class WechatDesktopChannel(ChatChannel):
             reference_required = bool(
                 getattr(item.event, "_attachment_reference_required", False)
             )
-            if not reference_required:
+            proactive_send = bool(
+                getattr(item.event, "_proactive_send", False)
+                or getattr(item.event, "_precomposed_reply_text", None)
+            )
+            if not reference_required and not proactive_send:
                 self._mark_lifecycle(
                     item.source_event_ids,
                     "agent_started",
@@ -1449,9 +1543,12 @@ class WechatDesktopChannel(ChatChannel):
                 elif reference_required:
                     terminal = self._send_attachment_reference_prompt(item)
                     dispatched = False
+                elif proactive_send:
+                    terminal = self._send_precomposed_reply(item)
+                    dispatched = False
                 else:
                     dispatched = self._dispatch_message(item.event, item.token)
-                if reference_required:
+                if reference_required or proactive_send:
                     pass
                 elif deferred_failed:
                     terminal = "failed"
@@ -1483,7 +1580,7 @@ class WechatDesktopChannel(ChatChannel):
                     "[WechatDesktop] queued message failed: %s", exc, exc_info=True
                 )
             finally:
-                if terminal in {"failed", "timeout"}:
+                if terminal in {"failed", "timeout"} and not proactive_send:
                     try:
                         self._send_agent_failure_notice(
                             event=item.event,
@@ -1501,7 +1598,8 @@ class WechatDesktopChannel(ChatChannel):
                         )
                 if not reference_required:
                     self._driver.end_reply_cycle()
-                    self._mark_lifecycle(item.source_event_ids, "agent_done")
+                    if not proactive_send:
+                        self._mark_lifecycle(item.source_event_ids, "agent_done")
                 for event_id in item.source_event_ids:
                     self._store.mark_event_processed(event_id)
                 self._store.audit(
@@ -1512,11 +1610,14 @@ class WechatDesktopChannel(ChatChannel):
                 )
                 self._reply_queue.finish(item, terminal)
                 self._finish_lifecycle(item.source_event_ids, terminal)
-                self._service.update_status(
-                    reply_in_flight=False,
-                    reply_conversation="",
+                status_updates = {
+                    "reply_in_flight": False,
+                    "reply_conversation": "",
                     **self._reply_queue.status(),
-                )
+                }
+                if self._daily_hot_scheduler is not None:
+                    status_updates.update(self._daily_hot_scheduler.status())
+                self._service.update_status(**status_updates)
 
     def _preserve_event_evidence(self, event: WechatDesktopEvent):
         """把临时截图/附件复制到 Agent 工作区，避免微信缓存清理后路径失效。"""

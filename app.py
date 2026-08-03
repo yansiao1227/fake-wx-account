@@ -14,7 +14,6 @@ import threading
 
 
 _channel_mgr = None
-_shutdown_requested = threading.Event()
 
 # Desktop mode: a lighter runtime for the packaged Electron client. Plugins are
 # loaded in a background thread (so command plugins like cow_cli/godcmd work
@@ -282,35 +281,6 @@ def sigterm_handler_wrap(_signo):
     signal.signal(_signo, func)
 
 
-def _start_emergency_hotkey():
-    if not conf().get("emergency_stop_hotkey_enabled", True):
-        logger.info("[App] Emergency stop hotkey is disabled")
-        return None
-    value = str(conf().get("emergency_stop_hotkey", "ctrl+alt+shift+q") or "")
-    try:
-        from common.windows_hotkey import WindowsGlobalHotkey, parse_hotkey
-
-        parsed = parse_hotkey(value)
-
-        def request_shutdown():
-            logger.warning(
-                f"[App] Emergency stop hotkey {parsed.display} pressed; shutting down..."
-            )
-            _shutdown_requested.set()
-
-        listener = WindowsGlobalHotkey(parsed, request_shutdown)
-        if listener.start():
-            logger.info(f"[App] Emergency stop hotkey: {parsed.display}")
-            return listener
-        logger.warning(
-            f"[App] Could not register emergency stop hotkey {parsed.display}: "
-            f"{listener.error or 'unknown error'}"
-        )
-    except Exception as exc:
-        logger.warning(f"[App] Invalid emergency stop hotkey {value!r}: {exc}")
-    return None
-
-
 def _warmup_mcp_tools():
     """
     Kick off MCP server loading at process startup so subprocesses
@@ -337,8 +307,6 @@ def _warmup_scheduler():
 
 def run():
     global _channel_mgr
-    hotkey_listener = None
-    _shutdown_requested.clear()
     try:
         # load config
         load_config()
@@ -380,18 +348,15 @@ def run():
 
         _channel_mgr = ChannelManager()
         _channel_mgr.start(channel_names, first_start=True)
-        hotkey_listener = _start_emergency_hotkey()
 
-        while not _shutdown_requested.wait(1):
-            pass
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         pass
     except Exception as e:
         logger.error("App startup failed!")
         logger.exception(e)
     finally:
-        if hotkey_listener is not None:
-            hotkey_listener.stop()
         if _channel_mgr is not None:
             try:
                 _channel_mgr.stop()

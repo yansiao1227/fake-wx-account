@@ -48,17 +48,6 @@ function Get-CowAgentProcess {
     return $process
 }
 
-function Get-EmergencyHotkey {
-    $configPath = Join-Path $ProjectRoot "config.json"
-    if (-not (Test-Path -LiteralPath $configPath)) { return "Ctrl+Alt+Shift+Q" }
-    try {
-        $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
-        if ($config.emergency_stop_hotkey_enabled -eq $false) { return "disabled" }
-        if ($config.emergency_stop_hotkey) { return [string]$config.emergency_stop_hotkey }
-    } catch {}
-    return "Ctrl+Alt+Shift+Q"
-}
-
 function Assert-ProjectProcess {
     param($Process, [string]$Python)
     $expectedPython = [System.IO.Path]::GetFullPath($Python)
@@ -79,11 +68,9 @@ function Start-CowAgent {
     if ($existing) {
         Assert-ProjectProcess $existing $python
         Write-Host "CowAgent is already running on port $Port (PID $($existing.ProcessId))"
-        Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
         return
     }
     Write-Host "Starting CowAgent in the current terminal (foreground mode)"
-    Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
     Write-Host "Press Ctrl+C to stop. Browser auto-open is disabled."
     $previousOpenBrowser = $env:COW_OPEN_BROWSER
     $env:COW_OPEN_BROWSER = "0"
@@ -124,7 +111,6 @@ switch ($Command) {
         $process = Get-CowAgentProcess
         if ($process) {
             Write-Host "CowAgent is running on port $Port (PID $($process.ProcessId))"
-            Write-Host "Emergency stop: $(Get-EmergencyHotkey)"
         } else {
             Write-Host "CowAgent is stopped"
         }

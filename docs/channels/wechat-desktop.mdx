@@ -15,20 +15,19 @@ python -m pip install -r requirements-windows.txt
 
 Start and sign in to exactly one desktop WeChat instance, then configure:
 
+Channel settings live only in `channel/wechat_desktop/config.py`. Root
+`config.json` does **not** need a `wechat_desktop` block. To enable the channel:
+
 ```json
 {
-  "channel_type": "web,wechat_desktop",
-  "wechat_desktop": {
-    "shell_hook_reconcile_seconds": 15,
-    "self_display_name": "Your WeChat display name",
-    "shadow_mode": true,
-    "auto_reply_contacts": ["File Transfer"],
-    "auto_reply_groups": ["Test group"]
-  }
+  "channel_type": "web,wechat_desktop"
 }
 ```
 
-`self_display_name` is used when WeChat does not expose the current account through UIA. Automatic sending stops if it conflicts with an account name exposed by the client.
+Set `self_display_name`, `shadow_mode`, allowlists, daily hot, and UIA timing in
+`channel/wechat_desktop/config.py`. `self_display_name` is used when WeChat does
+not expose the current account through UIA. Automatic sending stops if it
+conflicts with an account name exposed by the client.
 
 ## Message processing
 
@@ -57,4 +56,34 @@ python scripts/test_wechat_uia.py --conversation "File Transfer"
 
 Review diagnostic reports before sharing them. Sending occurs only when both `--send-to` and `--text` are supplied.
 
-During automation, the global `Ctrl+Alt+Shift+Q` hotkey stops CowAgent without requiring the mouse.
+## Daily hot broadcast
+
+Optionally push Baidu's top trending item to every group in `auto_reply_groups` at a fixed local time. Content is prepared on a background thread, then enqueued into the global reply FIFO so it never interrupts an in-flight reply.
+
+Pipeline:
+
+1. Qianfan `baidu_trending` for the top item (title, score, original link)
+2. Qianfan Baidu search (`ai_search/web_search` + `baidu_search_v2`) for detail snippets
+3. Global chat model (prefer `custom_api_*`) writes a factual summary plus a light personal commentary
+4. Message always ends with the original hot-search link
+
+Set them in `channel/wechat_desktop/config.py`, for example:
+
+```python
+"daily_hot_broadcast_enabled": True,
+"daily_hot_broadcast_time": "18:00",
+"auto_reply_groups": ["Test group"],
+"shadow_mode": False,
+```
+
+Notes:
+
+- Daily-hot and other channel settings are edited only in
+  `channel/wechat_desktop/config.py`.
+- Put the Qianfan secret in `~/.cow/.env` as `QIANFAN_API_KEY` (not production
+  secrets in the repo `config.json`).
+- Summarization uses global `custom_api_base` / `custom_api_key` / `model`, with
+  Qianfan chat then extractive fallback if needed.
+- No send occurs under `shadow_mode`, pause, blacklist, or rate limits.
+- At most one successful prepare/fire per calendar day; fetch failures retry on later ticks the same day.
+- Tab names match the `baidu-hot-cn` skill; default is `livelihood`.

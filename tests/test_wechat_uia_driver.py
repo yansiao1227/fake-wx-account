@@ -29,9 +29,9 @@ from channel.wechat_desktop.uia_driver import (
     _UiaPriorityCoordinator,
 )
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
+from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.wechat_desktop_channel import (
     ATTACHMENT_REFERENCE_REQUIRED_REPLY,
-    DEFAULT_CONFIG,
     WechatDesktopChannel,
     _format_agent_notice,
     _format_failure_notice,
