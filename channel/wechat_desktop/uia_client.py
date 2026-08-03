@@ -11,17 +11,19 @@ import shutil
 import threading
 import time
 import unicodedata
-from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from common.log import logger
+from channel.wechat_desktop.group_sender_ocr import RapidOcrGroupSenderResolver
 from channel.wechat_desktop.models import (
     ConversationInfo,
+    DEFAULT_SELF_SENDER_NAME,
     HeaderInfo,
     OwnerInfo,
+    UNKNOWN_SENDER_NAME,
     UiaChatMessage,
     UiaReferencedMessage,
 )
@@ -133,7 +135,8 @@ class WechatUiaClient:
         self._known_outgoing_messages: dict[
             str, list[tuple[str, str, float]]
         ] = {}
-        self.last_direction_resolution: dict = {}
+        # RapidOCR lazily loads its models only when a group has missing names.
+        self._group_sender_ocr = RapidOcrGroupSenderResolver(self.config)
 
     def cancel_waits(self):
         self._stop_event.set()
@@ -378,6 +381,49 @@ class WechatUiaClient:
         if int(foreground_process_id) != int(process_id):
             raise RuntimeError("WeChat could not be brought to the foreground")
         return True
+
+    @staticmethod
+    def _window_process_is_foreground(main_hwnd: int) -> bool:
+        """Return whether the foreground window belongs to the main window process."""
+
+        try:
+            import win32gui
+            import win32process
+
+            foreground = int(win32gui.GetForegroundWindow() or 0)
+            if not foreground or not main_hwnd:
+                return False
+            _, foreground_pid = win32process.GetWindowThreadProcessId(foreground)
+            _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            return bool(foreground_pid and int(foreground_pid) == int(main_pid))
+        except Exception:
+            return False
+
+    def _recover_foreground_after_dependency_failure(
+        self,
+        context: str,
+        main_hwnd: Optional[int] = None,
+    ) -> bool:
+        """Recover WeChat focus after a viewer, menu, or dialog operation failed."""
+
+        try:
+            owner_hwnd = int(main_hwnd or self.get_owner_window_handle())
+            if self._window_process_is_foreground(owner_hwnd):
+                return False
+            activated = self.ensure_foreground_window()
+            logger.info(
+                "[WechatDesktop] restored WeChat foreground after %s; activated=%s",
+                context,
+                activated,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] failed to restore WeChat foreground after %s: %s",
+                context,
+                exc,
+            )
+            return False
 
     def focus_window(self) -> None:
         self.ensure_foreground_window()
@@ -772,90 +818,46 @@ class WechatUiaClient:
                 size = int(float(match.group(1)) * units[match.group(2).upper()])
         return filename, size
 
-    @classmethod
+    def _self_sender_name(self) -> str:
+        return (
+            _text(self.config.get("self_display_name"))
+            or DEFAULT_SELF_SENDER_NAME
+        )
+
     def _message_sender(
-        cls,
+        self,
         header: HeaderInfo,
         item,
         content: str,
+        direction: str,
     ) -> str:
-        """Read sender metadata without using the observed direction field."""
+        """按会话类型和方向生成 OCR 前的发送者占位值。"""
+        del item, content
+        if direction == "outgoing":
+            return self._self_sender_name()
+        if direction != "incoming":
+            return UNKNOWN_SENDER_NAME
         if header.header_type == "private":
-            return _text(header.title)
-        if header.header_type == "group":
-            try:
-                for child in item.GetChildren():
-                    candidate = _text(child.Name)
-                    if candidate and candidate != content and len(candidate) <= 80:
-                        return candidate
-            except Exception:
-                pass
-        return ""
+            return _text(header.title) or UNKNOWN_SENDER_NAME
+        return UNKNOWN_SENDER_NAME
 
-    @staticmethod
-    def _history_message_content(value: str) -> str:
-        """Remove the timestamp appended by WeChat's history result rows."""
-        text = _text(value)
-        return re.sub(
-            r"\s+(?:\d{4}年\d{1,2}月\d{1,2}日\s+)?\d{1,2}:\d{2}$",
-            "",
-            text,
-        ).strip()
-
-    @staticmethod
-    def _choose_self_member(
-        candidate_histories: list[list[str]], outgoing_anchors: Iterable[str]
-    ) -> Optional[int]:
-        """Choose the current account among same-name member candidates."""
-        if len(candidate_histories) == 1:
-            return 0
-        anchors = {_text(item) for item in outgoing_anchors if _text(item)}
-        if not anchors:
-            return None
-        matches = [
-            index
-            for index, history in enumerate(candidate_histories)
-            if any(anchor in set(history) for anchor in anchors)
-        ]
-        return matches[0] if len(matches) == 1 else None
-
-    @staticmethod
-    def _apply_self_history_directions(
-        messages: list[UiaChatMessage], self_history: Iterable[str]
+    def _normalize_private_senders(
+        self,
+        header: HeaderInfo,
+        messages: list[UiaChatMessage],
     ) -> list[UiaChatMessage]:
-        """Classify messages from a member-filter result, failing on ambiguity."""
-        self_counts = Counter(_text(item) for item in self_history if _text(item))
-        if not self_counts:
-            # An empty filtered list can also mean that WeChat did not finish
-            # rendering the history view.  It is not proof that every visible
-            # bubble came from somebody else.
-            return messages
-        total_counts = Counter(
-            _text(message.content)
-            for message in messages
-            if _text(message.content)
-        )
-        resolved = []
+        """私聊不读取用户名，只根据最终方向映射为自己、对方或 unknown。"""
+
+        normalized = []
         for message in messages:
-            content = _text(message.content)
-            total = total_counts.get(content, 0)
-            own = self_counts.get(content, 0)
-            if total and own == total:
-                direction = "outgoing"
-            elif total and own == 0:
-                direction = "incoming"
+            if message.direction == "outgoing":
+                sender = self._self_sender_name()
+            elif message.direction == "incoming":
+                sender = _text(header.title) or UNKNOWN_SENDER_NAME
             else:
-                # Identical content appears on both sides, so occurrence order
-                # cannot be proven from the filtered history list.
-                resolved.append(message)
-                continue
-            resolved.append(
-                replace(
-                    message,
-                    direction=direction,
-                )
-            )
-        return resolved
+                sender = UNKNOWN_SENDER_NAME
+            normalized.append(replace(message, sender_name=sender))
+        return normalized
 
     @staticmethod
     def _click_and_restore(control) -> None:
@@ -866,275 +868,6 @@ class WechatUiaClient:
             control.Click()
         finally:
             win32api.SetCursorPos(cursor)
-
-    @staticmethod
-    def _visible_process_windows(process_id: int) -> list[int]:
-        import win32gui
-        import win32process
-
-        windows = []
-
-        def collect(hwnd, _):
-            if not win32gui.IsWindowVisible(hwnd):
-                return True
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            if int(pid) == int(process_id):
-                windows.append(int(hwnd))
-            return True
-
-        win32gui.EnumWindows(collect, None)
-        return windows
-
-    def _history_member_candidates(
-        self, history_hwnd: int, owner: str
-    ) -> list:
-        import uiautomation as auto
-        import win32process
-
-        with auto.UIAutomationInitializerInThread():
-            root = auto.ControlFromHandle(history_hwnd)
-            member_button = next(
-                (
-                    control
-                    for control in self._walk(root)
-                    if _text(control.Name) == "群成员"
-                ),
-                None,
-            )
-            if member_button is None:
-                return []
-            self._click_and_restore(member_button)
-        self._paced_wait(
-            "uia_history_settle_ms_min",
-            "uia_history_settle_ms_max",
-            800,
-            1300,
-        )
-        _, process_id = win32process.GetWindowThreadProcessId(history_hwnd)
-        with auto.UIAutomationInitializerInThread():
-            for hwnd in self._visible_process_windows(process_id):
-                root = auto.ControlFromHandle(hwnd)
-                member_list = next(
-                    (
-                        control
-                        for control in self._walk(root, 300)
-                        if _text(control.AutomationId) == "chatroom_member_list"
-                    ),
-                    None,
-                )
-                if member_list is None:
-                    continue
-                return [
-                    item
-                    for item in member_list.GetChildren()
-                    if _text(item.ClassName) == "mmui::XTableCell"
-                    and _text(item.Name) == _text(owner)
-                ]
-        return []
-
-    def _filtered_history_for_member(
-        self, history_hwnd: int, owner: str, candidate_index: int
-    ) -> tuple[int, list[str]]:
-        import uiautomation as auto
-        import win32process
-
-        candidates = self._history_member_candidates(history_hwnd, owner)
-        candidate_count = len(candidates)
-        if not 0 <= int(candidate_index) < candidate_count:
-            return candidate_count, []
-        self._click_and_restore(candidates[int(candidate_index)])
-        self._paced_wait(
-            "uia_history_settle_ms_min",
-            "uia_history_settle_ms_max",
-            800,
-            1300,
-        )
-        _, process_id = win32process.GetWindowThreadProcessId(history_hwnd)
-        with auto.UIAutomationInitializerInThread():
-            for hwnd in self._visible_process_windows(process_id):
-                root = auto.ControlFromHandle(hwnd)
-                message_list = next(
-                    (
-                        control
-                        for control in self._walk(root, 1000)
-                        if _text(control.AutomationId)
-                        in {"chat_log_message_list", "search_message_list"}
-                    ),
-                    None,
-                )
-                if message_list is None:
-                    continue
-                return candidate_count, [
-                    self._history_message_content(_text(item.Name))
-                    for item in message_list.GetChildren()
-                    if _text(item.ClassName).casefold() != "mmui::chatitemview"
-                    and "Chat" in _text(item.ClassName)
-                    and "ItemView" in _text(item.ClassName)
-                    and _text(item.Name)
-                ]
-        return candidate_count, []
-
-    def resolve_group_message_directions(
-        self,
-        conversation: str,
-        messages: list[UiaChatMessage],
-        owner: str,
-    ) -> list[UiaChatMessage]:
-        """Resolve unknown directions through the history member filter."""
-        self.last_direction_resolution = {
-            "conversation": _text(conversation),
-            "status": "not_started",
-        }
-        if not owner:
-            self.last_direction_resolution["status"] = "not_needed"
-            return messages
-        import win32con
-        import win32gui
-
-        with self.operation_lock:
-            owner_hwnd = self.get_owner_window_handle()
-            process_id = self.get_owner_window_process_id()
-            with self._uia_root() as root:
-                history_button = next(
-                    (
-                        control
-                        for control in self._walk(root)
-                        if _text(control.Name) == "聊天记录"
-                        and _text(control.ControlTypeName) == "ButtonControl"
-                    ),
-                    None,
-                )
-                if history_button is None:
-                    self.last_direction_resolution["status"] = "history_button_missing"
-                    return messages
-                self._click_and_restore(history_button)
-            self._paced_wait(
-                "uia_history_settle_ms_min",
-                "uia_history_settle_ms_max",
-                1000,
-                1600,
-            )
-            history_hwnd = next(
-                (
-                    hwnd
-                    for hwnd in self._visible_process_windows(process_id)
-                    if hwnd != owner_hwnd
-                    and "聊天记录" in win32gui.GetWindowText(hwnd)
-                ),
-                None,
-            )
-            if history_hwnd is None:
-                self.last_direction_resolution["status"] = "history_window_missing"
-                return messages
-            try:
-                # Selecting a member closes the popover, so the first filtered
-                # read also supplies the candidate count; reopen it only for
-                # subsequent candidates.
-                candidate_count, first_history = self._filtered_history_for_member(
-                    history_hwnd, owner, 0
-                )
-                if candidate_count == 0:
-                    self.last_direction_resolution.update(
-                        status="owner_member_missing", candidate_count=0
-                    )
-                    return messages
-                histories = [first_history]
-                for index in range(1, candidate_count):
-                    _, history = self._filtered_history_for_member(
-                        history_hwnd, owner, index
-                    )
-                    histories.append(history)
-                self_index = self._choose_self_member(
-                    histories,
-                    self._known_outgoing_texts.get(_text(conversation), []),
-                )
-                self.last_direction_resolution.update(
-                    candidate_count=candidate_count,
-                    filtered_history_counts=[len(history) for history in histories],
-                    status="resolved" if self_index is not None else "self_ambiguous",
-                )
-                if self_index is None:
-                    return messages
-                resolved = self._apply_self_history_directions(
-                    messages, histories[self_index]
-                )
-                if not histories[self_index]:
-                    self.last_direction_resolution["status"] = "filtered_history_empty"
-                return resolved
-            finally:
-                for hwnd in self._visible_process_windows(process_id):
-                    if hwnd == owner_hwnd or not win32gui.IsWindow(hwnd):
-                        continue
-                    title = win32gui.GetWindowText(hwnd)
-                    class_name = win32gui.GetClassName(hwnd)
-                    if "聊天记录" in title or class_name.endswith("QWindowToolSaveBits"):
-                        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                try:
-                    win32gui.SetForegroundWindow(owner_hwnd)
-                except Exception:
-                    pass
-
-    @classmethod
-    def _message_direction(cls, item, list_bounds) -> tuple[str, Optional[tuple[int, int, int, int]]]:
-        """Classify a message using UI geometry only, never display names.
-
-        WeChat often exposes ChatItemView as a full-width row.  The visible
-        bubble/avatar descendants, however, remain aligned to one side.  Vote
-        using those bounded descendants and fail closed when geometry is
-        ambiguous.
-        """
-        if not list_bounds:
-            return "unknown", _bounds(item)
-        list_left, _, list_right, _ = list_bounds
-        width = max(1, list_right - list_left)
-        center = (list_left + list_right) / 2.0
-        threshold = max(12.0, width * 0.06)
-        content = _text(item.Name)
-        candidates = []
-        item_bounds = _bounds(item)
-        controls = [item]
-        try:
-            controls.extend(cls._walk(item, 200))
-        except Exception:
-            pass
-        for control in controls:
-            bounds = _bounds(control)
-            if not bounds:
-                continue
-            left, top, right, bottom = bounds
-            candidate_width = right - left
-            if candidate_width <= 0 or bottom <= top or candidate_width >= width * 0.82:
-                continue
-            midpoint = (left + right) / 2.0
-            if abs(midpoint - center) <= threshold:
-                continue
-            class_name = _text(control.ClassName).casefold()
-            name = _text(control.Name)
-            weight = 1.0
-            if name and name == content:
-                weight += 4.0
-            if any(token in class_name for token in ("bubble", "avatar", "message", "content", "text")):
-                weight += 2.0
-            weight += min(2.0, candidate_width / max(1.0, width * 0.25))
-            side = "incoming" if midpoint < center else "outgoing"
-            candidates.append((side, weight, bounds))
-        if not candidates and item_bounds:
-            midpoint = (item_bounds[0] + item_bounds[2]) / 2.0
-            if midpoint < center - threshold:
-                return "incoming", item_bounds
-            if midpoint > center + threshold:
-                return "outgoing", item_bounds
-            return "unknown", item_bounds
-        incoming_score = sum(weight for side, weight, _ in candidates if side == "incoming")
-        outgoing_score = sum(weight for side, weight, _ in candidates if side == "outgoing")
-        if incoming_score == outgoing_score or max(incoming_score, outgoing_score) < 1.0:
-            return "unknown", item_bounds
-        winning = "incoming" if incoming_score > outgoing_score else "outgoing"
-        if min(incoming_score, outgoing_score) and max(incoming_score, outgoing_score) < min(incoming_score, outgoing_score) * 1.5:
-            return "unknown", item_bounds
-        winning_bounds = [bounds for side, _, bounds in candidates if side == winning]
-        anchor = max(winning_bounds, key=lambda value: (value[2] - value[0]) * (value[3] - value[1]))
-        return winning, anchor
 
     def get_chat_history(
         self,
@@ -1177,7 +910,8 @@ class WechatUiaClient:
                 # ChatImageItemView, ChatFileItemView, and similar subclasses.
                 if class_name.casefold() == "mmui::chatitemview":
                     continue
-                direction, item_bounds = self._message_direction(item, list_bounds)
+                direction = "unknown"
+                item_bounds = _bounds(item)
                 parsed_reference = self._parse_reference_label(content)
                 reference = None
                 if parsed_reference is not None:
@@ -1193,7 +927,7 @@ class WechatUiaClient:
                         strategy="preview_only",
                     )
                 sender = self._message_sender(
-                    header, item, content
+                    header, item, content, direction
                 )
                 messages.append(
                     UiaChatMessage(
@@ -1206,6 +940,14 @@ class WechatUiaClient:
                         reference=reference,
                     )
                 )
+            if header.header_type in {"group", "private"}:
+                messages = self._group_sender_ocr.enrich(
+                    messages,
+                    list_bounds,
+                    resolve_sender_names=header.header_type == "group",
+                )
+            if header.header_type == "private":
+                messages = self._normalize_private_senders(header, messages)
         return messages if bounded_limit == 0 else messages[-bounded_limit:]
 
     @staticmethod
@@ -1223,7 +965,19 @@ class WechatUiaClient:
                 continue
             if self._message_type(class_name, _text(control.Name)) != message.message_type:
                 continue
-            name_matches = _text(control.Name) == _text(message.content)
+            control_name = _text(control.Name)
+            name_matches = control_name == _text(message.content)
+            if not name_matches and message.reference is not None:
+                parsed = self._parse_reference_label(control_name)
+                name_matches = bool(
+                    parsed is not None
+                    and parsed["current"] == _text(message.content)
+                    and parsed["preview"] == _text(message.reference.content)
+                    and (
+                        not message.reference.sender_name
+                        or parsed["sender"] == _text(message.reference.sender_name)
+                    )
+                )
             bounds_match = self._same_bounds(_bounds(control), message.bounds)
             runtime_matches = bool(
                 message.runtime_id and _runtime_id(control) == message.runtime_id
@@ -1233,6 +987,46 @@ class WechatUiaClient:
             if name_matches:
                 candidates.append(control)
         return candidates[0] if len(candidates) == 1 else None
+
+    @classmethod
+    def _image_activation_bounds(cls, control, fallback_bounds):
+        """选择图片本体的点击区域，避免用整行消息区域覆盖已有锚点。"""
+
+        control_bounds = _bounds(control) if control is not None else None
+        fallback = tuple(fallback_bounds) if fallback_bounds else None
+        if fallback:
+            if control_bounds is None:
+                return fallback
+            outer_left, outer_top, outer_right, outer_bottom = control_bounds
+            inner_left, inner_top, inner_right, inner_bottom = fallback
+            if (
+                outer_left <= inner_left
+                and outer_top <= inner_top
+                and outer_right >= inner_right
+                and outer_bottom >= inner_bottom
+            ):
+                return fallback
+
+        image_bounds = []
+        if control is not None:
+            for child in cls._walk(control, 100):
+                bounds = _bounds(child)
+                if not bounds:
+                    continue
+                left, top, right, bottom = bounds
+                if right <= left or bottom <= top:
+                    continue
+                class_name = _text(getattr(child, "ClassName", ""))
+                content = _text(getattr(child, "Name", ""))
+                if cls._message_type(class_name, content) == "image":
+                    image_bounds.append(bounds)
+        if image_bounds:
+            return max(
+                image_bounds,
+                key=lambda bounds: (bounds[2] - bounds[0])
+                * (bounds[3] - bounds[1]),
+            )
+        return control_bounds or fallback
 
     @staticmethod
     def _right_click_point(point: tuple[int, int]) -> None:
@@ -1269,6 +1063,259 @@ class WechatUiaClient:
         win32api.keybd_event(
             win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0
         )
+
+    @classmethod
+    def _find_image_viewer_close_control(cls, root):
+        """在图片查看器自身的 UIA 树中查找关闭按钮。
+
+        微信 4.1.9.30 实测将其暴露为：
+        ``Name=关闭``、``ClassName=mmui::XButton``、
+        ``ControlTypeName=ButtonControl``。英文标题作为兼容项保留。
+        """
+
+        controls = [root, *cls._walk(root, 300)]
+        return next(
+            (
+                control
+                for control in controls
+                if _text(getattr(control, "Name", "")).casefold()
+                in {"关闭", "close"}
+                and _text(getattr(control, "ClassName", ""))
+                == "mmui::XButton"
+                and _text(getattr(control, "ControlTypeName", ""))
+                == "ButtonControl"
+            ),
+            None,
+        )
+
+    def _is_image_viewer_window(self, viewer_hwnd: int, main_hwnd: int) -> bool:
+        """严格确认句柄属于微信图片查看器，绝不能把主窗口当作关闭目标。"""
+
+        import win32gui
+        import win32process
+
+        if (
+            not viewer_hwnd
+            or not main_hwnd
+            or int(viewer_hwnd) == int(main_hwnd or 0)
+            or not win32gui.IsWindow(viewer_hwnd)
+            or not win32gui.IsWindow(main_hwnd)
+        ):
+            return False
+        try:
+            _, viewer_pid = win32process.GetWindowThreadProcessId(viewer_hwnd)
+            _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            title = _text(win32gui.GetWindowText(viewer_hwnd))
+        except Exception:
+            return False
+        return bool(
+            int(viewer_pid) == int(main_pid)
+            and title.casefold() in {"图片和视频", "images and videos"}
+        )
+
+    def _has_image_viewer_close_control(self, viewer_hwnd: int) -> bool:
+        """确认候选窗口确实暴露了微信图片查看器自己的关闭按钮。"""
+
+        try:
+            import uiautomation as auto
+
+            with auto.UIAutomationInitializerInThread():
+                root = auto.ControlFromHandle(viewer_hwnd)
+                return self._find_image_viewer_close_control(root) is not None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _image_viewer_is_open(viewer_hwnd: int) -> bool:
+        """Return whether the viewer still has a visible, non-minimized window.
+
+        WeChat's Qt windows are commonly hidden and reused after Close instead
+        of having their HWND destroyed.  ``IsWindow`` alone therefore reports
+        a successfully closed viewer as alive and can make the caller click a
+        stale close control a second time.
+        """
+
+        try:
+            import win32gui
+
+            return bool(
+                viewer_hwnd
+                and win32gui.IsWindow(viewer_hwnd)
+                and win32gui.IsWindowVisible(viewer_hwnd)
+                and not win32gui.IsIconic(viewer_hwnd)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _visible_top_level_window_handles() -> set[int]:
+        import win32gui
+
+        handles: set[int] = set()
+
+        def callback(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                handles.add(int(hwnd))
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return handles
+
+    def _find_opened_image_viewer(
+        self,
+        main_hwnd: int,
+        visible_before: set[int],
+    ) -> int:
+        """查找本次点击新打开的、经过原生窗口和 UIA 双重验证的查看器。"""
+
+        import win32gui
+
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+        native_candidates: list[int] = []
+
+        def callback(hwnd, _):
+            native_hwnd = int(hwnd or 0)
+            if (
+                native_hwnd
+                and native_hwnd not in visible_before
+                and win32gui.IsWindowVisible(native_hwnd)
+                and self._is_image_viewer_window(native_hwnd, main_hwnd)
+            ):
+                native_candidates.append(native_hwnd)
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        # Do not enter COM/UIA from inside EnumWindows' native callback.  Some
+        # WeChat builds synchronously wait on their UI thread while a new image
+        # viewer is initializing, which can otherwise freeze this worker before
+        # it ever reaches screenshot capture.
+        candidates = [
+            hwnd
+            for hwnd in native_candidates
+            if self._has_image_viewer_close_control(hwnd)
+        ]
+        if foreground in candidates:
+            return foreground
+        return candidates[0] if len(candidates) == 1 else 0
+
+    def _try_close_image_viewer_with_uia(self, viewer_hwnd: int) -> bool:
+        """通过查看器窗口句柄获取 UIA 根节点并操作关闭按钮。
+
+        微信的 ``mmui::XButton`` 会暴露 InvokePattern，但部分版本调用 Invoke
+        后不执行任何动作。因此 Invoke 后必须检查查看器是否仍可见；仍可见时再
+        使用 UIA 控件自己的 Click，而不是把“未抛异常”误判成关闭成功。
+        """
+
+        import uiautomation as auto
+        import win32api
+
+        with auto.UIAutomationInitializerInThread():
+            root = auto.ControlFromHandle(viewer_hwnd)
+            close_button = self._find_image_viewer_close_control(root)
+            if close_button is None:
+                return False
+            cursor = win32api.GetCursorPos()
+            try:
+                try:
+                    close_button.GetInvokePattern().Invoke()
+                except Exception:
+                    pass
+                invoke_deadline = time.monotonic() + 0.3
+                while (
+                    self._image_viewer_is_open(viewer_hwnd)
+                    and time.monotonic() < invoke_deadline
+                ):
+                    time.sleep(0.03)
+                if self._image_viewer_is_open(viewer_hwnd):
+                    close_button.Click(simulateMove=False, waitTime=0.1)
+            finally:
+                win32api.SetCursorPos(cursor)
+        if not self._image_viewer_is_open(viewer_hwnd):
+            return True
+        close_deadline = time.monotonic() + 1.0
+        while (
+            self._image_viewer_is_open(viewer_hwnd)
+            and time.monotonic() < close_deadline
+        ):
+            time.sleep(0.05)
+        return not self._image_viewer_is_open(viewer_hwnd)
+
+    def _close_image_viewer(self, viewer_hwnd: int, main_hwnd: int) -> bool:
+        """只点击图片查看器自己的关闭按钮，绝不关闭任何原生窗口。
+
+        全局 Esc 和 WM_CLOSE 都可能在焦点或窗口身份变化时作用于微信主窗口，
+        因而这里不提供键盘或窗口消息兜底。UIA 关闭失败时宁可留下查看器，
+        也不能终止用户的微信会话。
+        """
+
+        import win32gui
+
+        if not self._is_image_viewer_window(viewer_hwnd, main_hwnd):
+            logger.warning(
+                "[WechatDesktop] refused to close an unverified image viewer: "
+                "viewer_hwnd=%s main_hwnd=%s",
+                viewer_hwnd,
+                main_hwnd,
+            )
+            return False
+
+        try:
+            closed = self._try_close_image_viewer_with_uia(viewer_hwnd)
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] image viewer UIA close failed: %s", exc
+            )
+            return False
+        if not win32gui.IsWindow(main_hwnd):
+            logger.error(
+                "[WechatDesktop] main WeChat window disappeared while closing "
+                "image viewer: main_hwnd=%s viewer_hwnd=%s",
+                main_hwnd,
+                viewer_hwnd,
+            )
+            return False
+        if closed:
+            logger.info(
+                "[WechatDesktop] image viewer closed via its UIA control: hwnd=%s",
+                viewer_hwnd,
+            )
+        return closed
+
+    @staticmethod
+    def _restore_main_window_after_viewer(main_hwnd: int) -> bool:
+        """Restore the exact main window after the viewer has finished closing.
+
+        A same-process foreground window is not sufficient here: Qt can retain
+        the hidden viewer HWND after Close.  Restore and verify the original
+        main HWND itself so it cannot be left behind another application.
+        """
+
+        import win32con
+        import win32gui
+
+        if not main_hwnd or not win32gui.IsWindow(main_hwnd):
+            return False
+        try:
+            win32gui.ShowWindow(main_hwnd, win32con.SW_RESTORE)
+            deadline = time.monotonic() + 1.0
+            while True:
+                if int(win32gui.GetForegroundWindow() or 0) == int(main_hwnd):
+                    return bool(
+                        win32gui.IsWindowVisible(main_hwnd)
+                        and not win32gui.IsIconic(main_hwnd)
+                    )
+                win32gui.BringWindowToTop(main_hwnd)
+                win32gui.SetForegroundWindow(main_hwnd)
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            return False
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] failed to restore main window after viewer: %s",
+                exc,
+            )
+            return False
 
     @staticmethod
     def _press_end_key() -> None:
@@ -1386,7 +1433,11 @@ class WechatUiaClient:
     ) -> UiaChatMessage:
         """Resolve one quote through WeChat's native locate-original action."""
         reference = message.reference
-        if reference is None or not message.bounds:
+        if (
+            reference is None
+            or reference.message_type != "file"
+            or not message.bounds
+        ):
             return message
         left, top, right, bottom = message.bounds
         if right <= left or bottom <= top:
@@ -1411,7 +1462,10 @@ class WechatUiaClient:
                     "定位到原文位置", "mmui::XMenuView"
                 )
                 if menu_item is None:
-                    self._press_escape_key()
+                    logger.warning(
+                        "[WechatDesktop] locate-original menu item unavailable; "
+                        "leaving UI untouched"
+                    )
                     return message
                 self._click_and_restore(menu_item)
                 located = True
@@ -1690,6 +1744,7 @@ class WechatUiaClient:
         target = target_root / (
             f"{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:12]}_{safe_name}"
         )
+        main_hwnd = self.get_owner_window_handle()
         left, top, right, bottom = bounds
         self._right_click_point(
             (int(left + (right - left) * 0.25), int((top + bottom) / 2))
@@ -1702,7 +1757,9 @@ class WechatUiaClient:
         )
         menu_item = self._find_desktop_control("另存为...", "mmui::XMenuView")
         if menu_item is None:
-            self._press_escape_key()
+            self._recover_foreground_after_dependency_failure(
+                "missing Save As menu"
+            )
             return ""
         self._click_and_restore(menu_item)
         self._paced_wait(
@@ -1711,6 +1768,8 @@ class WechatUiaClient:
             400,
             700,
         )
+        dialog_hwnd = 0
+        saved = False
         try:
             import uiautomation as auto
             import win32gui
@@ -1747,18 +1806,70 @@ class WechatUiaClient:
                     logger.info(
                         "[WechatDesktop] file saved from native dialog: %s", target
                     )
+                    saved = True
                     return str(target)
                 time.sleep(0.25)
         finally:
-            try:
-                import win32gui
-
-                foreground = int(win32gui.GetForegroundWindow() or 0)
-                if foreground and win32gui.GetClassName(foreground) == "#32770":
-                    self._press_escape_key()
-            except Exception:
-                pass
+            if not saved:
+                # Never use WM_CLOSE or a global Escape fallback here.  If the
+                # native dialog changed identity, leave it alone rather than
+                # risk applying a close action to the WeChat main window.
+                self._try_cancel_verified_native_dialog(dialog_hwnd, main_hwnd)
+                self._recover_foreground_after_dependency_failure(
+                    "Save As dialog failure",
+                    main_hwnd,
+                )
         return ""
+
+    def _try_cancel_verified_native_dialog(
+        self,
+        dialog_hwnd: int,
+        main_hwnd: int,
+    ) -> bool:
+        """Invoke Cancel only on an exact same-process native child dialog."""
+
+        try:
+            import uiautomation as auto
+            import win32gui
+            import win32process
+
+            if (
+                not dialog_hwnd
+                or not main_hwnd
+                or int(dialog_hwnd) == int(main_hwnd)
+                or not win32gui.IsWindow(dialog_hwnd)
+                or not win32gui.IsWindow(main_hwnd)
+                or win32gui.GetClassName(dialog_hwnd) != "#32770"
+            ):
+                return False
+            _, dialog_pid = win32process.GetWindowThreadProcessId(dialog_hwnd)
+            _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            if int(dialog_pid) != int(main_pid):
+                return False
+            with auto.UIAutomationInitializerInThread():
+                dialog = auto.ControlFromHandle(dialog_hwnd)
+                cancel_button = next(
+                    (
+                        item
+                        for item in self._walk(dialog, 500)
+                        if _text(getattr(item, "AutomationId", "")) == "2"
+                        and "button"
+                        in _text(
+                            getattr(item, "ControlTypeName", "")
+                        ).casefold()
+                    ),
+                    None,
+                )
+                if cancel_button is None:
+                    return False
+                cancel_button.GetInvokePattern().Invoke()
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] verified native dialog cancel failed: %s",
+                exc,
+            )
+            return False
 
     def fetch_message_file(
         self, message: UiaChatMessage, tmp_root: Optional[Path] = None
@@ -1837,6 +1948,168 @@ class WechatUiaClient:
         )
         return ""
 
+    def _capture_image_viewer_from_point(
+        self,
+        point: tuple[int, int],
+        target: Path,
+    ) -> str:
+        """点击一个已验证的图片命中区域并截取新打开的微信图片查看器。"""
+
+        import win32gui
+        from PIL import ImageGrab
+
+        main_hwnd = self.get_owner_window_handle()
+        visible_before = self._visible_top_level_window_handles()
+        self._left_click_point(point)
+        self._paced_wait(
+            "uia_image_viewer_settle_ms_min",
+            "uia_image_viewer_settle_ms_max",
+            500,
+            900,
+        )
+        viewer_hwnd = self._find_opened_image_viewer(main_hwnd, visible_before)
+        if not viewer_hwnd:
+            logger.warning(
+                "[WechatDesktop] image click did not open a strictly "
+                "verified viewer"
+            )
+            self._recover_foreground_after_dependency_failure(
+                "image viewer detection failure",
+                main_hwnd,
+            )
+            return ""
+
+        captured = False
+        viewer_closed = False
+        main_restored = False
+        try:
+            viewer_bounds = tuple(
+                int(value) for value in win32gui.GetWindowRect(viewer_hwnd)
+            )
+            image = ImageGrab.grab(bbox=viewer_bounds, all_screens=True)
+            if image.width >= 2 and image.height >= 2:
+                image.save(target, format="PNG")
+                captured = True
+                logger.info(
+                    "[WechatDesktop] image viewer captured to tmp: %s", target
+                )
+        finally:
+            # The viewer is a separate WeChat top-level window.  Let its UI and
+            # image surface stabilize before touching its own close control.
+            # In particular, never race a just-opened referenced-image viewer
+            # with a global key or a native window-close message.
+            self._paced_wait(
+                "uia_image_viewer_before_close_ms_min",
+                "uia_image_viewer_before_close_ms_max",
+                300,
+                500,
+            )
+            viewer_closed = self._close_image_viewer(viewer_hwnd, main_hwnd)
+            # Qt may keep the closed viewer HWND alive while asynchronously
+            # transferring activation.  Let that transition finish before
+            # bringing the main HWND forward, or Windows can immediately undo
+            # our foreground request.
+            self._paced_wait(
+                "uia_image_viewer_close_settle_ms_min",
+                "uia_image_viewer_close_settle_ms_max",
+                200,
+                400,
+            )
+            if not viewer_closed:
+                logger.warning(
+                    "[WechatDesktop] image viewer remained open: hwnd=%s",
+                    viewer_hwnd,
+                )
+                self._recover_foreground_after_dependency_failure(
+                    "image viewer close failure",
+                    main_hwnd,
+                )
+            else:
+                main_restored = self._restore_main_window_after_viewer(main_hwnd)
+                if not main_restored:
+                    logger.warning(
+                        "[WechatDesktop] main window focus was not restored "
+                        "after image viewer close: hwnd=%s",
+                        main_hwnd,
+                    )
+                    self._recover_foreground_after_dependency_failure(
+                        "image viewer focus restore failure",
+                        main_hwnd,
+                    )
+        return str(target) if captured and viewer_closed and main_restored else ""
+
+    @staticmethod
+    def _reference_image_activation_point(
+        bounds: tuple[int, int, int, int],
+    ) -> tuple[int, int]:
+        """返回扁平引用节点中“引用内容”区域的命中点。
+
+        微信 UIA 将当前消息气泡和引用卡片折叠成单个无子节点的
+        ``ChatTextItemView``。引用卡片位于节点下半部，使用左侧四分之一、
+        高度约四分之三的位置可避开上方当前消息气泡。
+        """
+
+        left, top, right, bottom = (int(value) for value in bounds)
+        return (
+            int(left + (right - left) * 0.25),
+            int(top + (bottom - top) * 0.76),
+        )
+
+    def fetch_referenced_message_image(
+        self,
+        message: UiaChatMessage,
+        tmp_root: Optional[Path] = None,
+    ) -> str:
+        """直接点击当前引用节点的引用区域并截取被引用图片的大图。"""
+
+        reference = message.reference
+        if (
+            reference is None
+            or reference.message_type != "image"
+            or not message.bounds
+        ):
+            return ""
+        target_root = (
+            Path(tmp_root)
+            if tmp_root is not None
+            else Path(__file__).resolve().parents[2] / "tmp" / "wechat_images"
+        )
+        target_root.mkdir(parents=True, exist_ok=True)
+        identity = "\0".join(
+            (
+                str(message.stable_id or message.runtime_id or message.content),
+                str(reference.sender_name),
+                str(reference.content),
+                str(tuple(message.bounds)),
+            )
+        )
+        target = target_root / (
+            hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] + ".png"
+        )
+        try:
+            self.focus_window()
+            with self.operation_lock, self._uia_root() as root:
+                control = self._find_message_control(root, message)
+                click_bounds = _bounds(control) if control is not None else message.bounds
+                if not click_bounds:
+                    return ""
+                point = self._reference_image_activation_point(click_bounds)
+            # Leave the main-window UIA initializer before clicking.  Viewer
+            # discovery creates its own UIA context; nesting the two contexts
+            # while WeChat is creating a top-level viewer can deadlock COM.
+            logger.info(
+                "[WechatDesktop] referenced image activation prepared: "
+                "point=%s bounds=%s",
+                point,
+                click_bounds,
+            )
+            return self._capture_image_viewer_from_point(point, target)
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] referenced image viewer capture failed: %s", exc
+            )
+            return ""
+
     def fetch_message_image(
         self,
         message: UiaChatMessage,
@@ -1866,64 +2139,22 @@ class WechatUiaClient:
         )
         if prefer_viewer and bool(self.config.get("uia_image_viewer_enabled", True)):
             try:
-                import win32gui
-                import win32process
-                from PIL import ImageGrab
-
                 self.focus_window()
                 with self.operation_lock, self._uia_root() as root:
                     control = self._find_message_control(root, message)
-                    control_bounds = _bounds(control) if control is not None else None
-                    click_bounds = control_bounds or message.bounds
+                    click_bounds = self._image_activation_bounds(
+                        control, message.bounds
+                    )
+                    if not click_bounds:
+                        raise RuntimeError("image activation bounds are unavailable")
                     click_left, click_top, click_right, click_bottom = click_bounds
                     point = (
-                        int(click_left + (click_right - click_left) * 0.2),
+                        int((click_left + click_right) / 2),
                         int((click_top + click_bottom) / 2),
                     )
-                    before_hwnd = int(win32gui.GetForegroundWindow() or 0)
-                    self._left_click_point(point)
-                    self._paced_wait(
-                        "uia_image_viewer_settle_ms_min",
-                        "uia_image_viewer_settle_ms_max",
-                        500,
-                        900,
-                    )
-                    after_hwnd = int(win32gui.GetForegroundWindow() or 0)
-                    title = win32gui.GetWindowText(after_hwnd) if after_hwnd else ""
-                    process_id = 0
-                    if after_hwnd:
-                        _, process_id = win32process.GetWindowThreadProcessId(
-                            after_hwnd
-                        )
-                    viewer_opened = bool(
-                        after_hwnd
-                        and after_hwnd != before_hwnd
-                        and int(process_id) in self.allowed_process_ids()
-                    ) or title in {"图片和视频", "Images and Videos"}
-                    if viewer_opened:
-                        try:
-                            viewer_bounds = tuple(
-                                int(value)
-                                for value in win32gui.GetWindowRect(after_hwnd)
-                            )
-                            image = ImageGrab.grab(
-                                bbox=viewer_bounds, all_screens=True
-                            )
-                            if image.width >= 2 and image.height >= 2:
-                                image.save(target, format="PNG")
-                                logger.info(
-                                    "[WechatDesktop] image viewer captured to tmp: %s",
-                                    target,
-                                )
-                                return str(target)
-                        finally:
-                            self._press_escape_key()
-                            self._paced_wait(
-                                "uia_image_viewer_close_settle_ms_min",
-                                "uia_image_viewer_close_settle_ms_max",
-                                200,
-                                400,
-                            )
+                captured = self._capture_image_viewer_from_point(point, target)
+                if captured:
+                    return captured
             except Exception as exc:
                 logger.warning(
                     "[WechatDesktop] image viewer capture failed; using bubble: %s",

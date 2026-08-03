@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -15,6 +16,7 @@ from channel.wechat_desktop.models import WechatDesktopEvent
 @dataclass
 class ReplyQueueItem:
     event: WechatDesktopEvent
+    context_history: list[dict] = field(default_factory=list)
     token: str = field(default_factory=lambda: uuid.uuid4().hex)
     done: threading.Event = field(default_factory=threading.Event)
     terminal: str = ""
@@ -23,6 +25,10 @@ class ReplyQueueItem:
     global_queue_task: bool = True
     source_event_ids: list[str] = field(default_factory=list)
     batch_id: str = ""
+
+    def restore_context(self):
+        """Restore the immutable enqueue-time context onto the consumed event."""
+        self.event.history = deepcopy(self.context_history)
 
 
 @dataclass(frozen=True)
@@ -35,7 +41,7 @@ class QueueEnqueueResult:
 
 
 class WechatReplyQueue:
-    """Append-only global FIFO; queued and active work is never replaced."""
+    """只追加的全局 FIFO；已排队和正在处理的任务不会被新消息替换。"""
 
     _STOP = object()
 
@@ -74,6 +80,7 @@ class WechatReplyQueue:
                 return QueueEnqueueResult(False)
             item = ReplyQueueItem(
                 event=event,
+                context_history=deepcopy(event.history),
                 source_event_ids=source_event_ids,
                 batch_id=str(getattr(event, "_batch_id", "") or event.event_id),
             )
@@ -157,7 +164,7 @@ class WechatReplyQueue:
             }
 
     def clear_pending(self) -> list[str]:
-        """Discard pending work without disturbing the active item."""
+        """清空尚未开始的任务，不打断当前正在处理的回复。"""
         discarded_event_ids: list[str] = []
         with self._lock:
             while True:

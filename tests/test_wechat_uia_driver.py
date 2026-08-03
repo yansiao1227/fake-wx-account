@@ -3,11 +3,16 @@ import time
 import logging
 import queue
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from bridge.context import ContextType
 from channel.wechat_desktop.fifo_queue import WechatReplyQueue
+from channel.wechat_desktop.group_sender_ocr import (
+    OcrTextLine,
+    RapidOcrGroupSenderResolver,
+)
 from channel.wechat_desktop.models import (
     ConversationInfo,
     HeaderInfo,
@@ -25,10 +30,14 @@ from channel.wechat_desktop.uia_driver import (
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
 from channel.wechat_desktop.wechat_desktop_channel import (
     ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+    DEFAULT_CONFIG,
     WechatDesktopChannel,
+    _format_agent_notice,
     _is_network_reply_error,
     _preflight_tool_notice_data,
     _render_event_context_lines,
+    _reply_requirements,
+    _strip_group_bot_mentions,
     _tool_notice_subject,
 )
 from common.log import logger
@@ -465,24 +474,6 @@ def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):
     assert len(popup_calls) == 2
 
 
-def test_message_direction_uses_bubble_child_not_full_width_row():
-    left_bubble = GeometryControl(
-        (120, 120, 360, 180), "hello", "mmui::ChatTextBubble"
-    )
-    left_row = GeometryControl(
-        (100, 100, 900, 200), "hello", "mmui::ChatItemView", [left_bubble]
-    )
-    right_bubble = GeometryControl(
-        (640, 220, 880, 280), "reply", "mmui::ChatTextBubble"
-    )
-    right_row = GeometryControl(
-        (100, 200, 900, 300), "reply", "mmui::ChatItemView", [right_bubble]
-    )
-
-    assert WechatUiaClient._message_direction(left_row, (100, 50, 900, 700))[0] == "incoming"
-    assert WechatUiaClient._message_direction(right_row, (100, 50, 900, 700))[0] == "outgoing"
-
-
 def test_image_bubble_is_captured_to_tmp(monkeypatch, tmp_path):
     from PIL import Image, ImageGrab
 
@@ -509,11 +500,622 @@ def test_image_bubble_is_captured_to_tmp(monkeypatch, tmp_path):
     assert Image.open(image_path).size == (200, 160)
 
 
-def test_message_direction_fails_closed_for_centered_control():
-    centered = GeometryControl(
-        (390, 100, 610, 160), "system", "mmui::ChatItemView"
+def test_image_viewer_close_control_is_found_by_exact_uia_identity():
+    close = GeometryControl((900, 0, 950, 50), "关闭", "mmui::XButton")
+    close.ControlTypeName = "ButtonControl"
+    wrong_class = GeometryControl((850, 0, 900, 50), "关闭", "QWidget")
+    wrong_class.ControlTypeName = "ButtonControl"
+    root = GeometryControl(
+        (0, 0, 1000, 800),
+        "Weixin",
+        "mmui::XView",
+        children=[wrong_class, close],
     )
-    assert WechatUiaClient._message_direction(centered, (100, 50, 900, 700))[0] == "unknown"
+    root.ControlTypeName = "WindowControl"
+
+    assert WechatUiaClient._find_image_viewer_close_control(root) is close
+
+
+def test_image_viewer_uia_close_clicks_when_invoke_is_a_noop(monkeypatch):
+    import sys
+    import win32api
+    import win32gui
+
+    alive = {200: True}
+    calls = []
+
+    class InvokePattern:
+        def Invoke(self):
+            calls.append("invoke")
+
+    class CloseButton(GeometryControl):
+        def GetInvokePattern(self):
+            return InvokePattern()
+
+        def Click(self, **kwargs):
+            calls.append(("click", kwargs))
+            alive[200] = False
+
+    close = CloseButton((900, 0, 950, 50), "关闭", "mmui::XButton")
+    close.ControlTypeName = "ButtonControl"
+    root = GeometryControl(
+        (0, 0, 1000, 800),
+        "Weixin",
+        "mmui::XView",
+        children=[close],
+    )
+
+    @contextmanager
+    def uia_thread():
+        yield
+
+    fake_auto = SimpleNamespace(
+        UIAutomationInitializerInThread=uia_thread,
+        ControlFromHandle=lambda hwnd: root,
+    )
+    ticks = iter([0.0, 1.0])
+    monkeypatch.setitem(sys.modules, "uiautomation", fake_auto)
+    monkeypatch.setattr(win32api, "GetCursorPos", lambda: (10, 20))
+    monkeypatch.setattr(
+        win32api,
+        "SetCursorPos",
+        lambda point: calls.append(("restore", point)),
+    )
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: alive.get(hwnd, False))
+    monkeypatch.setattr(
+        win32gui, "IsWindowVisible", lambda hwnd: alive.get(hwnd, False)
+    )
+    monkeypatch.setattr(
+        "channel.wechat_desktop.uia_client.time.monotonic",
+        lambda: next(ticks),
+    )
+
+    assert WechatUiaClient({})._try_close_image_viewer_with_uia(200) is True
+    assert calls == [
+        "invoke",
+        ("click", {"simulateMove": False, "waitTime": 0.1}),
+        ("restore", (10, 20)),
+    ]
+
+
+def test_image_viewer_uia_close_accepts_hidden_reusable_hwnd(monkeypatch):
+    import sys
+    import win32api
+    import win32gui
+
+    visible = {200: True}
+    calls = []
+
+    class InvokePattern:
+        def Invoke(self):
+            calls.append("invoke")
+            visible[200] = False
+
+    class CloseButton(GeometryControl):
+        def GetInvokePattern(self):
+            return InvokePattern()
+
+        def Click(self, **_kwargs):
+            raise AssertionError("a hidden reusable viewer must not be clicked twice")
+
+    close = CloseButton((900, 0, 950, 50), "关闭", "mmui::XButton")
+    close.ControlTypeName = "ButtonControl"
+    root = GeometryControl(
+        (0, 0, 1000, 800),
+        "Weixin",
+        "mmui::XView",
+        children=[close],
+    )
+
+    @contextmanager
+    def uia_thread():
+        yield
+
+    monkeypatch.setitem(
+        sys.modules,
+        "uiautomation",
+        SimpleNamespace(
+            UIAutomationInitializerInThread=uia_thread,
+            ControlFromHandle=lambda _hwnd: root,
+        ),
+    )
+    monkeypatch.setattr(win32api, "GetCursorPos", lambda: (10, 20))
+    monkeypatch.setattr(
+        win32api,
+        "SetCursorPos",
+        lambda point: calls.append(("restore", point)),
+    )
+    monkeypatch.setattr(win32gui, "IsWindow", lambda _hwnd: True)
+    monkeypatch.setattr(
+        win32gui, "IsWindowVisible", lambda hwnd: visible.get(hwnd, False)
+    )
+
+    assert WechatUiaClient({})._try_close_image_viewer_with_uia(200) is True
+    assert calls == ["invoke", ("restore", (10, 20))]
+
+
+def test_restore_after_viewer_targets_visible_non_minimized_main_window(
+    monkeypatch,
+):
+    import win32con
+    import win32gui
+
+    foreground = {"hwnd": 200}
+    main = {"visible": False, "iconic": True}
+    calls = []
+
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: hwnd in {100, 200})
+    monkeypatch.setattr(
+        win32gui,
+        "IsWindowVisible",
+        lambda hwnd: main["visible"] if hwnd == 100 else True,
+    )
+    monkeypatch.setattr(
+        win32gui, "IsIconic", lambda hwnd: main["iconic"] if hwnd == 100 else False
+    )
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: foreground["hwnd"])
+
+    def show_window(hwnd, command):
+        calls.append(("show", hwnd, command))
+        main.update(visible=True, iconic=False)
+
+    def set_foreground(hwnd):
+        calls.append(("foreground", hwnd))
+        foreground["hwnd"] = hwnd
+
+    monkeypatch.setattr(win32gui, "ShowWindow", show_window)
+    monkeypatch.setattr(
+        win32gui,
+        "BringWindowToTop",
+        lambda hwnd: calls.append(("top", hwnd)),
+    )
+    monkeypatch.setattr(win32gui, "SetForegroundWindow", set_foreground)
+
+    assert WechatUiaClient._restore_main_window_after_viewer(100) is True
+    assert calls == [
+        ("show", 100, win32con.SW_RESTORE),
+        ("top", 100),
+        ("foreground", 100),
+    ]
+
+
+def test_image_viewer_close_rejects_unverified_window(monkeypatch):
+    import win32gui
+
+    client = WechatUiaClient({})
+    posted = []
+    monkeypatch.setattr(client, "_is_image_viewer_window", lambda *_args: False)
+    monkeypatch.setattr(
+        client,
+        "_try_close_image_viewer_with_uia",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("UIA must not touch an unverified window")
+        ),
+    )
+    monkeypatch.setattr(
+        win32gui,
+        "PostMessage",
+        lambda *args: posted.append(args),
+    )
+
+    assert client._close_image_viewer(200, 100) is False
+    assert posted == []
+
+
+def test_image_viewer_native_identity_rejects_main_and_other_process(monkeypatch):
+    import win32gui
+    import win32process
+
+    client = WechatUiaClient({})
+    alive = {100, 200, 300}
+    process_ids = {100: 42, 200: 42, 300: 99}
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: hwnd in alive)
+    monkeypatch.setattr(
+        win32gui,
+        "GetWindowText",
+        lambda hwnd: "图片和视频" if hwnd in {200, 300} else "微信",
+    )
+    monkeypatch.setattr(
+        win32process,
+        "GetWindowThreadProcessId",
+        lambda hwnd: (1, process_ids[hwnd]),
+    )
+
+    assert client._is_image_viewer_window(100, 100) is False
+    assert client._is_image_viewer_window(300, 100) is False
+    assert client._is_image_viewer_window(200, 100) is True
+
+
+def test_dependency_failure_only_reactivates_when_wechat_left_foreground(
+    monkeypatch,
+):
+    client = WechatUiaClient({})
+    calls = []
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(
+        client,
+        "ensure_foreground_window",
+        lambda: calls.append("activate") or True,
+    )
+    monkeypatch.setattr(client, "_window_process_is_foreground", lambda _hwnd: True)
+
+    assert client._recover_foreground_after_dependency_failure("viewer") is False
+    assert calls == []
+
+    monkeypatch.setattr(client, "_window_process_is_foreground", lambda _hwnd: False)
+    assert client._recover_foreground_after_dependency_failure("viewer") is True
+    assert calls == ["activate"]
+
+
+def test_native_dialog_cancel_refuses_main_window_and_uses_exact_cancel_control(
+    monkeypatch,
+):
+    import sys
+    import win32gui
+    import win32process
+
+    client = WechatUiaClient({})
+    calls = []
+
+    class InvokePattern:
+        def Invoke(self):
+            calls.append("cancel")
+
+    cancel = GeometryControl((0, 0, 20, 20), "取消", "Button")
+    cancel.AutomationId = "2"
+    cancel.ControlTypeName = "ButtonControl"
+    cancel.GetInvokePattern = lambda: InvokePattern()
+    root = GeometryControl((0, 0, 200, 200), "另存为", "#32770", [cancel])
+
+    @contextmanager
+    def uia_thread():
+        yield
+
+    monkeypatch.setitem(
+        sys.modules,
+        "uiautomation",
+        SimpleNamespace(
+            UIAutomationInitializerInThread=uia_thread,
+            ControlFromHandle=lambda hwnd: root,
+        ),
+    )
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: hwnd in {100, 200})
+    monkeypatch.setattr(
+        win32gui,
+        "GetClassName",
+        lambda hwnd: "#32770" if hwnd == 200 else "WeChatMainWndForPC",
+    )
+    monkeypatch.setattr(
+        win32process,
+        "GetWindowThreadProcessId",
+        lambda _hwnd: (1, 42),
+    )
+
+    assert client._try_cancel_verified_native_dialog(100, 100) is False
+    assert calls == []
+    assert client._try_cancel_verified_native_dialog(200, 100) is True
+    assert calls == ["cancel"]
+
+
+def test_image_viewer_close_prefers_uia_without_global_keyboard(monkeypatch):
+    import win32gui
+
+    client = WechatUiaClient({})
+    alive = {100: True, 200: True}
+    calls = []
+    monkeypatch.setattr(client, "_is_image_viewer_window", lambda *_args: True)
+
+    def close_with_uia(hwnd):
+        calls.append(("uia", hwnd))
+        alive[hwnd] = False
+        return True
+
+    monkeypatch.setattr(client, "_try_close_image_viewer_with_uia", close_with_uia)
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: alive.get(hwnd, False))
+    monkeypatch.setattr(
+        win32gui,
+        "PostMessage",
+        lambda *args: calls.append(("wm_close", *args)),
+    )
+    monkeypatch.setattr(
+        client,
+        "_press_escape_key",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("image viewer must never use global Escape")
+        ),
+    )
+
+    assert client._close_image_viewer(200, 100) is True
+    assert calls == [("uia", 200)]
+
+
+def test_image_viewer_close_never_falls_back_to_native_window_close(monkeypatch):
+    import win32gui
+
+    client = WechatUiaClient({})
+    alive = {100: True, 200: True}
+    posted = []
+    monkeypatch.setattr(client, "_is_image_viewer_window", lambda *_args: True)
+    monkeypatch.setattr(client, "_try_close_image_viewer_with_uia", lambda *_args: False)
+    monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: alive.get(hwnd, False))
+
+    monkeypatch.setattr(
+        win32gui,
+        "PostMessage",
+        lambda *args: posted.append(args),
+    )
+
+    assert client._close_image_viewer(200, 100) is False
+    assert alive == {100: True, 200: True}
+    assert posted == []
+
+
+def test_opened_image_viewer_requires_new_window_and_exact_uia_identity(monkeypatch):
+    import win32gui
+
+    client = WechatUiaClient({})
+    visible = {100, 200, 300}
+    in_enum_callback = False
+
+    def enum_windows(callback, param):
+        nonlocal in_enum_callback
+        for hwnd in sorted(visible):
+            in_enum_callback = True
+            try:
+                callback(hwnd, param)
+            finally:
+                in_enum_callback = False
+
+    monkeypatch.setattr(win32gui, "EnumWindows", enum_windows)
+    monkeypatch.setattr(win32gui, "IsWindowVisible", lambda hwnd: hwnd in visible)
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 200)
+    monkeypatch.setattr(
+        client,
+        "_is_image_viewer_window",
+        lambda hwnd, main_hwnd: hwnd in {200, 300} and main_hwnd == 100,
+    )
+    monkeypatch.setattr(
+        client,
+        "_has_image_viewer_close_control",
+        lambda hwnd: (
+            (_ for _ in ()).throw(
+                AssertionError("viewer UIA must run after EnumWindows returns")
+            )
+            if in_enum_callback
+            else hwnd == 200
+        ),
+    )
+
+    assert client._find_opened_image_viewer(100, {100, 300}) == 200
+
+
+def test_opened_image_viewer_does_not_accept_same_process_popup(monkeypatch):
+    import win32gui
+
+    client = WechatUiaClient({})
+
+    def enum_windows(callback, param):
+        callback(100, param)
+        callback(200, param)
+
+    monkeypatch.setattr(win32gui, "EnumWindows", enum_windows)
+    monkeypatch.setattr(win32gui, "IsWindowVisible", lambda _hwnd: True)
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 200)
+    monkeypatch.setattr(
+        client,
+        "_is_image_viewer_window",
+        lambda _hwnd, _main_hwnd: False,
+    )
+    monkeypatch.setattr(
+        client,
+        "_has_image_viewer_close_control",
+        lambda _hwnd: (_ for _ in ()).throw(
+            AssertionError("non-viewer popup must not be inspected or closed")
+        ),
+    )
+
+    assert client._find_opened_image_viewer(100, {100}) == 0
+
+
+def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp_path):
+    import win32gui
+    from PIL import Image, ImageGrab
+
+    client = WechatUiaClient({"uia_image_viewer_enabled": True})
+    message = UiaChatMessage(
+        "Alice",
+        "图片",
+        message_type="image",
+        runtime_id="image-1",
+        bounds=(100, 100, 300, 260),
+    )
+    control = GeometryControl(
+        (100, 100, 300, 260),
+        "图片",
+        "mmui::ChatImageItemView",
+    )
+    calls = []
+
+    @contextmanager
+    def fake_root():
+        yield object()
+
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_find_message_control", lambda *_args: control)
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(
+        client,
+        "_visible_top_level_window_handles",
+        lambda: {100},
+    )
+    monkeypatch.setattr(
+        client,
+        "_left_click_point",
+        lambda _point: calls.append("click_image"),
+    )
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(
+        client,
+        "_find_opened_image_viewer",
+        lambda main_hwnd, before: calls.append(
+            ("verify_viewer", main_hwnd, before)
+        )
+        or 200,
+    )
+    monkeypatch.setattr(win32gui, "GetWindowRect", lambda hwnd: (0, 0, 800, 600))
+    monkeypatch.setattr(
+        ImageGrab,
+        "grab",
+        lambda *, bbox, all_screens: calls.append(("grab", bbox, all_screens))
+        or Image.new("RGB", (800, 600), "red"),
+    )
+    monkeypatch.setattr(
+        client,
+        "_close_image_viewer",
+        lambda viewer_hwnd, main_hwnd: calls.append(
+            ("close_viewer", viewer_hwnd, main_hwnd)
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        client,
+        "_restore_main_window_after_viewer",
+        lambda main_hwnd: calls.append(("restore_main", main_hwnd)) or True,
+    )
+    monkeypatch.setattr(
+        client,
+        "_press_escape_key",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("viewer flow must never send global Escape")
+        ),
+    )
+    monkeypatch.setattr(
+        win32gui,
+        "PostMessage",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("viewer flow must never send WM_CLOSE")
+        ),
+    )
+
+    image_path = client.fetch_message_image(message, tmp_path)
+
+    assert Path(image_path).is_file()
+    assert calls == [
+        "click_image",
+        ("verify_viewer", 100, {100}),
+        ("grab", (0, 0, 800, 600), True),
+        ("close_viewer", 200, 100),
+        ("restore_main", 100),
+    ]
+
+
+def test_image_viewer_waits_for_configured_stability_before_close(
+    monkeypatch, tmp_path
+):
+    import win32gui
+    from PIL import Image, ImageGrab
+
+    client = WechatUiaClient(
+        {
+            "uia_image_viewer_before_close_ms_min": 420,
+            "uia_image_viewer_before_close_ms_max": 420,
+        }
+    )
+    target = tmp_path / "viewer.png"
+    calls = []
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
+    monkeypatch.setattr(client, "_left_click_point", lambda _point: None)
+
+    def paced_wait(minimum_key, maximum_key, default_minimum, default_maximum):
+        if minimum_key == "uia_image_viewer_before_close_ms_min":
+            calls.append(
+                (
+                    "before_close_wait",
+                    client.config[minimum_key],
+                    client.config[maximum_key],
+                    default_minimum,
+                    default_maximum,
+                )
+            )
+
+    monkeypatch.setattr(client, "_paced_wait", paced_wait)
+    monkeypatch.setattr(client, "_find_opened_image_viewer", lambda *_args: 200)
+    monkeypatch.setattr(win32gui, "GetWindowRect", lambda _hwnd: (0, 0, 800, 600))
+    monkeypatch.setattr(
+        ImageGrab,
+        "grab",
+        lambda **_kwargs: Image.new("RGB", (800, 600), "red"),
+    )
+    monkeypatch.setattr(
+        client,
+        "_close_image_viewer",
+        lambda *_args: calls.append("close") or True,
+    )
+    monkeypatch.setattr(client, "_restore_main_window_after_viewer", lambda _hwnd: True)
+
+    assert client._capture_image_viewer_from_point((100, 200), target) == str(target)
+    assert calls == [("before_close_wait", 420, 420, 300, 500), "close"]
+
+
+def test_image_viewer_capture_is_not_successful_until_viewer_closes(
+    monkeypatch, tmp_path
+):
+    import win32gui
+    from PIL import Image, ImageGrab
+
+    client = WechatUiaClient({})
+    target = tmp_path / "viewer.png"
+    calls = []
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
+    monkeypatch.setattr(client, "_left_click_point", lambda point: calls.append(point))
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(client, "_find_opened_image_viewer", lambda *_args: 200)
+    monkeypatch.setattr(win32gui, "GetWindowRect", lambda _hwnd: (0, 0, 800, 600))
+    monkeypatch.setattr(
+        ImageGrab,
+        "grab",
+        lambda **_kwargs: Image.new("RGB", (800, 600), "red"),
+    )
+    monkeypatch.setattr(client, "_close_image_viewer", lambda *_args: False)
+    monkeypatch.setattr(
+        client,
+        "_restore_main_window_after_viewer",
+        lambda _hwnd: (_ for _ in ()).throw(
+            AssertionError("main restore must wait for viewer close")
+        ),
+    )
+
+    result = client._capture_image_viewer_from_point((100, 200), target)
+
+    assert result == ""
+    assert target.is_file()
+    assert calls == [(100, 200)]
+
+
+def test_image_activation_prefers_image_anchor_over_full_message_row():
+    image = GeometryControl(
+        (600, 120, 820, 280),
+        "图片",
+        "mmui::ChatImageItemView",
+    )
+    row = GeometryControl(
+        (100, 100, 900, 300),
+        "图片",
+        "mmui::ChatItemView",
+        children=[image],
+    )
+
+    bounds = WechatUiaClient._image_activation_bounds(
+        row, (600, 120, 820, 280)
+    )
+    point = ((bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2)
+
+    assert bounds == (600, 120, 820, 280)
+    assert 600 <= point[0] <= 820
+    assert 120 <= point[1] <= 280
 
 
 def test_file_message_type_prefers_uia_control_class_over_suffix():
@@ -607,7 +1209,7 @@ def test_reference_attachment_is_added_to_event_without_changing_current_type():
     assert event.reference["file_path"] == "C:/tmp/reference.png"
 
 
-def test_reference_context_renderer_labels_only_the_original_message():
+def test_reference_context_renderer_uses_reference_and_ignores_history():
     event = WechatDesktopEvent(
         "message",
         "session",
@@ -618,10 +1220,9 @@ def test_reference_context_renderer_labels_only_the_original_message():
         "当前问题",
         history=[
             {
-                "sender_name": "Alice",
-                "content": "完整原文",
+                "sender_name": "Bob",
+                "content": "与引用无关的会话历史",
                 "content_type": "text",
-                "is_reference": True,
             }
         ],
         reference={
@@ -634,9 +1235,271 @@ def test_reference_context_renderer_labels_only_the_original_message():
 
     heading, lines = _render_event_context_lines(event)
 
-    assert heading == "[被引用的原消息，仅追溯这一层]"
+    assert heading == "[被引用的内容]"
     assert lines == ["Alice: 完整原文"]
     assert "当前问题" not in "\n".join(lines)
+    assert "与引用无关的会话历史" not in "\n".join(lines)
+
+
+def test_reply_requirements_separate_reference_and_regular_context_rules():
+    reference_event = WechatDesktopEvent(
+        "message",
+        "session",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "当前问题",
+        reference={"content": "完整原文", "content_type": "text"},
+    )
+    regular_event = replace(reference_event, reference={})
+
+    reference_requirements = _reply_requirements(reference_event)
+    regular_requirements = _reply_requirements(regular_event)
+
+    assert "只根据“被引用的内容”和“需要回复的引用消息”作答" in reference_requirements
+    assert "引用之外的会话上下文" in reference_requirements
+    assert "语义关联度" not in reference_requirements
+    assert "只保留并使用关联度高" in regular_requirements
+    assert "关联度低、已结束或属于其他话题的内容直接忽略" in regular_requirements
+
+
+def test_group_prompt_rule_requires_explicit_member_mention():
+    event = WechatDesktopEvent(
+        "message",
+        "group",
+        "项目群",
+        "alice",
+        "Alice",
+        "text",
+        "李四怎么看",
+        is_group=True,
+    )
+
+    requirements = _reply_requirements(event)
+
+    assert "只有待回复消息明确使用“@成员”时" in requirements
+    assert "没有 @ 时，不要仅因正文出现成员姓名就作此推断" in requirements
+
+
+def test_group_bot_mention_is_removed_without_touching_other_members():
+    content = "@颜料盒bot\u2005请看一下，@李四 也确认下；颜料盒bot 是正文"
+
+    cleaned = _strip_group_bot_mentions(content, ["颜料盒bot"])
+
+    assert cleaned == "请看一下，@李四 也确认下；颜料盒bot 是正文"
+
+
+def test_regular_context_renderer_marks_history_as_filterable_candidates():
+    event = WechatDesktopEvent(
+        "message",
+        "session",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "继续聊部署",
+        history=[{"content": "昨天讨论部署"}, {"content": "午饭吃什么"}],
+    )
+
+    heading, lines = _render_event_context_lines(event)
+
+    assert heading == "[候选会话上下文，需按关联度筛选]"
+    assert lines == ["历史消息: 昨天讨论部署", "历史消息: 午饭吃什么"]
+
+
+def test_dispatch_reference_prompt_excludes_unrelated_history():
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+
+    def compose_context(ctype, content, **kwargs):
+        captured.update(ctype=ctype, content=content, kwargs=kwargs)
+        return None
+
+    channel._compose_context = compose_context
+    event = WechatDesktopEvent(
+        "message",
+        "session",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "这句话是什么意思？",
+        history=[{"content": "无关的早餐话题"}],
+        reference={
+            "sender_name": "Bob",
+            "content": "今晚发布",
+            "content_type": "text",
+        },
+    )
+
+    assert channel._dispatch_message(event) is False
+
+    prompt = captured["content"]
+    assert "[被引用的内容]" in prompt
+    assert "Bob: 今晚发布" in prompt
+    assert "[需要回复的引用消息]" in prompt
+    assert "这句话是什么意思？" in prompt
+    assert "无关的早餐话题" not in prompt
+    assert "[候选会话上下文" not in prompt
+
+
+def test_dispatch_regular_prompt_requests_context_relevance_filtering():
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+
+    def compose_context(ctype, content, **kwargs):
+        captured.update(ctype=ctype, content=content, kwargs=kwargs)
+        return None
+
+    channel._compose_context = compose_context
+    event = WechatDesktopEvent(
+        "message",
+        "session",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "部署时间定了吗？",
+        history=[{"content": "今晚发布"}, {"content": "中午吃面"}],
+    )
+
+    assert channel._dispatch_message(event) is False
+
+    prompt = captured["content"]
+    assert "[候选会话上下文，需按关联度筛选]" in prompt
+    assert "今晚发布" in prompt
+    assert "中午吃面" in prompt
+    assert "只保留并使用关联度高" in prompt
+    assert "关联度低、已结束或属于其他话题的内容直接忽略" in prompt
+
+
+def test_dispatch_group_prompt_removes_bot_mention_before_agent():
+    channel = _bare_wechat_channel()
+    channel.config = {"self_display_name": ""}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+
+    def compose_context(ctype, content, **kwargs):
+        captured.update(ctype=ctype, content=content, kwargs=kwargs)
+        return None
+
+    channel._compose_context = compose_context
+    event = WechatDesktopEvent(
+        "message",
+        "group",
+        "项目群",
+        "alice",
+        "Alice",
+        "text",
+        "@颜料盒bot\u2005李四怎么看？ @王五 也说一下",
+        is_group=True,
+        is_at=True,
+    )
+
+    assert channel._dispatch_message(event) is False
+
+    prompt = captured["content"]
+    assert "@颜料盒bot" not in prompt
+    assert "李四怎么看？" in prompt
+    assert "@王五 也说一下" in prompt
+    assert "只有待回复消息明确使用“@成员”时" in prompt
+
+
+def test_referenced_image_clicks_quote_region_without_locating_original(monkeypatch):
+    client = WechatUiaClient({})
+    calls = []
+    root_active = False
+    reference_node = GeometryControl(
+        (792, 483, 1632, 611),
+        "这张图引用 颜料盒 的消息 : 图片",
+        "mmui::ChatTextItemView",
+    )
+    root = GeometryControl((0, 0, 1800, 1000), children=[reference_node])
+    quoted = UiaChatMessage(
+        "Alice",
+        "这张图",
+        message_type="text",
+        runtime_id="42.198746.4.-2147467003",
+        bounds=(792, 483, 1632, 611),
+        reference=UiaReferencedMessage(
+            sender_name="颜料盒",
+            content="图片",
+            message_type="image",
+        ),
+    )
+
+    @contextmanager
+    def fake_root():
+        nonlocal root_active
+        root_active = True
+        try:
+            yield root
+        finally:
+            root_active = False
+
+    def capture(point, _target):
+        assert root_active is False
+        calls.append(point)
+        return "C:/tmp/quoted-viewer.png"
+
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(
+        client,
+        "_capture_image_viewer_from_point",
+        capture,
+    )
+    monkeypatch.setattr(
+        client,
+        "resolve_message_reference",
+        lambda _message: (_ for _ in ()).throw(
+            AssertionError("image references must not locate the original")
+        ),
+    )
+
+    image_path = client.fetch_referenced_message_image(quoted)
+
+    assert image_path == "C:/tmp/quoted-viewer.png"
+    assert calls == [(1002, 580)]
+
+
+def test_missing_locate_original_menu_never_sends_global_escape(monkeypatch):
+    client = WechatUiaClient({})
+    quoted = UiaChatMessage(
+        "Alice",
+        "看看这个",
+        message_type="text",
+        bounds=(100, 500, 500, 650),
+        reference=UiaReferencedMessage(
+            sender_name="Bob",
+            content="report.pdf",
+            message_type="file",
+        ),
+    )
+
+    @contextmanager
+    def fake_root():
+        yield object()
+
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_right_click_point", lambda _point: None)
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(client, "_find_desktop_control", lambda *_args: None)
+    monkeypatch.setattr(
+        client,
+        "_press_escape_key",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("missing reference menu must not send global Escape")
+        ),
+    )
+
+    assert client.resolve_message_reference(quoted) is quoted
 
 
 def test_reply_target_image_requests_viewer_quality_capture():
@@ -798,104 +1661,190 @@ def test_downloaded_file_event_becomes_file_context(tmp_path):
     assert message.content == str(attachment)
 
 
-def test_message_sender_uses_geometry_direction_for_self_and_private_peer():
+def test_message_sender_uses_ocr_direction_for_self_and_private_peer():
     owner = "当前账号"
+    client = WechatUiaClient({"self_display_name": owner})
     header = HeaderInfo("颜料盒", "private", 1)
-    incoming_bubble = GeometryControl(
-        (120, 120, 360, 180), "对方消息", "mmui::ChatTextBubble"
-    )
-    incoming_row = GeometryControl(
-        (100, 100, 900, 200),
-        "对方消息",
-        "mmui::ChatTextItemView",
-        [incoming_bubble],
-    )
-    outgoing_bubble = GeometryControl(
-        (640, 220, 880, 280), "自己的消息", "mmui::ChatTextBubble"
-    )
-    outgoing_row = GeometryControl(
-        (100, 200, 900, 300),
-        "自己的消息",
-        "mmui::ChatTextItemView",
-        [outgoing_bubble],
-    )
-    list_bounds = (100, 50, 900, 700)
-
-    incoming_direction = WechatUiaClient._message_direction(
-        incoming_row, list_bounds
-    )[0]
-    outgoing_direction = WechatUiaClient._message_direction(
-        outgoing_row, list_bounds
-    )[0]
-
-    assert incoming_direction == "incoming"
-    assert WechatUiaClient._message_sender(
-        header, incoming_row, "对方消息"
+    assert client._message_sender(
+        header, None, "对方消息", "incoming"
     ) == "颜料盒"
-    assert outgoing_direction == "outgoing"
-    assert WechatUiaClient._message_sender(
-        header, outgoing_row, "自己的消息"
-    ) == "颜料盒"
+    assert client._message_sender(
+        header, None, "自己的消息", "outgoing"
+    ) == owner
+    assert client._message_sender(
+        header, None, "方向未知", "unknown"
+    ) == "unknown"
 
 
-def test_message_sender_reads_group_member_without_direction():
+def test_group_message_sender_is_deferred_to_rapidocr():
     member = GeometryControl((130, 100, 220, 120), "群成员甲", "Text")
     bubble = GeometryControl((120, 130, 420, 190), "群消息", "ChatTextBubble")
     row = GeometryControl(
         (100, 90, 900, 210), "群消息", "mmui::ChatTextItemView", [member, bubble]
     )
 
-    assert WechatUiaClient._message_sender(
-        HeaderInfo("测试群", "group", 3), row, "群消息"
-    ) == "群成员甲"
-
-
-def test_history_member_filter_selects_unique_self_candidate():
-    assert WechatUiaClient._choose_self_member([["我发送的消息"]], []) == 0
-
-
-def test_history_message_content_removes_full_or_time_only_suffix():
-    assert WechatUiaClient._history_message_content(
-        "正文 2026年7月28日 12:36"
-    ) == "正文"
-    assert WechatUiaClient._history_message_content(
-        "[smoke] 2026-07-28 12:36:31 +0800 12:36"
-    ) == "[smoke] 2026-07-28 12:36:31 +0800"
-
-
-def test_history_member_filter_uses_known_outgoing_anchor_for_same_name():
-    histories = [["另一个同名成员的消息"], ["CowAgent 已发送的回复"]]
-    assert WechatUiaClient._choose_self_member(
-        histories, ["CowAgent 已发送的回复"]
-    ) == 1
-    assert WechatUiaClient._choose_self_member(histories, []) is None
-
-
-def test_history_direction_resolution_fails_closed_for_duplicate_content():
-    messages = [
-        UiaChatMessage("", "仅对方发送", direction="unknown", runtime_id="1"),
-        UiaChatMessage("", "仅自己发送", direction="unknown", runtime_id="2"),
-        UiaChatMessage("", "双方相同正文", direction="unknown", runtime_id="3"),
-        UiaChatMessage("", "双方相同正文", direction="unknown", runtime_id="4"),
-    ]
-    resolved = WechatUiaClient._apply_self_history_directions(
-        messages, ["仅自己发送", "双方相同正文"]
+    assert (
+        WechatUiaClient({})._message_sender(
+            HeaderInfo("测试群", "group", 3), row, "群消息", "incoming"
+        )
+        == "unknown"
     )
 
-    assert [item.direction for item in resolved] == [
-        "incoming",
-        "outgoing",
-        "unknown",
-        "unknown",
-    ]
 
-
-def test_history_direction_resolution_fails_closed_for_empty_filter_result():
+def test_private_sender_names_are_derived_only_from_direction():
+    client = WechatUiaClient({"self_display_name": "颜料盒bot"})
     messages = [
-        UiaChatMessage("", "无法确认方向", direction="unknown", runtime_id="1")
+        UiaChatMessage("错误用户名", "收到", direction="incoming"),
+        UiaChatMessage("", "发出", direction="outgoing"),
+        UiaChatMessage("对方", "无法判断", direction="unknown"),
     ]
 
-    assert WechatUiaClient._apply_self_history_directions(messages, []) == messages
+    normalized = client._normalize_private_senders(
+        HeaderInfo("曹博淳", "private", 1), messages
+    )
+
+    assert [message.sender_name for message in normalized] == [
+        "曹博淳",
+        "颜料盒bot",
+        "unknown",
+    ]
+
+
+def test_nested_group_member_uia_metadata_is_not_used_before_ocr():
+    member = GeometryControl(
+        (130, 100, 220, 120),
+        "群成员乙",
+        "mmui::ChatSenderNameLabel",
+    )
+    wrapper = GeometryControl((120, 90, 430, 200), "", "Wrapper", [member])
+    row_control = GeometryControl(
+        (100, 80, 900, 220),
+        "群消息",
+        "mmui::ChatTextItemView",
+        [wrapper],
+    )
+
+    assert (
+        WechatUiaClient({})._message_sender(
+            HeaderInfo("测试群", "group", 3),
+            row_control,
+            "群消息",
+            "incoming",
+        )
+        == "unknown"
+    )
+
+
+def test_rapidocr_matches_group_body_then_name_above_it():
+    resolver = RapidOcrGroupSenderResolver({})
+    message = UiaChatMessage(
+        "",
+        "请确认今晚部署",
+        message_type="text",
+        direction="incoming",
+        bounds=(100, 90, 500, 190),
+    )
+    lines = [
+        OcrTextLine("成员甲", 0.96, (140, 100, 200, 120)),
+        OcrTextLine("请确认今晚部署", 0.99, (140, 132, 300, 156)),
+        OcrTextLine("12:30", 0.99, (400, 60, 450, 80)),
+    ]
+
+    resolved = resolver.assign_senders([message], lines)
+
+    assert resolved[0].sender_name == "成员甲"
+
+
+def test_rapidocr_does_not_guess_between_ambiguous_sender_labels():
+    resolver = RapidOcrGroupSenderResolver({})
+    message = UiaChatMessage(
+        "",
+        "请确认今晚部署",
+        message_type="text",
+        direction="incoming",
+        bounds=(100, 90, 500, 190),
+    )
+    lines = [
+        OcrTextLine("成员甲", 0.95, (140, 101, 200, 121)),
+        OcrTextLine("成员乙", 0.94, (141, 100, 201, 120)),
+        OcrTextLine("请确认今晚部署", 0.99, (140, 132, 300, 156)),
+    ]
+
+    resolved = resolver.assign_senders([message], lines)
+
+    assert resolved[0].sender_name == "unknown"
+
+
+def test_rapidocr_falls_back_to_text_when_uia_bounds_use_another_dpi_scale():
+    resolver = RapidOcrGroupSenderResolver({})
+    message = UiaChatMessage(
+        "",
+        "我只是觉得好笑哈哈哈哈",
+        message_type="text",
+        direction="unknown",
+        # Deliberately model UIA physical pixels while OCR uses logical pixels.
+        bounds=(690, 450, 1010, 510),
+    )
+    lines = [
+        OcrTextLine("杨昊", 0.985, (460, 270, 497, 292)),
+        OcrTextLine("我只是觉得好笑哈哈哈哈", 1.0, (475, 308, 674, 331)),
+    ]
+
+    resolved = resolver.assign_senders(
+        [message], lines, pane_bounds=(375, 100, 1095, 647)
+    )
+
+    assert resolved[0].sender_name == "杨昊"
+    assert resolved[0].direction == "incoming"
+
+
+def test_rapidocr_uses_body_side_to_resolve_outgoing_direction():
+    resolver = RapidOcrGroupSenderResolver({})
+    message = UiaChatMessage(
+        "",
+        "这是机器人发出的消息",
+        message_type="text",
+        direction="unknown",
+        bounds=(100, 100, 900, 180),
+    )
+    lines = [
+        OcrTextLine("这是机器人发出的消息", 0.99, (790, 120, 970, 145)),
+    ]
+
+    resolved = resolver.assign_senders(
+        [message], lines, pane_bounds=(375, 100, 1095, 647)
+    )
+
+    assert resolved[0].sender_name == "自己"
+    assert resolved[0].direction == "outgoing"
+
+
+def test_rapidocr_output_uses_official_boxes_txts_scores_api():
+    output = SimpleNamespace(
+        boxes=[[[1, 2], [11, 2], [11, 8], [1, 8]]],
+        txts=("成员甲",),
+        scores=(0.98,),
+    )
+
+    lines = RapidOcrGroupSenderResolver._output_lines(output, (100, 200))
+
+    assert lines == [OcrTextLine("成员甲", 0.98, (101, 202, 111, 208))]
+
+
+def test_group_sender_name_survives_flattened_followup_snapshot():
+    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
+    first = driver._stabilize_messages(
+        "group",
+        [UiaChatMessage("成员甲", "同一条消息", runtime_id="runtime-1")],
+    )
+    second = driver._stabilize_messages(
+        "group",
+        [UiaChatMessage("unknown", "同一条消息", runtime_id="runtime-1")],
+    )
+
+    assert first[0].sender_name == "成员甲"
+    assert second[0].sender_name == "成员甲"
+    assert second[0].stable_id == first[0].stable_id
 
 
 def _selection_tree(active_title, messages, row):
@@ -980,8 +1929,6 @@ class FakeClient:
         self.focus_calls = 0
         self.owner_calls = 0
         self.seeded_outgoing = {}
-        self.direction_resolution_calls = []
-        self.resolved_histories = {}
         self.file_paths = {}
         self.file_fetches = []
         self.image_paths = {}
@@ -1043,10 +1990,6 @@ class FakeClient:
 
     def seed_outgoing_texts(self, conversation, texts):
         self.seeded_outgoing[conversation] = list(texts)
-
-    def resolve_group_message_directions(self, conversation, messages, owner):
-        self.direction_resolution_calls.append((conversation, owner))
-        return list(self.resolved_histories.get(conversation, messages))
 
     def send_message(self, who, text, runtime_id="", row_index=-1):
         return {"success": True, "verified": True}
@@ -1617,6 +2560,35 @@ def test_reply_queue_appends_pending_target_from_same_conversation():
     assert reply_queue.get().event is new
 
 
+def test_reply_queue_captures_enqueue_time_context_independently():
+    reply_queue = WechatReplyQueue()
+    event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "待回复消息",
+        history=[{"content": "入队时的上文", "content_type": "text"}],
+    )
+
+    assert reply_queue.enqueue(event)
+    event.history[0]["content"] = "入队后被修改"
+    event.history.append({"content": "消费前出现的新消息"})
+
+    item = reply_queue.get()
+
+    assert item.context_history == [
+        {"content": "入队时的上文", "content_type": "text"}
+    ]
+    item.restore_context()
+    assert item.event.content == "待回复消息"
+    assert item.event.history == [
+        {"content": "入队时的上文", "content_type": "text"}
+    ]
+
+
 def test_reply_queue_private_followup_does_not_expire_active():
     reply_queue = WechatReplyQueue()
     old = WechatDesktopEvent(
@@ -1867,6 +2839,27 @@ def test_tool_notice_subject_recognizes_skill_reads_and_regular_tools():
     ) == ("tool", "web_search")
 
 
+def test_tool_notice_templates_always_output_the_concrete_tool_name():
+    assert all(
+        "{tool_name}" in template
+        for template in DEFAULT_CONFIG["agent_tool_notice_templates"]
+    )
+    assert (
+        _format_agent_notice(
+            ["我准备调用 `{tool_name}` tool"], "tool", "web_search"
+        )
+        == "我准备调用 `web_search` tool"
+    )
+    assert (
+        _format_agent_notice(["我正在使用工具，请稍等"], "tool", "vision")
+        == "我正在使用工具，请稍等 当前工具：`vision`。"
+    )
+    assert (
+        _format_agent_notice(["调用 `{name}` skill"], "skill", "pdf-reader")
+        == "调用 `pdf-reader` skill"
+    )
+
+
 def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     docx_event = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "file", r"C:\tmp\LDAP.docx"
@@ -1901,6 +2894,16 @@ def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
         "inspect",
         reference={"content_type": "file"},
     )
+    pdf_reference = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "inspect",
+        reference={"content_type": "file", "file_path": r"C:\tmp\quoted.pdf"},
+    )
     text_event = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "hello"
     )
@@ -1912,12 +2915,11 @@ def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     assert _tool_notice_subject(
         _preflight_tool_notice_data(image_reference_event)
     ) == ("tool", "vision")
+    assert _preflight_tool_notice_data(unresolved_image_reference) is None
+    assert _preflight_tool_notice_data(unresolved_file_reference) is None
     assert _tool_notice_subject(
-        _preflight_tool_notice_data(unresolved_image_reference)
-    ) == ("tool", "vision")
-    assert _tool_notice_subject(
-        _preflight_tool_notice_data(unresolved_file_reference)
-    ) == ("tool", "file-reader")
+        _preflight_tool_notice_data(pdf_reference)
+    ) == ("skill", "pdf-reader")
     assert _preflight_tool_notice_data(text_event) is None
 
 
@@ -2618,6 +3620,52 @@ def test_reply_consumer_bypasses_agent_for_reference_prompt():
     assert "agent_done" not in stages
 
 
+def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
+    channel = _bare_wechat_channel()
+    channel._stop_event = threading.Event()
+    channel._reply_queue = WechatReplyQueue()
+    event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "待回复消息",
+        history=[{"content": "入队时的上文", "content_type": "text"}],
+    )
+    assert channel._reply_queue.enqueue(event)
+    event.history = [{"content": "消费时错误找回的上文"}]
+    original_finish = channel._reply_queue.finish
+
+    def finish(item, terminal):
+        original_finish(item, terminal)
+        channel._stop_event.set()
+
+    channel._reply_queue.finish = finish
+    dispatched_history = []
+    channel._service = SimpleNamespace(update_status=lambda **_kwargs: None)
+    channel._store = SimpleNamespace(
+        mark_event_processed=lambda _event_id: None,
+        audit=lambda *_args, **_kwargs: None,
+    )
+    channel._driver = SimpleNamespace(end_reply_cycle=lambda: None)
+    channel._mark_lifecycle = lambda *_args, **_kwargs: None
+    channel._finish_lifecycle = lambda *_args, **_kwargs: None
+
+    def dispatch(dispatched_event, _token):
+        dispatched_history.extend(dispatched_event.history)
+        return False
+
+    channel._dispatch_message = dispatch
+
+    channel._consume_reply_queue()
+
+    assert dispatched_history == [
+        {"content": "入队时的上文", "content_type": "text"}
+    ]
+
+
 def test_attachment_path_cache_avoids_second_image_capture(tmp_path):
     local_image = tmp_path / "cached.png"
     local_image.write_bytes(b"png")
@@ -2726,6 +3774,152 @@ def test_cached_file_is_reused_by_quoted_filename(tmp_path):
     assert resolved.reference.resolved is True
     assert second_count == 0
     assert client.file_fetches == ["文件\nreport.pdf\n8 KB"]
+
+
+def test_text_reference_uses_uia_preview_without_locating_original():
+    client = FakeClient()
+    client.resolve_message_reference = lambda _message: (_ for _ in ()).throw(
+        AssertionError("text reference must not locate original")
+    )
+    client.fetch_referenced_message_image = lambda _message: (
+        _ for _ in ()
+    ).throw(AssertionError("text reference must not open image viewer"))
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    quoted = UiaChatMessage(
+        "Alice",
+        "你怎么看",
+        message_type="text",
+        runtime_id="quote-text-1",
+        reference=UiaReferencedMessage(
+            sender_name="Bob",
+            content="这是被引用的文本预览",
+            message_type="text",
+        ),
+    )
+
+    resolved, resolve_count = driver._resolve_reply_target_message(
+        "conversation", quoted
+    )
+
+    assert resolve_count == 0
+    assert resolved.reference.content == "这是被引用的文本预览"
+    assert resolved.reference.resolved is True
+    assert resolved.reference.strategy == "uia_reference_preview"
+
+
+def test_image_reference_opens_current_quote_region_without_locating_original(
+    tmp_path,
+):
+    image_path = tmp_path / "quoted.png"
+    image_path.write_bytes(b"png")
+    client = FakeClient()
+    calls = []
+    client.fetch_referenced_message_image = lambda message: calls.append(
+        ("viewer", message.content)
+    ) or str(image_path)
+    client.resolve_message_reference = lambda _message: (_ for _ in ()).throw(
+        AssertionError("image reference must not locate original")
+    )
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    quoted = UiaChatMessage(
+        "Alice",
+        "这张图",
+        message_type="text",
+        runtime_id="quote-image-1",
+        reference=UiaReferencedMessage(
+            sender_name="Bob",
+            content="图片",
+            message_type="image",
+        ),
+    )
+
+    resolved, resolve_count = driver._resolve_reply_target_message(
+        "conversation", quoted
+    )
+
+    assert calls == [("viewer", "这张图")]
+    assert resolve_count == 1
+    assert resolved.reference.file_path == str(image_path)
+    assert resolved.reference.resolved is True
+    assert resolved.reference.strategy == "wechat_reference_image_viewer"
+
+
+def test_file_reference_uses_prefix_cache_before_locating_original(tmp_path):
+    cached_file = tmp_path / "report(1).pdf"
+    cached_file.write_bytes(b"%PDF")
+    client = FakeClient()
+    client.resolve_message_reference = lambda _message: (_ for _ in ()).throw(
+        AssertionError("prefix cache hit must not locate original")
+    )
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    driver._remember_file_by_name(
+        "conversation", "report(1).pdf", str(cached_file)
+    )
+    quoted = UiaChatMessage(
+        "Alice",
+        "帮我读一下",
+        message_type="text",
+        runtime_id="quote-file-prefix-1",
+        reference=UiaReferencedMessage(
+            sender_name="Bob",
+            content="report.pdf",
+            message_type="file",
+        ),
+    )
+
+    resolved, resolve_count = driver._resolve_reply_target_message(
+        "conversation", quoted
+    )
+
+    assert resolve_count == 0
+    assert resolved.reference.file_path == str(cached_file)
+    assert resolved.reference.resolved is True
+
+
+def test_file_reference_cache_miss_locates_original(tmp_path):
+    resolved_file = tmp_path / "report.pdf"
+    resolved_file.write_bytes(b"%PDF")
+    client = FakeClient()
+    calls = []
+
+    def resolve_reference(message):
+        calls.append(message.reference.content)
+        return replace(
+            message,
+            reference=replace(
+                message.reference,
+                file_path=str(resolved_file),
+                resolved=True,
+                degraded=False,
+                strategy="wechat_locate_original",
+            ),
+        )
+
+    client.resolve_message_reference = resolve_reference
+    client.fetch_referenced_message_image = lambda _message: (
+        _ for _ in ()
+    ).throw(AssertionError("file reference must not open image viewer"))
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    quoted = UiaChatMessage(
+        "Alice",
+        "帮我读一下",
+        message_type="text",
+        runtime_id="quote-file-miss-1",
+        reference=UiaReferencedMessage(
+            sender_name="Bob",
+            content="report.pdf",
+            message_type="file",
+        ),
+    )
+
+    resolved, resolve_count = driver._resolve_reply_target_message(
+        "conversation", quoted
+    )
+
+    assert calls == ["report.pdf"]
+    assert resolve_count == 1
+    assert resolved.reference.file_path == str(resolved_file)
+    assert resolved.reference.strategy == "wechat_locate_original"
 
 
 def test_attachment_cache_re_resolves_invalid_path_and_changed_identity(tmp_path):

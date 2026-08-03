@@ -48,6 +48,7 @@
   },
   "qianfan_api_key": "",
   "wechat_desktop": {
+    "desktop_backend": "uia",
     "uia_focus_settle_ms": 350,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
@@ -74,15 +75,19 @@
     "uia_send_interval_ms_max": 5000,
     "uia_conversation_cooldown_seconds": 5,
     "outgoing_echo_suppression_seconds": 300,
-    "uia_history_sender_resolution_enabled": true,
-    "uia_history_settle_ms_min": 800,
-    "uia_history_settle_ms_max": 1300,
+    "uia_group_sender_ocr_enabled": true,
+    "uia_group_sender_ocr_body_min_score": 0.6,
+    "uia_group_sender_ocr_name_min_score": 0.75,
+    "uia_group_sender_ocr_text_similarity": 0.78,
+    "uia_group_sender_ocr_name_gap_px": 48,
     "shell_hook_reconcile_seconds": 15,
     "shell_hook_reconcile_enabled": false,
     "shell_hook_debounce_ms": 250,
     "reply_monitor_interval_seconds": 1.0,
     "resolve_message_references": true,
     "uia_image_viewer_enabled": true,
+    "uia_image_viewer_before_close_ms_min": 300,
+    "uia_image_viewer_before_close_ms_max": 500,
     "uia_file_save_as_enabled": true,
     "agent_tool_notice_enabled": true,
     "agent_tool_notice_once_per_reply": true,
@@ -93,9 +98,9 @@
         "正在召唤 `{name}` skill，答案已经在路上了 ✨"
     ],
     "agent_tool_notice_templates": [
-        "我准备调用 `{name}` tool 查一查，稍等我操作一下 🔧",
-        "轮到 `{name}` tool 上场了，我去后台忙活一下 🛠️",
-        "先让 `{name}` tool 跑一趟，别走开，马上带结果回来 🚀"
+        "我准备调用 `{tool_name}` tool 查一查，稍等我操作一下 🔧",
+        "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
+        "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀"
     ],
     "auto_reply_private_all": false,
     "auto_reply_groups_all": false,

@@ -10,6 +10,8 @@ from config import conf
 
 
 class WechatDesktopService:
+    """向 Web/API 工具暴露线程安全的微信桌面运行状态。"""
+
     def __init__(self, store: WechatDesktopStore):
         self.store = store
         self._lock = threading.RLock()
@@ -88,11 +90,15 @@ _service_lock = threading.Lock()
 
 
 def _default_store_path() -> str:
+    """状态库默认放在 Agent 工作区，避免污染源码目录。"""
+
     workspace = Path(expand_path(conf().get("agent_workspace", "~/cow")))
     return str(workspace / "wechat_desktop.sqlite3")
 
 
 def get_wechat_desktop_service() -> WechatDesktopService:
+    """按状态库路径缓存服务实例；配置切换后自动重建。"""
+
     global _service
     with _service_lock:
         expected = _default_store_path()

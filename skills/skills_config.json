@@ -1,10 +1,14 @@
 {
     "amap-map": {
         "name": "amap-map",
-        "description": "使用高德地图 Web 服务查询地点、周边 POI、地址与坐标，并规划步行、骑行或驾车路线。用户询问位置、附近地点、地址解析或路线时使用。",
+        "description": "使用高德地图 Web 服务查询地点、周边 POI、地址与坐标，并规划步行、骑行或驾车路线。用户询问位置、附近地点、地址解析或路线时使用；未指定城市时默认上海。",
         "source": "clawhub",
         "enabled": true,
-        "category": "skill"
+        "category": "skill",
+        "preferences": {
+            "default_city": "上海",
+            "default_location": "121.4737,31.2304"
+        }
     },
     "analyze-url": {
         "name": "analyze-url",

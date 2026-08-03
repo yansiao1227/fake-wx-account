@@ -22,6 +22,11 @@ USAGE_FILE = os.path.join(SKILL_DIR, ".usage.json")
 # 高德开放平台 Web 服务 API 配置
 AMAP_API_KEY = os.getenv("AMAP_API_KEY", "")  # 从环境变量或配置获取
 BASE_URL = "https://restapi.amap.com/v3"
+DEFAULT_CITY = os.getenv("AMAP_DEFAULT_CITY", "上海").strip() or "上海"
+DEFAULT_LOCATION = (
+    os.getenv("AMAP_DEFAULT_LOCATION", "121.4737,31.2304").strip()
+    or "121.4737,31.2304"
+)
 
 
 def load_usage() -> Dict[str, Any]:
@@ -178,18 +183,18 @@ def text_search(keywords: str, city: str = "", limit: int = 10) -> Dict[str, Any
     
     Args:
         keywords: 搜索关键词
-        city: 城市名称（可选）
+        city: 城市名称；未提供时默认上海
         limit: 返回数量（默认 10）
     
     Returns:
         搜索结果
     
     示例:
-        >>> text_search("餐厅", "北京", 10)
+        >>> text_search("餐厅", "上海", 10)
     """
     params = {
         "keywords": keywords,
-        "city": city,
+        "city": city.strip() if city and city.strip() else DEFAULT_CITY,
         "limit": limit,
         "offset": 0,
         "page": 1
@@ -314,7 +319,7 @@ def geo(address: str, city: str = "") -> Dict[str, Any]:
     
     Args:
         address: 地址
-        city: 城市名称（可选）
+        city: 城市名称；未提供时默认上海
     
     Returns:
         地理编码结果
@@ -324,7 +329,7 @@ def geo(address: str, city: str = "") -> Dict[str, Any]:
     """
     params = {
         "address": address,
-        "city": city
+        "city": city.strip() if city and city.strip() else DEFAULT_CITY
     }
     return call_api("geocode/geo", params)
 
@@ -352,27 +357,27 @@ def regeocode(location: str, radius: int = 1000) -> Dict[str, Any]:
 
 def print_usage():
     """打印使用说明"""
-    usage = """
+    usage = f"""
 高德地图 API 调用脚本
 
 用法：python amap.py <功能> <参数>
 
 功能列表:
-  text_search <关键词> [城市] [数量]     关键词搜索 POI
-  around_search <经纬度> [关键词] [半径] [数量]  周边搜索
+  text_search <关键词> [城市] [数量]     关键词搜索 POI（城市默认上海）
+  around_search <经纬度> [关键词] [半径] [数量]  周边搜索（默认参考点：{DEFAULT_LOCATION}）
   poi_detail <POI_ID>                   POI 详情查询
   walking <起点经纬度> <终点经纬度>       步行导航
   bicycling <起点经纬度> <终点经纬度>     骑行导航
   driving <起点经纬度> <终点经纬度> [策略] 驾车导航
-  geo <地址> [城市]                     地址转经纬度
+  geo <地址> [城市]                     地址转经纬度（城市默认上海）
   regeocode <经纬度> [半径]             经纬度转地址
   --usage, -u                           查看使用统计
 
 示例:
-  python amap.py text_search "餐厅" "北京" 10
-  python amap.py around_search "116.397428,39.90923" "咖啡" 500
-  python amap.py walking "116.397428,39.90923" "116.407428,39.91923"
-  python amap.py geo "北京市天安门广场" "北京"
+  python amap.py text_search "餐厅" "上海" 10
+  python amap.py around_search "{DEFAULT_LOCATION}" "咖啡" 500
+  python amap.py walking "121.4737,31.2304" "121.4837,31.2404"
+  python amap.py geo "人民广场" "上海"
   python amap.py --usage
 """
     print(usage)
@@ -415,7 +420,7 @@ def main():
     
     # 检查参数数量
     min_args = {
-        "text_search": 2,
+        "text_search": 1,
         "around_search": 1,
         "poi_detail": 1,
         "walking": 2,
