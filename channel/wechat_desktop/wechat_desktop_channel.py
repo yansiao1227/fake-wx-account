@@ -65,6 +65,8 @@ DEFAULT_CONFIG = {
     "uia_send_interval_ms_max": 5000,
     "uia_conversation_cooldown_seconds": 5,
     "outgoing_echo_suppression_seconds": 300,
+    "uia_owner_lookup_timeout_seconds": 2.0,
+    "uia_owner_failure_cache_seconds": 60.0,
 
     # 消息观察与会话历史解析。
     "uia_group_sender_ocr_enabled": True,
@@ -104,6 +106,12 @@ DEFAULT_CONFIG = {
         "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
         "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
     ],
+    "agent_failure_notice_enabled": True,
+    "agent_failure_notice_templates": [
+        "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
+        "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
+        "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
+    ],
     "auto_reply_contacts": [],
     "auto_reply_groups": [],
     "group_reply_mode": "at_only",
@@ -123,7 +131,9 @@ DEFAULT_CONFIG = {
     "uia_file_download_timeout_seconds": 10,
 
     # 私聊聚合、发送限流、数据保留与首次启动行为。
-    "private_message_aggregation_ms": 800,
+    "private_message_aggregation_min_ms": 500,
+    "private_message_aggregation_max_ms": 1200,
+    "private_message_aggregation_max_wait_ms": 4000,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
@@ -287,6 +297,13 @@ def _format_agent_notice(templates: list[str], kind: str, name: str) -> str:
     return notice
 
 
+def _format_failure_notice(templates) -> str:
+    """挑选一条不暴露内部异常细节的轻松失败提示。"""
+    fallback = "刚才脑内小齿轮打了个滑 😵‍💫 请再戳我一下，我重新来过。"
+    candidates = [str(item).strip() for item in templates or [] if str(item).strip()]
+    return random.choice(candidates) if candidates else fallback
+
+
 def _preflight_tool_notice_data(event: WechatDesktopEvent) -> dict | None:
     """根据附件类型预判首个工具，使耗时读取开始前就能发送进度通知。"""
     content_type = str(event.content_type or "").lower()
@@ -391,6 +408,7 @@ class WechatDesktopChannel(ChatChannel):
 
         # 生命周期表只用于诊断耗时，不参与消息业务判断。
         self._lifecycle_lock = threading.RLock()
+        self._failure_notice_lock = threading.RLock()
         self._lifecycles: dict[str, dict] = {}
         self._scan_count = 0
         self._service = get_wechat_desktop_service()
@@ -889,14 +907,8 @@ class WechatDesktopChannel(ChatChannel):
         每条新消息都会取消旧定时器并重新计时；事件对象已经携带观察当时的历史
         快照，因此释放批次时不需要重新打开该会话获取上文。
         """
-        wait_seconds = max(
-            0.05,
-            min(
-                float(self.config.get("private_message_aggregation_ms", 800))
-                / 1000.0,
-                5.0,
-            ),
-        )
+        wait_seconds = 0.0
+        release_now = None
         with self._pending_private_lock:
             previous = self._pending_private_batches.pop(
                 event.conversation_id, None
@@ -1060,8 +1072,11 @@ class WechatDesktopChannel(ChatChannel):
         """
         if event.content_type != "text":
             return False
-        reference_type = str(event.reference.get("content_type") or "").lower()
-        if reference_type in {"file", "image"}:
+        # Any explicit quote already gives the Agent an unambiguous target.
+        # In particular, a quoted text message may itself discuss a picture or
+        # file; treating its wording as an unreferenced attachment request would
+        # incorrectly replace the Agent reply with the attachment prompt.
+        if event.reference:
             return False
         text = unicodedata.normalize("NFKC", str(event.content or "")).strip()
         if not text or re.search(r"(?:生成|创建|制作|画一张|做一张)", text):
@@ -1468,6 +1483,22 @@ class WechatDesktopChannel(ChatChannel):
                     "[WechatDesktop] queued message failed: %s", exc, exc_info=True
                 )
             finally:
+                if terminal in {"failed", "timeout"}:
+                    try:
+                        self._send_agent_failure_notice(
+                            event=item.event,
+                            reason=(
+                                "reply_timeout"
+                                if terminal == "timeout"
+                                else "reply_failed"
+                            ),
+                            require_active=terminal != "timeout",
+                        )
+                    except Exception as notice_exc:
+                        logger.warning(
+                            "[WechatDesktop] final failure notice crashed: %s",
+                            notice_exc,
+                        )
                 if not reference_required:
                     self._driver.end_reply_cycle()
                     self._mark_lifecycle(item.source_event_ids, "agent_done")
@@ -1957,6 +1988,158 @@ class WechatDesktopChannel(ChatChannel):
         """ChatChannel 发送入口；所有安全判断集中在 ``_send_reply_impl``。"""
         return self._send_reply_impl(reply, context)
 
+    def _send_agent_failure_notice(
+        self,
+        *,
+        context=None,
+        event: WechatDesktopEvent | None = None,
+        reason: str = "failed",
+        require_active: bool = True,
+    ) -> bool:
+        """幂等发送最终失败提示，避免 Agent 异常或超时后用户空等。"""
+        if not bool(self.config.get("agent_failure_notice_enabled", True)):
+            return False
+        msg = context.get("msg") if context else None
+        if event is None:
+            event = getattr(msg, "event", None)
+        target_name = (
+            getattr(event, "conversation_name", "")
+            or getattr(msg, "other_user_nickname", "")
+            or (context.get("receiver", "") if context else "")
+        )
+        target_id = (
+            getattr(event, "conversation_id", "")
+            or getattr(msg, "other_user_id", "")
+            or (context.get("receiver", "") if context else "")
+        )
+        if not target_name and not target_id:
+            return False
+        queue_token = str(
+            context.get("wechat_desktop_queue_token", "") if context else ""
+        )
+        conversation_id = str(
+            getattr(event, "conversation_id", "") or target_id
+        )
+        if (
+            require_active
+            and queue_token
+            and not self._reply_queue.is_relevant(queue_token, conversation_id)
+        ):
+            return False
+
+        lock = getattr(self, "_failure_notice_lock", None)
+        if lock is None:
+            lock = self._failure_notice_lock = threading.RLock()
+        with lock:
+            if bool(
+                context
+                and context.get("wechat_desktop_failure_notice_sent", False)
+            ) or bool(event and getattr(event, "_failure_notice_sent", False)):
+                return True
+            is_group = bool(
+                getattr(event, "is_group", False)
+                if event is not None
+                else context.get("isgroup", False)
+            )
+            if (
+                bool(self._service.status().get("paused"))
+                or bool(self.config.get("shadow_mode", True))
+                or self._policy.is_blocked(target_name)
+                or not self._policy.is_allowlisted(target_name, is_group)
+            ):
+                return False
+            notice = _format_failure_notice(
+                self.config.get("agent_failure_notice_templates", [])
+            )
+            send_target = (
+                target_id
+                if str(target_id).startswith("uia-session:")
+                else target_name
+            )
+            source_event_ids = list(
+                context.get("wechat_desktop_source_event_ids", [])
+                if context
+                else getattr(event, "_source_event_ids", None)
+                or ([event.event_id] if event is not None else [])
+            )
+            self._mark_lifecycle(source_event_ids, "send_started")
+            try:
+                send_interim = getattr(self._driver, "send_interim_text", None)
+                result = (
+                    send_interim(send_target, notice)
+                    if send_interim
+                    else self._driver.send_text(send_target, notice)
+                )
+                if not result.get("success"):
+                    raise RuntimeError(str(result.get("message") or "send failed"))
+            except Exception as exc:
+                self._mark_lifecycle(
+                    source_event_ids,
+                    "send_started",
+                    send_result="failure_notice_failed",
+                )
+                self._trace(
+                    "12-failure-notice-failed",
+                    "target=%s reason=%s error=%s",
+                    target_name,
+                    reason,
+                    exc,
+                )
+                self._store.audit(
+                    "agent_failure_notice",
+                    target_name,
+                    "failed",
+                    self._content_hash(notice),
+                    detail=f"reason={reason}; error={exc}",
+                )
+                return False
+
+            if context is not None:
+                context["wechat_desktop_failure_notice_sent"] = True
+            if event is not None:
+                setattr(event, "_failure_notice_sent", True)
+            verified = bool(result.get("verified"))
+            self._mark_lifecycle(
+                source_event_ids,
+                "send_verified" if verified else "send_started",
+                send_result=(
+                    "failure_notice_verified"
+                    if verified
+                    else "failure_notice_unverified"
+                ),
+            )
+            self._store.append_conversation_history(
+                conversation_id=target_id,
+                conversation_name=target_name,
+                sender_name=str(self.config.get("self_display_name") or "我"),
+                direction="outgoing",
+                content_type="text",
+                content=notice,
+                source_type=str(
+                    getattr(event, "source_type", "")
+                    or (
+                        context.get("wechat_desktop_source_type", "unknown")
+                        if context
+                        else "unknown"
+                    )
+                ),
+            )
+            self._store.audit(
+                "agent_failure_notice",
+                target_name,
+                "success" if verified else "unverified",
+                self._content_hash(notice),
+                detail=f"reason={reason}",
+            )
+            self._trace(
+                "12-failure-notice-success",
+                "target=%s reason=%s verified=%s",
+                target_name,
+                reason,
+                verified,
+            )
+            return True
+
     def _finish_reply_cycle(self, context):
         """幂等释放后端回复周期，防止回调和异常路径重复解锁。"""
         if not context or not bool(
@@ -1986,6 +2169,16 @@ class WechatDesktopChannel(ChatChannel):
         context = kwargs.get("context")
         self._finish_reply_cycle(context)
         if context:
+            try:
+                self._send_agent_failure_notice(
+                    context=context,
+                    reason="agent_exception",
+                )
+            except Exception as notice_exc:
+                logger.warning(
+                    "[WechatDesktop] Agent failure notice crashed: %s",
+                    notice_exc,
+                )
             self._mark_lifecycle(
                 context.get("wechat_desktop_source_event_ids", []),
                 "agent_done",
@@ -2057,7 +2250,6 @@ class WechatDesktopChannel(ChatChannel):
                 self._handle_network_reply_error(
                     reply,
                     context,
-                    send_target,
                     target_name,
                 )
             else:
@@ -2071,6 +2263,10 @@ class WechatDesktopChannel(ChatChannel):
                     target_name,
                     "failed",
                     detail=str(reply.content or ""),
+                )
+                self._send_agent_failure_notice(
+                    context=context,
+                    reason="agent_reply_error",
                 )
             return
 
@@ -2226,7 +2422,6 @@ class WechatDesktopChannel(ChatChannel):
         self,
         reply: Reply,
         context: Context,
-        send_target: str,
         target_name: str,
     ):
         """处理 Agent 网络故障：终止当前周期、清空待办并尝试通知当前用户。
@@ -2242,7 +2437,6 @@ class WechatDesktopChannel(ChatChannel):
         for event_id in discarded_event_ids:
             self._store.mark_event_processed(event_id)
         self._finish_lifecycle(discarded_event_ids, "failed")
-        notice = "目前网络不稳定，请稍后再试。"
         error_detail = str(reply.content or "")
         self._trace(
             "10-network-unstable",
@@ -2265,44 +2459,10 @@ class WechatDesktopChannel(ChatChannel):
                 f"discarded={len(discarded_event_ids)}; error={error_detail}"
             ),
         )
-        try:
-            result = self._driver.send_text(send_target, notice)
-            if result.get("success"):
-                verified = bool(result.get("verified"))
-                self._trace(
-                    "12-network-notice-success",
-                    "target=%s verified=%s",
-                    target_name,
-                    verified,
-                )
-                self._store.audit(
-                    "network_unstable_notice",
-                    target_name,
-                    "success" if verified else "unverified",
-                    self._content_hash(notice),
-                    detail=str(result.get("message", "")),
-                )
-                return
-            raise RuntimeError(str(result.get("message") or "send failed"))
-        except Exception as exc:
-            self._trace(
-                "12-network-notice-failed",
-                "target=%s error=%s",
-                target_name,
-                exc,
-            )
-            logger.error(
-                "[WechatDesktop] failed to send network instability notice; ending reply flow target=%s error=%s",
-                target_name,
-                exc,
-            )
-            self._store.audit(
-                "network_unstable_notice",
-                target_name,
-                "failed",
-                self._content_hash(notice),
-                detail=str(exc),
-            )
+        self._send_agent_failure_notice(
+            context=context,
+            reason="network_error",
+        )
 
     def _execute_agent_action(self, action: str, **params) -> dict:
         """供 Agent 主动发送微信文字的受限入口。

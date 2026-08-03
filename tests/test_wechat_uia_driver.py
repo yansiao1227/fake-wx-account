@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from bridge.context import ContextType
+from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.group_sender_ocr import (
     OcrTextLine,
@@ -33,6 +34,7 @@ from channel.wechat_desktop.wechat_desktop_channel import (
     DEFAULT_CONFIG,
     WechatDesktopChannel,
     _format_agent_notice,
+    _format_failure_notice,
     _is_network_reply_error,
     _preflight_tool_notice_data,
     _render_event_context_lines,
@@ -448,7 +450,7 @@ class ClickableGeometryControl(GeometryControl):
 
 
 def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):
-    client = WechatUiaClient({})
+    client = WechatUiaClient({"uia_owner_failure_cache_seconds": 0})
     root = GeometryControl((0, 0, 1000, 800))
     popup_results = iter([("", ""), ("颜料盒bot", "wxid_bot")])
     popup_calls = []
@@ -472,6 +474,114 @@ def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):
     )
     assert client.get_owner_info().nick_name == "颜料盒bot"
     assert len(popup_calls) == 2
+
+
+def test_owner_discovery_failure_is_cached_until_retry_window(monkeypatch):
+    client = WechatUiaClient({"uia_owner_failure_cache_seconds": 60})
+    root = GeometryControl((0, 0, 1000, 800))
+    now = [100.0]
+    popup_calls = []
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_walk", lambda _root: iter(()))
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        client,
+        "_read_owner_profile_popup",
+        lambda _root: popup_calls.append(True) or ("", ""),
+    )
+
+    assert client.get_owner_info() == OwnerInfo("", source="unknown")
+    assert client.get_owner_info() == OwnerInfo("", source="unknown")
+    assert len(popup_calls) == 1
+
+    now[0] = 161.0
+    assert client.get_owner_info() == OwnerInfo("", source="unknown")
+    assert len(popup_calls) == 2
+
+
+def test_configured_owner_is_still_verified_through_uia(monkeypatch):
+    client = WechatUiaClient({"self_display_name": "颜料盒bot"})
+    root = GeometryControl((0, 0, 1000, 800))
+    popup_calls = []
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_walk", lambda _root: iter(()))
+    monkeypatch.setattr(
+        client,
+        "_read_owner_profile_popup",
+        lambda _root: popup_calls.append(True) or ("颜料盒bot", "wxid_bot"),
+    )
+
+    assert client.get_owner_info() == OwnerInfo(
+        "颜料盒bot", wx_id="wxid_bot", source="uia"
+    )
+    assert popup_calls == [True]
+
+
+def test_owner_profile_popup_uses_same_process_hwnd_without_desktop_uia(monkeypatch):
+    import uiautomation as auto
+    import win32api
+    import win32gui
+    import win32process
+
+    display = GeometryControl(
+        (500, 200, 650, 230),
+        name="颜料盒bot",
+        class_name="mmui::XTextView",
+        automation_id="right_v_view.nickname_button_view.display_name_text",
+    )
+    wx_id = GeometryControl(
+        (500, 240, 650, 270),
+        name="wxid_bot",
+        class_name="mmui::ProfileTextView",
+    )
+    popup = GeometryControl(
+        (400, 150, 700, 450),
+        class_name="mmui::ProfileUniquePop",
+        children=[display, wx_id],
+    )
+    root = GeometryControl((100, 100, 1000, 800))
+    client = WechatUiaClient({"uia_selection_settle_ms": 0})
+    clicked = []
+
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
+    monkeypatch.setattr(auto, "Click", lambda x, y: clicked.append((x, y)))
+    monkeypatch.setattr(
+        auto,
+        "GetRootControl",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("desktop UIA root must not be enumerated")
+        ),
+    )
+    monkeypatch.setattr(auto, "ControlFromHandle", lambda hwnd: popup if hwnd == 200 else root)
+    monkeypatch.setattr(win32api, "GetCursorPos", lambda: (10, 20))
+    monkeypatch.setattr(win32api, "SetCursorPos", lambda _point: None)
+    monkeypatch.setattr(win32api, "keybd_event", lambda *_args: None)
+    monkeypatch.setattr(win32gui, "IsWindowVisible", lambda hwnd: hwnd in {100, 200, 300})
+
+    def enum_windows(callback, param):
+        for hwnd in (100, 200, 300):
+            callback(hwnd, param)
+
+    monkeypatch.setattr(win32gui, "EnumWindows", enum_windows)
+    monkeypatch.setattr(
+        win32process,
+        "GetWindowThreadProcessId",
+        lambda hwnd: (1, 42 if hwnd in {100, 200} else 99),
+    )
+
+    assert client._read_owner_profile_popup(root) == ("颜料盒bot", "wxid_bot")
+    assert clicked == [(138, 168)]
 
 
 def test_image_bubble_is_captured_to_tmp(monkeypatch, tmp_path):
@@ -2860,6 +2970,82 @@ def test_tool_notice_templates_always_output_the_concrete_tool_name():
     )
 
 
+def test_failure_notice_has_fun_fallback_when_templates_are_empty():
+    assert "小齿轮" in _format_failure_notice([])
+    assert _format_failure_notice(["机器人暂时打了个喷嚏 🤖"]) == (
+        "机器人暂时打了个喷嚏 🤖"
+    )
+
+
+def test_agent_error_sends_one_final_failure_notice():
+    channel = _bare_wechat_channel()
+    event = WechatDesktopEvent(
+        "message",
+        "uia-session:a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "hello",
+    )
+    reply_queue = WechatReplyQueue()
+    assert reply_queue.enqueue(event)
+    item = reply_queue.get()
+    sent = []
+    audits = []
+    history = []
+    channel.config = {
+        "agent_failure_notice_enabled": True,
+        "agent_failure_notice_templates": ["机器人暂时打了个喷嚏 🤖 请再试一次。"],
+        "shadow_mode": False,
+        "self_display_name": "Bot",
+    }
+    channel._failure_notice_lock = threading.RLock()
+    channel._reply_queue = reply_queue
+    channel._service = SimpleNamespace(status=lambda: {"paused": False})
+    channel._policy = SimpleNamespace(
+        is_blocked=lambda _target: False,
+        is_allowlisted=lambda _target, _is_group: True,
+    )
+    channel._driver = SimpleNamespace(
+        send_interim_text=lambda target, text: (
+            sent.append((target, text))
+            or {"success": True, "verified": True}
+        )
+    )
+    channel._store = SimpleNamespace(
+        audit=lambda *args, **kwargs: audits.append((args, kwargs)),
+        append_conversation_history=lambda **kwargs: history.append(kwargs),
+    )
+    channel._mark_lifecycle = lambda *_args, **_kwargs: None
+    channel._trace = lambda *_args, **_kwargs: None
+    context = {
+        "msg": WechatDesktopMessage(event),
+        "receiver": event.conversation_id,
+        "isgroup": False,
+        "wechat_desktop_queue_token": item.token,
+        "wechat_desktop_source_event_ids": [event.event_id],
+        "wechat_desktop_source_type": "private",
+        "wechat_desktop_queue_terminal": "completed",
+    }
+
+    channel._send_reply_impl(Reply(ReplyType.ERROR, "model exploded"), context)
+    channel._send_agent_failure_notice(
+        context=context,
+        reason="duplicate_callback",
+    )
+
+    assert context["wechat_desktop_queue_terminal"] == "failed"
+    assert sent == [
+        (
+            "uia-session:a",
+            "机器人暂时打了个喷嚏 🤖 请再试一次。",
+        )
+    ]
+    assert history[0]["content"] == sent[0][1]
+    assert any(args[0] == "agent_failure_notice" for args, _ in audits)
+
+
 def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     docx_event = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "file", r"C:\tmp\LDAP.docx"
@@ -3517,6 +3703,20 @@ def test_non_reference_attachment_question_requires_quote():
         "这个文件讲了什么？",
         reference={"content_type": "file", "file_path": "C:/tmp/a.pdf"},
     )
+    referenced_text = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "这个文件讲了什么？",
+        reference={
+            "content_type": "text",
+            "sender_name": "Bob",
+            "content": "请查看这个文件的处理规则",
+        },
+    )
     generation = WechatDesktopEvent(
         "message",
         "a",
@@ -3544,6 +3744,9 @@ def test_non_reference_attachment_question_requires_quote():
     )
     assert not WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
         referenced
+    )
+    assert not WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
+        referenced_text
     )
     assert not WechatDesktopChannel.__closure__[0].cell_contents._requires_attachment_reference(
         generation
@@ -3734,6 +3937,62 @@ def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
     assert dispatched_history == [
         {"content": "入队时的上文", "content_type": "text"}
     ]
+
+
+def test_reply_timeout_sends_final_failure_notice():
+    channel = _bare_wechat_channel()
+    channel._stop_event = threading.Event()
+    channel._reply_queue = WechatReplyQueue()
+    event = WechatDesktopEvent(
+        "message", "uia-session:a", "Alice", "a", "Alice", "text", "hello"
+    )
+    assert channel._reply_queue.enqueue(event)
+    original_finish = channel._reply_queue.finish
+
+    def finish(item, terminal):
+        original_finish(item, terminal)
+        channel._stop_event.set()
+
+    channel._reply_queue.finish = finish
+    sent = []
+    processed = []
+    channel.config = {
+        "reply_cycle_timeout_seconds": 0,
+        "agent_failure_notice_enabled": True,
+        "agent_failure_notice_templates": ["答案刚才迷路了 🧭 请再试一次。"],
+        "shadow_mode": False,
+    }
+    channel._failure_notice_lock = threading.RLock()
+    channel._service = SimpleNamespace(
+        status=lambda: {"paused": False},
+        update_status=lambda **_kwargs: None,
+    )
+    channel._policy = SimpleNamespace(
+        is_blocked=lambda _target: False,
+        is_allowlisted=lambda _target, _is_group: True,
+    )
+    channel._driver = SimpleNamespace(
+        send_interim_text=lambda target, text: (
+            sent.append((target, text))
+            or {"success": True, "verified": True}
+        ),
+        end_reply_cycle=lambda: None,
+    )
+    channel._store = SimpleNamespace(
+        mark_event_processed=lambda event_id: processed.append(event_id),
+        audit=lambda *_args, **_kwargs: None,
+        append_conversation_history=lambda **_kwargs: None,
+    )
+    channel._dispatch_message = lambda *_args: True
+    channel._mark_lifecycle = lambda *_args, **_kwargs: None
+    channel._finish_lifecycle = lambda *_args, **_kwargs: None
+    channel._trace = lambda *_args, **_kwargs: None
+
+    channel._consume_reply_queue()
+
+    assert sent == [("uia-session:a", "答案刚才迷路了 🧭 请再试一次。")]
+    assert processed == [event.event_id]
+    assert channel._reply_queue.status()["queue_timeout"] == 1
 
 
 def test_attachment_path_cache_avoids_second_image_capture(tmp_path):

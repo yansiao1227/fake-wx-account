@@ -13,6 +13,12 @@ from agent.protocol.message_utils import sanitize_claude_messages, compress_turn
 from agent.tools.base_tool import BaseTool, ToolResult
 from common.log import logger
 from common.i18n import t as _t
+from models.model_api_retry import (
+    ModelApiRetriesExhausted,
+    get_model_api_retry_policy,
+    is_retryable_model_api_error,
+    model_api_retry_delay,
+)
 
 # Optional: repair malformed JSON args from non-strict providers (e.g. unescaped quotes in long content).
 try:
@@ -915,7 +921,7 @@ class AgentStreamExecutor:
             logger.debug(f"[ToolRetrieval] full injection (retrieval skipped): {e}")
             return all_tools
 
-    def _call_llm_stream(self, retry_on_empty=True, retry_count=0, max_retries=3,
+    def _call_llm_stream(self, retry_on_empty=True, retry_count=0, max_retries=None,
                          _overflow_retry: bool = False) -> Tuple[str, List[Dict]]:
         """
         Call LLM with streaming and automatic retry on errors
@@ -923,12 +929,19 @@ class AgentStreamExecutor:
         Args:
             retry_on_empty: Whether to retry once if empty response is received
             retry_count: Current retry attempt (internal use)
-            max_retries: Maximum number of retries for API errors
+            max_retries: Maximum number of retries for API errors. ``None``
+                loads the current ``model_api_max_retries`` configuration.
             _overflow_retry: Internal flag indicating this is a retry after context overflow
         
         Returns:
             (response_text, tool_calls)
         """
+        retry_policy = get_model_api_retry_policy()
+        if max_retries is None:
+            max_retries = retry_policy.max_retries
+        else:
+            max_retries = max(0, min(int(max_retries), 10))
+
         # Validate and fix message history (e.g. orphaned tool_result blocks).
         # Context trimming is done once in run_stream() before the loop starts,
         # NOT here — trimming mid-execution would strip the current run's
@@ -1201,26 +1214,30 @@ class AgentStreamExecutor:
                         "Sorry, something went wrong with the earlier conversation. I've cleared the history — please send your message again.",
                     ))
             
-            # Check if error is rate limit (429)
-            is_rate_limit = '429' in error_str_lower or 'rate limit' in error_str_lower
-            
-            # Check if error is retryable (timeout, connection, server busy, etc.)
-            is_retryable = any(keyword in error_str_lower for keyword in [
-                'timeout', 'timed out', 'connection', 'network', 
-                'rate limit', 'overloaded', 'unavailable', 'busy', 'retry',
-                '429', '500', '502', '503', '504', '512'
-            ])
+            is_retryable = is_retryable_model_api_error(error_str)
             
             if is_retryable and retry_count < max_retries:
-                # Rate limit needs longer wait time
-                if is_rate_limit:
-                    wait_time = 30 + (retry_count * 15)  # 30s, 45s, 60s for rate limit
-                else:
-                    wait_time = (retry_count + 1) * 2  # 2s, 4s, 6s for other errors
+                wait_time = model_api_retry_delay(
+                    retry_count,
+                    error_str,
+                    retry_policy,
+                )
                 
-                logger.warning(f"⚠️ LLM API error (attempt {retry_count + 1}/{max_retries}): {e}")
-                logger.info(f"Retrying in {wait_time}s...")
-                time.sleep(wait_time)
+                logger.warning(
+                    "⚠️ LLM API error; retry %s/%s in %.2fs: %s",
+                    retry_count + 1,
+                    max_retries,
+                    wait_time,
+                    e,
+                )
+                if wait_time > 0:
+                    if self.cancel_event is not None:
+                        if self.cancel_event.wait(wait_time):
+                            raise AgentCancelledError(
+                                "cancelled while waiting to retry model API"
+                            )
+                    else:
+                        time.sleep(wait_time)
                 return self._call_llm_stream(
                     retry_on_empty=retry_on_empty, 
                     retry_count=retry_count + 1,
@@ -1231,7 +1248,7 @@ class AgentStreamExecutor:
                     logger.error(f"❌ LLM API error after {max_retries} retries: {e}", exc_info=True)
                 else:
                     logger.error(f"❌ LLM call error (non-retryable): {e}", exc_info=True)
-                raise
+                raise ModelApiRetriesExhausted(error_str, retry_count) from e
 
         # Parse tool calls
         tool_calls = []

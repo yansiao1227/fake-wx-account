@@ -128,6 +128,7 @@ class WechatUiaClient:
         self.config = dict(config or {})
         self.operation_lock = threading.RLock()
         self._owner_cache: Optional[OwnerInfo] = None
+        self._owner_lookup_retry_after = 0.0
         self._stop_event = threading.Event()
         self._last_send_at = 0.0
         self._last_conversation_send: dict[str, float] = {}
@@ -482,6 +483,15 @@ class WechatUiaClient:
                     self._owner_cache.nick_name,
                 )
             return self._owner_cache
+        now = time.monotonic()
+        if now < self._owner_lookup_retry_after:
+            if bool(self.config.get("diagnostic_logging", False)):
+                logger.info(
+                    "[WechatDesktop][trace:05-owner] "
+                    "source=failure_cache retry_in=%.3fs",
+                    self._owner_lookup_retry_after - now,
+                )
+            return OwnerInfo("", source="unknown")
         discovered = ""
         wx_id = ""
         discovery_method = "none"
@@ -491,31 +501,59 @@ class WechatUiaClient:
                 bool(configured),
                 bool(self._owner_cache and self._owner_cache.nick_name),
             )
-        with self.operation_lock, self._uia_root() as root:
-            root_bounds = _bounds(root)
-            left_limit = root_bounds[0] + max(100, (root_bounds[2] - root_bounds[0]) // 5) if root_bounds else 0
-            for control in self._walk(root):
-                aid = _text(control.AutomationId).casefold()
-                cls = _text(control.ClassName).casefold()
-                name = _text(control.Name)
-                bounds = _bounds(control)
-                profile_hint = any(
-                    key in aid
-                    for key in ("self_avatar", "owner_avatar", "profile", "account", "userinfo")
-                ) or ("avatar" in cls and any(key in aid for key in ("self", "owner")))
-                in_sidebar = bool(bounds and left_limit and bounds[0] <= left_limit)
-                if profile_hint and in_sidebar and name and name not in {"头像", "微信"}:
-                    discovered = name
-                    discovery_method = "sidebar"
-                    break
-            if not discovered:
-                if bool(self.config.get("diagnostic_logging", False)):
-                    logger.info(
-                        "[WechatDesktop][trace:05-owner] sidebar_missing; opening_profile_popup"
+        try:
+            with self.operation_lock, self._uia_root() as root:
+                root_bounds = _bounds(root)
+                left_limit = (
+                    root_bounds[0]
+                    + max(100, (root_bounds[2] - root_bounds[0]) // 5)
+                    if root_bounds
+                    else 0
+                )
+                for control in self._walk(root):
+                    aid = _text(control.AutomationId).casefold()
+                    cls = _text(control.ClassName).casefold()
+                    name = _text(control.Name)
+                    bounds = _bounds(control)
+                    profile_hint = any(
+                        key in aid
+                        for key in (
+                            "self_avatar",
+                            "owner_avatar",
+                            "profile",
+                            "account",
+                            "userinfo",
+                        )
+                    ) or (
+                        "avatar" in cls
+                        and any(key in aid for key in ("self", "owner"))
                     )
-                discovered, wx_id = self._read_owner_profile_popup(root)
-                if discovered:
-                    discovery_method = "profile_popup"
+                    in_sidebar = bool(
+                        bounds and left_limit and bounds[0] <= left_limit
+                    )
+                    if (
+                        profile_hint
+                        and in_sidebar
+                        and name
+                        and name not in {"头像", "微信"}
+                    ):
+                        discovered = name
+                        discovery_method = "sidebar"
+                        break
+                if not discovered:
+                    if bool(self.config.get("diagnostic_logging", False)):
+                        logger.info(
+                            "[WechatDesktop][trace:05-owner] "
+                            "sidebar_missing; opening_profile_popup"
+                        )
+                    discovered, wx_id = self._read_owner_profile_popup(root)
+                    if discovered:
+                        discovery_method = "profile_popup"
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop][trace:05-owner] lookup_failed error=%s",
+                exc,
+            )
         if discovered and configured and discovered != configured:
             raise RuntimeError(
                 "self_display_name does not match the account exposed by WeChat UIA"
@@ -530,6 +568,19 @@ class WechatUiaClient:
         # mention matching. Cache only a usable account identity so later group
         # observations retry the profile-popup discovery path.
         self._owner_cache = owner if owner.nick_name else None
+        if discovered:
+            self._owner_lookup_retry_after = 0.0
+        elif not owner.nick_name:
+            try:
+                failure_cache_seconds = float(
+                    self.config.get("uia_owner_failure_cache_seconds", 60.0)
+                )
+            except (TypeError, ValueError):
+                failure_cache_seconds = 60.0
+            self._owner_lookup_retry_after = time.monotonic() + max(
+                0.0,
+                min(failure_cache_seconds, 3600.0),
+            )
         if bool(self.config.get("diagnostic_logging", False)):
             logger.info(
                 "[WechatDesktop][trace:05-owner] lookup_result available=%s source=%s method=%s name=%s",
@@ -540,8 +591,82 @@ class WechatUiaClient:
             )
         return owner
 
+    def _find_owner_profile_popup(
+        self,
+        main_hwnd: int,
+        visible_before: Optional[set[int]] = None,
+    ):
+        """Return the profile popup without enumerating the desktop UIA tree.
+
+        Desktop ``GetChildren()`` asks every top-level window's UIA provider for
+        data.  A single unrelated, unresponsive provider can therefore block the
+        WeChat scan thread for close to a minute.  Native window enumeration is
+        cheap; only same-process candidates are converted to UIA controls.
+        """
+
+        import uiautomation as auto
+        import win32gui
+        import win32process
+
+        _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+        try:
+            timeout_seconds = float(
+                self.config.get("uia_owner_lookup_timeout_seconds", 2.0)
+            )
+        except (TypeError, ValueError):
+            timeout_seconds = 2.0
+        deadline = time.monotonic() + max(0.0, min(timeout_seconds, 5.0))
+
+        while True:
+            candidates: list[int] = []
+
+            def callback(hwnd, _):
+                native_hwnd = int(hwnd or 0)
+                if (
+                    not native_hwnd
+                    or native_hwnd == int(main_hwnd)
+                    or not win32gui.IsWindowVisible(native_hwnd)
+                ):
+                    return True
+                try:
+                    _, process_id = win32process.GetWindowThreadProcessId(
+                        native_hwnd
+                    )
+                except Exception:
+                    return True
+                if int(process_id) == int(main_pid):
+                    candidates.append(native_hwnd)
+                return True
+
+            win32gui.EnumWindows(callback, None)
+            # Prefer a window created by the avatar click, but also accept an
+            # already-open profile popup left behind by a previous attempt.
+            if visible_before is not None:
+                candidates.sort(key=lambda hwnd: hwnd in visible_before)
+            # Do not enter COM/UIA inside EnumWindows' callback. Qt may
+            # synchronously wait on its UI thread while the popup is created.
+            for hwnd in candidates:
+                try:
+                    popup = auto.ControlFromHandle(hwnd)
+                    if _text(popup.ClassName) == "mmui::ProfileUniquePop":
+                        return popup
+                except Exception as exc:
+                    if bool(self.config.get("diagnostic_logging", False)):
+                        logger.info(
+                            "[WechatDesktop][trace:05-owner] "
+                            "profile_popup_candidate_failed hwnd=%s error=%s",
+                            hwnd,
+                            exc,
+                        )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if self._stop_event.wait(min(0.05, remaining)):
+                raise RuntimeError("WeChat UI Automation is stopping")
+
     def _read_owner_profile_popup(self, root) -> tuple[str, str]:
         """Open the unlabelled top-left avatar and read its semantic popup."""
+        started_at = time.monotonic()
         try:
             import uiautomation as auto
             import win32api
@@ -550,6 +675,8 @@ class WechatUiaClient:
             bounds = _bounds(root)
             if not bounds:
                 return "", ""
+            main_hwnd = self.get_owner_window_handle()
+            visible_before = self._visible_top_level_window_handles()
             old_cursor = win32api.GetCursorPos()
             try:
                 auto.Click(bounds[0] + 38, bounds[1] + 68)
@@ -563,15 +690,14 @@ class WechatUiaClient:
             finally:
                 win32api.SetCursorPos(old_cursor)
 
-            popup = next(
-                (
-                    item
-                    for item in auto.GetRootControl().GetChildren()
-                    if _text(item.ClassName) == "mmui::ProfileUniquePop"
-                ),
-                None,
-            )
+            popup = self._find_owner_profile_popup(main_hwnd, visible_before)
             if popup is None:
+                if bool(self.config.get("diagnostic_logging", False)):
+                    logger.info(
+                        "[WechatDesktop][trace:05-owner] "
+                        "profile_popup_not_found elapsed=%.3fs",
+                        time.monotonic() - started_at,
+                    )
                 return "", ""
             display_name = ""
             wx_id = ""
@@ -583,8 +709,21 @@ class WechatUiaClient:
                     candidate = _text(control.Name)
                     if candidate and candidate != display_name:
                         wx_id = candidate
+            if bool(self.config.get("diagnostic_logging", False)):
+                logger.info(
+                    "[WechatDesktop][trace:05-owner] "
+                    "profile_popup_read available=%s elapsed=%.3fs",
+                    bool(display_name),
+                    time.monotonic() - started_at,
+                )
             return display_name, wx_id
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop][trace:05-owner] "
+                "profile_popup_read_failed elapsed=%.3fs error=%s",
+                time.monotonic() - started_at,
+                exc,
+            )
             return "", ""
         finally:
             try:

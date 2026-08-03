@@ -23,6 +23,9 @@ Design goals:
 """
 
 import json
+import threading
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Generator, Optional
 from urllib.parse import urlparse
 
@@ -33,6 +36,16 @@ from common.log import logger
 
 DEFAULT_API_BASE = "https://api.openai.com/v1"
 DEFAULT_TIMEOUT = 600  # seconds; matches old openai SDK default
+
+# Failed payloads are intentionally kept outside normal logs: they may contain
+# private conversation text or base64 image data and are only meant for local
+# replay/debugging.  ``tmp`` is ignored by git in this project.
+_FAILED_REQUEST_LOG = (
+    Path(__file__).resolve().parents[2]
+    / "tmp"
+    / "openai_failed_requests.jsonl"
+)
+_FAILED_REQUEST_LOG_LOCK = threading.Lock()
 
 
 _APP_TITLE = "CowAgent"
@@ -64,6 +77,57 @@ def _resolve_attribution_headers(url: str) -> Dict[str, str]:
         if host == suffix or host.endswith("." + suffix):
             return dict(headers)
     return {}
+
+
+def _record_failed_request(
+    *,
+    url: str,
+    payload: Dict[str, Any],
+    status_code: int,
+    response_body: Any,
+    params: Optional[Dict[str, str]] = None,
+    response_headers: Optional[Dict[str, str]] = None,
+) -> None:
+    """Append a replayable failed request without persisting credentials."""
+    headers = response_headers or {}
+    request_id = next(
+        (
+            headers.get(name)
+            for name in (
+                "x-request-id",
+                "request-id",
+                "cf-ray",
+                "x-amzn-requestid",
+            )
+            if headers.get(name)
+        ),
+        "",
+    )
+    record = {
+        "recorded_at": datetime.now().astimezone().isoformat(),
+        "method": "POST",
+        "url": url,
+        "query": dict(params or {}),
+        "request_body": payload,
+        "response": {
+            "status_code": int(status_code),
+            "request_id": request_id,
+            "body": response_body,
+        },
+    }
+    try:
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        with _FAILED_REQUEST_LOG_LOCK:
+            _FAILED_REQUEST_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with _FAILED_REQUEST_LOG.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        logger.warning(
+            "[OpenAIHTTP] failed request payload saved for replay: %s",
+            _FAILED_REQUEST_LOG,
+        )
+    except Exception as exc:
+        # Diagnostics must never replace or hide the original API failure.
+        logger.warning("[OpenAIHTTP] unable to save failed request payload: %s", exc)
 
 
 class OpenAIHTTPError(Exception):
@@ -254,11 +318,46 @@ class OpenAIHTTPClient:
                 params=extra_query,
             )
         except requests.exceptions.Timeout as e:
+            _record_failed_request(
+                url=url,
+                payload=clean_payload,
+                status_code=408,
+                response_body={"transport_error": f"Request timed out: {e}"},
+                params=extra_query,
+            )
             raise OpenAIHTTPError(408, {}, f"Request timed out: {e}")
         except requests.exceptions.ConnectionError as e:
+            _record_failed_request(
+                url=url,
+                payload=clean_payload,
+                status_code=0,
+                response_body={"transport_error": f"Connection error: {e}"},
+                params=extra_query,
+            )
             raise OpenAIHTTPError(0, {}, f"Connection error: {e}")
         except requests.exceptions.RequestException as e:
+            _record_failed_request(
+                url=url,
+                payload=clean_payload,
+                status_code=0,
+                response_body={"transport_error": f"Request failed: {e}"},
+                params=extra_query,
+            )
             raise OpenAIHTTPError(0, {}, f"Request failed: {e}")
+
+        if resp.status_code >= 400:
+            try:
+                response_body = resp.json()
+            except ValueError:
+                response_body = {"raw": resp.text}
+            _record_failed_request(
+                url=url,
+                payload=clean_payload,
+                status_code=resp.status_code,
+                response_body=response_body,
+                params=extra_query,
+                response_headers=resp.headers,
+            )
 
         return self._parse_response(resp)
 
@@ -303,12 +402,33 @@ class OpenAIHTTPClient:
                 params=params,
             )
         except requests.exceptions.Timeout as e:
+            _record_failed_request(
+                url=url,
+                payload=payload,
+                status_code=408,
+                response_body={"transport_error": f"Request timed out: {e}"},
+                params=params,
+            )
             yield self._make_error_chunk(408, f"Request timed out: {e}")
             return
         except requests.exceptions.ConnectionError as e:
+            _record_failed_request(
+                url=url,
+                payload=payload,
+                status_code=0,
+                response_body={"transport_error": f"Connection error: {e}"},
+                params=params,
+            )
             yield self._make_error_chunk(0, f"Connection error: {e}")
             return
         except requests.exceptions.RequestException as e:
+            _record_failed_request(
+                url=url,
+                payload=payload,
+                status_code=0,
+                response_body={"transport_error": f"Request failed: {e}"},
+                params=params,
+            )
             yield self._make_error_chunk(0, f"Request failed: {e}")
             return
 
@@ -331,6 +451,14 @@ class OpenAIHTTPClient:
                     err_msg = err
             if not err_msg:
                 err_msg = str(body)[:500]
+            _record_failed_request(
+                url=url,
+                payload=payload,
+                status_code=resp.status_code,
+                response_body=body,
+                params=params,
+                response_headers=resp.headers,
+            )
             yield {
                 "error": {
                     "message": err_msg,
@@ -375,8 +503,22 @@ class OpenAIHTTPClient:
                     continue
                 yield chunk
         except requests.exceptions.ChunkedEncodingError as e:
+            _record_failed_request(
+                url=url,
+                payload=payload,
+                status_code=0,
+                response_body={"stream_error": f"Stream interrupted: {e}"},
+                params=params,
+            )
             yield self._make_error_chunk(0, f"Stream interrupted: {e}")
         except requests.exceptions.RequestException as e:
+            _record_failed_request(
+                url=url,
+                payload=payload,
+                status_code=0,
+                response_body={"stream_error": f"Stream error: {e}"},
+                params=params,
+            )
             yield self._make_error_chunk(0, f"Stream error: {e}")
         finally:
             try:

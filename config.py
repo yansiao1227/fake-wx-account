@@ -83,6 +83,15 @@ available_setting = {
     "presence_penalty": 0,
     "request_timeout": 180,  # chatgpt request timeout; the openai api defaults to 600, hard questions usually need longer
     "timeout": 120,  # chatgpt retry timeout; will auto-retry within this window
+    "model_api_max_retries": 3,  # retries after the initial model API request
+    "model_api_retry_base_seconds": 2.0,
+    "model_api_retry_max_seconds": 10.0,
+    "model_api_retry_jitter_seconds": 0.5,
+    "model_api_failure_messages": [
+        "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
+        "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
+        "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
+    ],
     # Baidu Wenxin (ERNIE) params
     "baidu_wenxin_model": "eb-instant",  # defaults to the ERNIE-Bot-turbo model
     "baidu_wenxin_api_key": "",  # Baidu api key

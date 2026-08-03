@@ -21,6 +21,10 @@ from common import const
 from common.log import logger
 from common.utils import expand_path
 from config import conf
+from models.model_api_retry import (
+    ModelApiRetriesExhausted,
+    model_api_failure_message,
+)
 from models.openai_compatible_bot import OpenAICompatibleBot
 
 
@@ -641,6 +645,24 @@ class AgentBridge:
             
             return Reply(ReplyType.TEXT, response)
             
+        except ModelApiRetriesExhausted as e:
+            logger.error(
+                "Model API failed after %s retries: %s",
+                e.retries,
+                e.original_error,
+            )
+            if cancel_event is not None and (request_id or session_id):
+                try:
+                    get_cancel_registry().unregister(request_id or session_id)
+                except Exception:
+                    pass
+            if session_id and steer_inbox is not None:
+                try:
+                    get_steer_registry().unregister(session_id, steer_inbox)
+                except Exception:
+                    pass
+            return Reply(ReplyType.TEXT, model_api_failure_message())
+
         except Exception as e:
             logger.error(f"Agent reply error: {e}")
             # If the agent cleared its messages due to format error / overflow,

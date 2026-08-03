@@ -4,6 +4,15 @@
   "model": "deepseek-v4-flash",
   "deepseek_api_key": "",
   "deepseek_api_base": "https://api.deepseek.com/v1",
+  "model_api_max_retries": 3,
+  "model_api_retry_base_seconds": 2.0,
+  "model_api_retry_max_seconds": 10.0,
+  "model_api_retry_jitter_seconds": 0.5,
+  "model_api_failure_messages": [
+    "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
+    "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
+    "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。"
+  ],
   "qianfan_api_key": "",
   "qianfan_api_base": "https://qianfan.baidubce.com/v2",
   "minimax_api_key": "",
@@ -75,6 +84,8 @@
     "uia_send_interval_ms_max": 5000,
     "uia_conversation_cooldown_seconds": 5,
     "outgoing_echo_suppression_seconds": 300,
+    "uia_owner_lookup_timeout_seconds": 2.0,
+    "uia_owner_failure_cache_seconds": 60.0,
     "uia_group_sender_ocr_enabled": true,
     "uia_group_sender_ocr_body_min_score": 0.6,
     "uia_group_sender_ocr_name_min_score": 0.75,
@@ -84,6 +95,7 @@
     "shell_hook_reconcile_enabled": false,
     "shell_hook_debounce_ms": 250,
     "reply_monitor_interval_seconds": 1.0,
+    "active_conversation_burst_limit": 5,
     "resolve_message_references": true,
     "uia_image_viewer_enabled": true,
     "uia_image_viewer_before_close_ms_min": 300,
@@ -101,6 +113,12 @@
         "我准备调用 `{tool_name}` tool 查一查，稍等我操作一下 🔧",
         "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
         "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀"
+    ],
+    "agent_failure_notice_enabled": true,
+    "agent_failure_notice_templates": [
+        "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
+        "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
+        "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。"
     ],
     "auto_reply_private_all": false,
     "auto_reply_groups_all": false,
