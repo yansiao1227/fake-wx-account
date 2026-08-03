@@ -2208,7 +2208,11 @@ class FakeTimer:
 def test_private_aggregation_uses_sliding_window():
     FakeTimer.instances = []
     channel = _bare_wechat_channel()
-    channel.config = {"private_message_aggregation_ms": 800}
+    channel.config = {
+        "private_message_aggregation_min_ms": 500,
+        "private_message_aggregation_max_ms": 1200,
+        "private_message_aggregation_max_wait_ms": 4000,
+    }
     channel._pending_private_lock = threading.RLock()
     channel._pending_private_batches = {}
     channel._private_batch_timer_factory = FakeTimer
@@ -2234,14 +2238,18 @@ def test_private_aggregation_uses_sliding_window():
 
     assert released == [[first, second]]
     assert first_timer.cancelled is True
-    assert second_timer.interval == 0.8
+    assert 0.5 <= second_timer.interval <= 1.2
     assert channel._pending_private_batches == {}
 
 
 def test_private_aggregation_is_isolated_by_conversation_and_window():
     FakeTimer.instances = []
     channel = _bare_wechat_channel()
-    channel.config = {"private_message_aggregation_ms": 800}
+    channel.config = {
+        "private_message_aggregation_min_ms": 500,
+        "private_message_aggregation_max_ms": 1200,
+        "private_message_aggregation_max_wait_ms": 4000,
+    }
     channel._pending_private_lock = threading.RLock()
     channel._pending_private_batches = {}
     channel._private_batch_timer_factory = FakeTimer
@@ -2270,6 +2278,68 @@ def test_private_aggregation_is_isolated_by_conversation_and_window():
     later_timer.fire()
 
     assert released == [[alice], [bob], [later]]
+
+
+def test_private_aggregation_renews_without_exceeding_hard_deadline(monkeypatch):
+    FakeTimer.instances = []
+    channel = _bare_wechat_channel()
+    channel.config = {
+        "private_message_aggregation_min_ms": 1200,
+        "private_message_aggregation_max_ms": 1200,
+        "private_message_aggregation_max_wait_ms": 4000,
+    }
+    channel._pending_private_lock = threading.RLock()
+    channel._pending_private_batches = {}
+    channel._private_batch_timer_factory = FakeTimer
+    channel._stop_event = threading.Event()
+    channel._trace = lambda *_args, **_kwargs: None
+    released = []
+    channel._submit_materialization = lambda events: released.append(events)
+    timestamps = iter((100.0, 103.7))
+    monkeypatch.setattr(time, "monotonic", lambda: next(timestamps))
+    first = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "first"
+    )
+    second = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "second"
+    )
+
+    channel._defer_private_event(first)
+    first_timer = FakeTimer.instances[-1]
+    channel._defer_private_event(second)
+    deadline_timer = FakeTimer.instances[-1]
+
+    assert first_timer.cancelled is True
+    assert abs(deadline_timer.interval - 0.3) < 1e-9
+    deadline_timer.fire()
+    assert released == [[first, second]]
+
+
+def test_private_aggregation_starts_only_while_robot_is_idle():
+    FakeTimer.instances = []
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._pending_private_lock = threading.RLock()
+    channel._pending_private_batches = {}
+    channel._private_batch_timer_factory = FakeTimer
+    channel._stop_event = threading.Event()
+    channel._trace = lambda *_args, **_kwargs: None
+    channel._reply_queue = SimpleNamespace(
+        status=lambda: {"queue_active_event": "active", "queue_depth": 0}
+    )
+    channel._materialize_queue = queue.Queue()
+    channel._materialization_active = threading.Event()
+    released = []
+    channel._submit_materialization = lambda events: released.append(events)
+    event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "text", "busy"
+    )
+
+    channel._defer_private_event(event)
+
+    assert released == [[event]]
+    assert FakeTimer.instances == []
+    assert channel._pending_private_batches == {}
 
 
 def test_control_events_bypass_private_aggregation():

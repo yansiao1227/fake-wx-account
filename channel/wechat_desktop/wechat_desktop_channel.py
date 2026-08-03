@@ -91,7 +91,9 @@ DEFAULT_CONFIG = {
     "uia_file_download_enabled": True,
     "uia_file_save_as_enabled": True,
     "uia_file_download_timeout_seconds": 10,
-    "private_message_aggregation_ms": 800,
+    "private_message_aggregation_min_ms": 500,
+    "private_message_aggregation_max_ms": 1200,
+    "private_message_aggregation_max_wait_ms": 4000,
     "max_send_per_minute": 5,
     "max_send_per_hour": 60,
     "retention_days": 7,
@@ -240,12 +242,13 @@ class WechatDesktopChannel(ChatChannel):
         )
         self._pending_private_lock = threading.RLock()
         self._pending_private_batches: dict[
-            str, tuple[list[WechatDesktopEvent], threading.Timer]
+            str, tuple[list[WechatDesktopEvent], threading.Timer, float]
         ] = {}
         self._private_batch_timer_factory = threading.Timer
         self._materialize_submit_lock = threading.RLock()
         self._materialize_queue: queue.Queue = queue.Queue()
         self._materialize_stop = object()
+        self._materialization_active = threading.Event()
         self._queue_thread = None
         self._scan_thread = None
         self._materialize_thread = None
@@ -391,6 +394,7 @@ class WechatDesktopChannel(ChatChannel):
             int(self.config.get("active_conversation_burst_limit", 5))
         )
         self._materialize_queue = queue.Queue()
+        self._materialization_active.clear()
         self._queue_thread = threading.Thread(
             target=self._consume_reply_queue,
             name="cow-wechat-reply-fifo",
@@ -721,37 +725,94 @@ class WechatDesktopChannel(ChatChannel):
         self._finish_lifecycle([event.event_id], terminal)
 
     def _defer_private_event(self, event: WechatDesktopEvent):
-        wait_seconds = max(
-            0.05,
-            min(
-                float(self.config.get("private_message_aggregation_ms", 800))
-                / 1000.0,
-                5.0,
-            ),
-        )
+        release_now = None
         with self._pending_private_lock:
             previous = self._pending_private_batches.pop(
                 event.conversation_id, None
             )
+            if previous is None and not self._is_idle_for_private_aggregation():
+                release_now = [event]
             events = list(previous[0]) if previous is not None else []
             if previous is not None:
                 previous[1].cancel()
-            events.append(event)
-            timer = self._private_batch_timer_factory(
-                wait_seconds,
-                self._release_private_batch,
-                args=(event.conversation_id, event.event_id),
-            )
-            timer.daemon = True
-            self._pending_private_batches[event.conversation_id] = (events, timer)
-            timer.start()
+            if release_now is None:
+                events.append(event)
+                now = time.monotonic()
+                first_event_at = previous[2] if previous is not None else now
+                max_wait_seconds = max(
+                    0.05,
+                    float(
+                        self.config.get(
+                            "private_message_aggregation_max_wait_ms", 4000
+                        )
+                    )
+                    / 1000.0,
+                )
+                remaining_seconds = max_wait_seconds - (now - first_event_at)
+                if remaining_seconds <= 0:
+                    release_now = events
+                else:
+                    min_wait_seconds = max(
+                        0.05,
+                        float(
+                            self.config.get(
+                                "private_message_aggregation_min_ms", 500
+                            )
+                        )
+                        / 1000.0,
+                    )
+                    max_wait_window_seconds = max(
+                        min_wait_seconds,
+                        float(
+                            self.config.get(
+                                "private_message_aggregation_max_ms", 1200
+                            )
+                        )
+                        / 1000.0,
+                    )
+                    quiet_seconds = random.uniform(
+                        min_wait_seconds, max_wait_window_seconds
+                    )
+                    wait_seconds = min(quiet_seconds, remaining_seconds)
+                    timer = self._private_batch_timer_factory(
+                        wait_seconds,
+                        self._release_private_batch,
+                        args=(event.conversation_id, event.event_id),
+                    )
+                    timer.daemon = True
+                    self._pending_private_batches[event.conversation_id] = (
+                        events,
+                        timer,
+                        first_event_at,
+                    )
+                    timer.start()
+        if release_now is not None:
+            self._submit_materialization(release_now)
+            wait_seconds = 0.0
         self._trace(
             "09-private-aggregate",
-            "id=%s conversation=%s messages=%s milliseconds=%s",
+            "id=%s conversation=%s messages=%s milliseconds=%s immediate=%s",
             event.event_id[:10],
             event.conversation_name,
-            len(events),
+            len(release_now or events),
             int(wait_seconds * 1000),
+            release_now is not None,
+        )
+
+    def _is_idle_for_private_aggregation(self) -> bool:
+        """Only open a new debounce batch when no reply work is in flight."""
+        reply_queue = getattr(self, "_reply_queue", None)
+        status = reply_queue.status() if reply_queue is not None else {}
+        materialize_queue = getattr(self, "_materialize_queue", None)
+        materialization_active = getattr(self, "_materialization_active", None)
+        return bool(
+            not status.get("queue_active_event")
+            and int(status.get("queue_depth", 0)) == 0
+            and (materialize_queue is None or materialize_queue.empty())
+            and (
+                materialization_active is None
+                or not materialization_active.is_set()
+            )
         )
 
     def _release_private_batch(self, conversation_id: str, last_event_id: str):
@@ -765,13 +826,13 @@ class WechatDesktopChannel(ChatChannel):
                 or pending[0][-1].event_id != last_event_id
             ):
                 return
-            events, _ = self._pending_private_batches.pop(conversation_id)
+            events, _, _ = self._pending_private_batches.pop(conversation_id)
         self._submit_materialization(events)
 
     def _clear_pending_private_batches(self) -> list[str]:
         with self._pending_private_lock:
             event_ids = []
-            for events, timer in self._pending_private_batches.values():
+            for events, timer, _ in self._pending_private_batches.values():
                 timer.cancel()
                 event_ids.extend(event.event_id for event in events)
             self._pending_private_batches.clear()
@@ -952,6 +1013,11 @@ class WechatDesktopChannel(ChatChannel):
                 self._materialize_queue.task_done()
                 return
             event_ids = [event.event_id for event in events]
+            materialization_active = getattr(
+                self, "_materialization_active", None
+            )
+            if materialization_active is not None:
+                materialization_active.set()
             try:
                 if self._has_referenced_attachment(events[-1]):
                     materialized = self._prepare_deferred_materialization(events)
@@ -979,6 +1045,8 @@ class WechatDesktopChannel(ChatChannel):
                     self._store.mark_event_processed(event_id)
                 self._finish_lifecycle(event_ids, "failed")
             finally:
+                if materialization_active is not None:
+                    materialization_active.clear()
                 self._materialize_queue.task_done()
 
     def _enqueue_reply_event(self, event: WechatDesktopEvent):

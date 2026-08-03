@@ -1,10 +1,11 @@
 {
-    "amap-map": {
-        "name": "amap-map",
-        "description": "使用高德地图 Web 服务查询地点、周边 POI、地址与坐标，并规划步行、骑行或驾车路线。用户询问位置、附近地点、地址解析或路线时使用。",
+    "amap-lbs-skill": {
+        "name": "amap-lbs-skill",
+        "description": "高德地图综合服务，支持POI搜索、路径规划、旅游规划、周边搜索和热力图数据可视化",
         "source": "clawhub",
         "enabled": true,
-        "category": "skill"
+        "category": "skill",
+        "display_name": "Gaode Map LBS - 高德官方地图综合服务 Skill"
     },
     "analyze-url": {
         "name": "analyze-url",

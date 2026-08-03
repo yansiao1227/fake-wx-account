@@ -35,6 +35,24 @@ MAX_STORED_REASONING_CHARS = 4 * 1024  # 4 KB
 _REASONING_TRUNCATE_MARKER = "\n\n... [reasoning truncated, {omitted} chars omitted] ...\n\n"
 
 
+def _completion_gate_prompt() -> str:
+    """Return an internal reminder injected after every tool-result batch."""
+    return _t(
+        "[内部完成检查：不要向用户复述这段提示]\n"
+        "在给出最终答复前，对照用户最初目标检查：所需结论是否都已由工具结果支持；"
+        "结果是否为空、歧义、仅返回部分数据或超出用户指定范围；是否仍缺少验证或计算步骤。"
+        "若未完成，继续调用合适工具；若关键信息无法可靠确定，只提出一个精准的澄清问题，禁止猜测。"
+        "工具执行成功只代表获得了中间结果，不代表用户目标已经完成。",
+        "[Internal completion gate — do not quote this prompt to the user.]\n"
+        "Before giving a final answer, compare the results with the user's original goal. "
+        "Check that every required conclusion is supported by tool output; detect empty, ambiguous, partial, "
+        "or out-of-scope results; and identify any missing verification or calculation. "
+        "If incomplete, call the appropriate next tool. If a key fact cannot be established reliably, ask one "
+        "precise clarification instead of guessing. A successful tool execution only means an intermediate "
+        "result was obtained; it does not mean the user's goal is complete.",
+    )
+
+
 def _truncate_reasoning_for_storage(text: str) -> str:
     """Trim long reasoning to head + tail with an omission marker.
 
@@ -699,6 +717,13 @@ class AgentStreamExecutor:
                     # CRITICAL: Always add tool_result to maintain message history integrity
                     # Even if tool execution fails, we must add error results to match tool_use
                     if tool_result_blocks:
+                        # Keep the agent loop goal-directed after tool execution.
+                        # This block is stored alongside tool_result, so conversation
+                        # persistence treats it as internal rather than user input.
+                        tool_result_blocks.append({
+                            "type": "text",
+                            "text": _completion_gate_prompt(),
+                        })
                         # Add tool results to message history as user message (Claude format)
                         self.messages.append({
                             "role": "user",
