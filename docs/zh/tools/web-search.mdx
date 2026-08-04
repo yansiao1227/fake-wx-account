@@ -3,23 +3,32 @@ title: web_search - 联网搜索
 description: 搜索互联网获取实时信息，支持多个搜索厂商
 ---
 
-搜索互联网获取实时信息、新闻、研究等内容。支持博查、百度千帆、智谱、LinkAI 四个 API 后端，并支持无需密钥的 DDGS 聚合搜索。
+搜索互联网获取实时信息、新闻、研究等内容。默认流程：先用百度千帆 **智能 Query 改写** 优化检索词，再并行调用 **百度 / Tavily / DDGS** 三源搜索，按关联度排序后返回最相关结果供大模型汇总。
+
+另支持博查、智谱、LinkAI 等后端（`fixed` 策略或三源均不可用时的回退）。
 
 <Tip>
   推荐通过 [Web 控制台](/zh/channels/web) 的「模型管理 → 搜索」面板可视化配置厂商与策略，无需手动编辑配置文件。
 </Tip>
 
+## 默认流水线
+
+1. **Query 改写**：`POST /v2/tools/query_rewrite`，使用 `QIANFAN_API_KEY`（`~/.cow/.env`）。文档见 [智能 Query 改写](https://cloud.baidu.com/doc/qianfan-api/s/tmokwnznj)。
+2. **三源并行**：将 `altered_query` 同时发给百度千帆搜索、Tavily、DDGS（已配置/可用的）。
+3. **关联度排序**：按 URL 去重，结合标题/摘要与 query 的词面重合、厂商自带 score、多源命中等打分，取 top-N 返回。
+
+改写失败时自动回退为原始 query；无千帆 Key 时跳过改写，仍可搜索。
+
 ## 厂商
 
 | 厂商 | 凭证 | 申请入口 |
 | --- | --- | --- |
+| 百度千帆（搜索 + Query 改写） | 复用 `qianfan_api_key` / `QIANFAN_API_KEY` | [千帆控制台](https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy) |
+| Tavily | `tools.web_search.tavily_api_key` / `TAVILY_API_KEY` | [Tavily](https://tavily.com/) |
+| DDGS | 无需凭证 | 安装 `ddgs` Python 包 |
 | 博查 Bocha | `tools.web_search.bocha_api_key` | [博查开放平台](https://open.bochaai.com/) |
-| 百度千帆 | 复用 `qianfan_api_key` | [千帆控制台](https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy) |
 | 智谱 Zhipu | 复用 `zhipu_ai_api_key` | [智谱开放平台](https://docs.bigmodel.cn/cn/guide/tools/web-search) |
 | LinkAI | 复用 `linkai_api_key` | [LinkAI 控制台](https://link-ai.tech/console/interface) |
-| DDGS | 无需凭证 | 安装 `ddgs` Python 包 |
-
-除博查需要单独的 `bocha_api_key` 外，其他三家直接复用对应模型的 API Key，配好模型即同时获得搜索能力。
 
 ## 路由策略
 
@@ -29,6 +38,7 @@ description: 搜索互联网获取实时信息，支持多个搜索厂商
     "web_search": {
       "strategy": "auto",
       "provider": "",
+      "query_rewrite": true,
       "ddgs_backend": "bing,brave",
       "ddgs_region": "cn-zh"
     }
@@ -36,8 +46,9 @@ description: 搜索互联网获取实时信息，支持多个搜索厂商
 }
 ```
 
-- `auto`（默认）：由 Agent 在可用厂商中智能选择，并可在一次任务中多次调用、切换不同厂商以获取更全面的结果；未指定时按 `bocha → qianfan → zhipu → linkai → ddgs` 顺序选择。
-- `fixed`：固定使用 `provider` 指定的厂商；该厂商凭证缺失时自动回落到 auto 顺序。
+- `auto`（默认）：Query 改写后并行 fan-out 到 `qianfan → tavily → ddgs`；部分源失败不影响其他源；三源皆不可用时再回退博查/智谱/LinkAI。
+- `fixed`：固定使用 `provider` 指定的厂商（仍会先做 Query 改写）；该厂商不可用时回落到 auto 多源。
+- `query_rewrite`：是否启用改写，默认 `true`。
 - `ddgs_backend`：DDGS 内部引擎列表，默认 `bing,brave`，以逗号分隔。
 - `ddgs_region`：DDGS 搜索区域，默认 `cn-zh`。
 

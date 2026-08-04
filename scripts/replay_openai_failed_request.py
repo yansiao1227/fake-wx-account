@@ -1,4 +1,4 @@
-"""Replay requests captured in tmp/openai_failed_requests.jsonl.
+"""Replay requests captured in tmp/failed_requests/openai_failed_requests.jsonl.
 
 The failure log intentionally does not contain authorization headers.  This
 script loads the API key from config.json at replay time and never prints it.
@@ -16,7 +16,7 @@ import requests
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LOG = REPO_ROOT / "tmp" / "openai_failed_requests.jsonl"
+DEFAULT_LOG = REPO_ROOT / "tmp" / "failed_requests" / "openai_failed_requests.jsonl"
 DEFAULT_CONFIG = REPO_ROOT / "config.json"
 
 

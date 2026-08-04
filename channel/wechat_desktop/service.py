@@ -27,7 +27,6 @@ class WechatDesktopService:
             "auto_reply_private_all": False,
             "auto_reply_groups_all": False,
             "auto_reply_blacklist": [],
-            "learn_from_official_accounts": False,
             "diagnostic_logging": False,
             "reply_in_flight": False,
             "reply_conversation": "",

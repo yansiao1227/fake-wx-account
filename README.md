@@ -197,7 +197,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe scripts\clear_daily_hot_state.py
 ```
 
 - `model_api_max_retries` 表示首次请求之后的重试次数（默认最多约 4 次总尝试）。
-- OpenAI 兼容客户端可将失败请求记录到 `tmp/openai_failed_requests.jsonl`，可用脚本回放：
+- OpenAI 兼容客户端可将失败请求记录到 `tmp/failed_requests/openai_failed_requests.jsonl`，可用脚本回放：
 
 ```powershell
 D:\Miniconda\envs\cowagent-wechat\python.exe scripts\replay_openai_failed_request.py

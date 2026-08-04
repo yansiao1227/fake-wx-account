@@ -2,33 +2,47 @@
   - tavily  (https://api.tavily.com/search)
   - bocha   (https://open.bochaai.com)
   - zhipu   (https://docs.bigmodel.cn/cn/guide/tools/web-search)
-  - qianfan (https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy)
+  - qianfan / baidu (https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy)
   - linkai  (https://link-ai.tech, fallback)
   - ddgs    (keyless metasearch fallback)
 
+Default search pipeline (strategy 'auto')
+  1. Call Baidu Qianfan ``/v2/tools/query_rewrite`` with ``QIANFAN_API_KEY``
+     to produce an optimized ``altered_query`` (and optional decomposition).
+  2. Fan-out the rewritten query to the multi-source trio in parallel:
+     baidu/qianfan, tavily, ddgs (whichever are configured/available).
+  3. Deduplicate by URL, score by relevance to the original + rewritten
+     query, and return the top-N results for the model to summarize.
+
 Provider selection
-  - strategy 'auto' (default): pick the first configured provider in the
-    canonical order [qianfan, tavily, bocha, zhipu, linkai, ddgs]. Caller
-    hints cannot bypass this deployment fallback order.
-  - strategy 'fixed': use the configured provider; if its credential is
-    missing at call time, silently fall back to auto order (no card hint).
+  - strategy 'auto' (default): multi-source fan-out over baidu/tavily/ddgs.
+    If none of the trio is available, fall back through the remaining
+    providers in PROVIDER_ORDER.
+  - strategy 'fixed': use the configured provider only (still rewrites the
+    query first when a Qianfan key is present). If its credential is
+    missing at call time, silently fall back to auto multi-source.
 
 Credentials
   - tavily  : tools.web_search.tavily_api_key -> env TAVILY_API_KEY
   - bocha   : tools.web_search.bocha_api_key  ->  env BOCHA_API_KEY
   - zhipu   : conf.zhipu_ai_api_key            ->  env ZHIPUAI_API_KEY
   - qianfan : conf.qianfan_api_key             ->  env QIANFAN_API_KEY
+              (also used for query_rewrite)
   - linkai  : conf.linkai_api_key              ->  env LINKAI_API_KEY
   - ddgs    : no credential required; requires the ``ddgs`` Python package
+
+Query rewrite docs: https://cloud.baidu.com/doc/qianfan-api/s/tmokwnznj
 """
 
 import json
 import os
+import re
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -48,14 +62,18 @@ from config import conf, get_data_root
 
 
 DEFAULT_TIMEOUT = 30
+REWRITE_TIMEOUT = 15
 CITATION_POLICY = (
     "When search results inform the answer, cite the supporting result URLs as "
     "clickable source links. Do not present search-derived factual claims without citations."
 )
 
-# Canonical fallback order. Baidu Search is preferred, Tavily follows, and
-# DDGS remains the final keyless fallback when API-backed providers fail.
+# Full catalog of backends (used for fixed strategy / legacy single-provider).
 PROVIDER_ORDER = ("qianfan", "tavily", "bocha", "zhipu", "linkai", "ddgs")
+
+# Default multi-source fan-out trio (baidu search is exposed as provider id
+# ``qianfan`` for credential and quota continuity).
+MULTI_SOURCE_PROVIDERS = ("qianfan", "tavily", "ddgs")
 
 PROVIDER_LABELS = {
     "tavily": "Tavily",
@@ -70,6 +88,12 @@ _DEFAULT_PROVIDER_QUOTAS = {
     "qianfan": ("day", 50),
     "tavily": ("month", 1000),
 }
+
+# Lightweight CJK / Latin tokeniser for relevance scoring.
+_TOKEN_RE = re.compile(
+    r"[A-Za-z0-9_]+|[\u4e00-\u9fff]",
+    re.UNICODE,
+)
 
 
 class WebSearchUsageStore:
@@ -193,12 +217,197 @@ def configured_providers() -> List[str]:
     return [p for p in PROVIDER_ORDER if (p == "ddgs" and DDGS is not None) or _get_api_key(p)]
 
 
+def multi_source_providers() -> List[str]:
+    """Providers used for the default multi-source fan-out.
+
+    Prefer the baidu/tavily/ddgs trio. When none of them is available, fall
+    back to any other configured provider so the tool remains usable.
+    """
+    available = set(configured_providers())
+    trio = [p for p in MULTI_SOURCE_PROVIDERS if p in available]
+    if trio:
+        return trio
+    return [p for p in PROVIDER_ORDER if p in available]
+
+
 def _configured_strategy() -> str:
     return (_tools_web_search_conf().get("strategy") or "auto").strip().lower()
 
 
 def _configured_provider() -> str:
     return (_tools_web_search_conf().get("provider") or "").strip().lower()
+
+
+def _query_rewrite_enabled() -> bool:
+    """Whether to call Qianfan query_rewrite before searching (default True)."""
+    val = _tools_web_search_conf().get("query_rewrite")
+    if val is None:
+        return True
+    return bool(val)
+
+
+def _tokenize_for_relevance(text: str) -> List[str]:
+    """Extract lightweight tokens for relevance scoring (Latin words + CJK chars)."""
+    if not text:
+        return []
+    return [t.lower() for t in _TOKEN_RE.findall(text)]
+
+
+def _normalize_result_url(url: str) -> str:
+    """Normalize URL for cross-provider deduplication."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw.rstrip("/").lower()
+    scheme = (parsed.scheme or "https").lower()
+    netloc = (parsed.netloc or "").lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = (parsed.path or "").rstrip("/")
+    return f"{scheme}://{netloc}{path}"
+
+
+def _overlap_score(query_tokens: List[str], text: str) -> float:
+    if not query_tokens:
+        return 0.0
+    text_tokens = set(_tokenize_for_relevance(text))
+    if not text_tokens:
+        return 0.0
+    hits = sum(1 for t in query_tokens if t in text_tokens)
+    return hits / float(len(query_tokens))
+
+
+def score_result_relevance(
+    query: str,
+    altered_query: str,
+    item: Dict[str, Any],
+    *,
+    provider_rank: int = 0,
+    provider_hits: int = 1,
+) -> float:
+    """Score how relevant a single result is to the search intent.
+
+    Combines:
+      - lexical overlap of original + rewritten query against title/snippet
+      - provider-native score when present (e.g. Tavily)
+      - multi-provider agreement boost
+      - mild within-provider rank bonus (earlier results score higher)
+    """
+    title = str(item.get("title") or "")
+    snippet = str(item.get("snippet") or item.get("summary") or "")
+    queries = [q for q in (query, altered_query) if q]
+    if not queries:
+        base_overlap = 0.0
+    else:
+        overlaps = []
+        for q in queries:
+            tokens = _tokenize_for_relevance(q)
+            title_s = _overlap_score(tokens, title)
+            snip_s = _overlap_score(tokens, snippet)
+            overlaps.append(0.7 * title_s + 0.3 * snip_s)
+        base_overlap = max(overlaps) if overlaps else 0.0
+
+    provider_score = 0.0
+    raw_score = item.get("score")
+    if isinstance(raw_score, (int, float)):
+        provider_score = max(0.0, min(1.0, float(raw_score)))
+
+    rank_bonus = max(0.0, 0.12 * (1.0 - min(provider_rank, 20) / 20.0))
+    multi_boost = 0.08 * max(0, int(provider_hits) - 1)
+
+    # Weighted blend; keep in [0, 1].
+    score = (
+        0.55 * base_overlap
+        + 0.30 * provider_score
+        + rank_bonus
+        + multi_boost
+    )
+    return round(max(0.0, min(1.0, score)), 4)
+
+
+def merge_and_rank_results(
+    query: str,
+    altered_query: str,
+    provider_payloads: List[Tuple[str, List[Dict[str, Any]]]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Deduplicate multi-provider hits by URL and return top-N by relevance."""
+    by_url: Dict[str, Dict[str, Any]] = {}
+
+    for provider, items in provider_payloads:
+        for rank, raw in enumerate(items or []):
+            if not isinstance(raw, dict):
+                continue
+            url = str(raw.get("url") or "").strip()
+            title = str(raw.get("title") or "").strip()
+            if not url or not title:
+                continue
+            key = _normalize_result_url(url) or url
+            if key not in by_url:
+                entry = {
+                    "title": title,
+                    "url": url,
+                    "snippet": str(raw.get("snippet") or "").strip(),
+                    "siteName": str(raw.get("siteName") or "").strip(),
+                    "datePublished": str(raw.get("datePublished") or "").strip(),
+                    "sources": [provider],
+                    "_best_rank": rank,
+                    "_provider_score": raw.get("score"),
+                }
+                if raw.get("summary"):
+                    entry["summary"] = raw["summary"]
+                by_url[key] = entry
+            else:
+                entry = by_url[key]
+                if provider not in entry["sources"]:
+                    entry["sources"].append(provider)
+                # Prefer longer snippet / title when merging duplicates.
+                snip = str(raw.get("snippet") or "").strip()
+                if len(snip) > len(entry.get("snippet") or ""):
+                    entry["snippet"] = snip
+                if raw.get("summary") and not entry.get("summary"):
+                    entry["summary"] = raw["summary"]
+                if not entry.get("siteName") and raw.get("siteName"):
+                    entry["siteName"] = str(raw.get("siteName") or "")
+                if not entry.get("datePublished") and raw.get("datePublished"):
+                    entry["datePublished"] = str(raw.get("datePublished") or "")
+                entry["_best_rank"] = min(entry.get("_best_rank", rank), rank)
+                # Keep strongest native score when present.
+                prev = entry.get("_provider_score")
+                cur = raw.get("score")
+                if isinstance(cur, (int, float)):
+                    if not isinstance(prev, (int, float)) or float(cur) > float(prev):
+                        entry["_provider_score"] = cur
+
+    ranked: List[Dict[str, Any]] = []
+    for entry in by_url.values():
+        proxy = {
+            "title": entry.get("title"),
+            "snippet": entry.get("snippet"),
+            "summary": entry.get("summary"),
+            "score": entry.get("_provider_score"),
+        }
+        entry["score"] = score_result_relevance(
+            query,
+            altered_query,
+            proxy,
+            provider_rank=int(entry.pop("_best_rank", 0) or 0),
+            provider_hits=len(entry.get("sources") or []),
+        )
+        entry.pop("_provider_score", None)
+        ranked.append(entry)
+
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            len(item.get("sources") or []),
+        ),
+        reverse=True,
+    )
+    return ranked[: max(1, min(int(limit or 10), 50))]
 
 
 class WebSearch(BaseTool):
@@ -304,39 +513,140 @@ class WebSearch(BaseTool):
     # Provider resolution
     # ------------------------------------------------------------------
 
-    def _resolve_provider(self, requested: Optional[str]) -> Optional[str]:
-        """Pick a provider for this call.
+    def _resolve_search_providers(self, requested: Optional[str]) -> List[str]:
+        """Resolve which providers to hit for this call.
 
-        Fixed strategy wins when configured. Auto strategy always starts at
-        the first configured provider in PROVIDER_ORDER.
+        - fixed: single pinned provider when available
+        - auto: multi-source trio (baidu/tavily/ddgs), else remaining backends
         """
         available = configured_providers()
         if not available:
-            return None
+            return []
 
         if _configured_strategy() == "fixed":
             pinned = _configured_provider()
             if pinned in available:
-                return pinned
+                return [pinned]
             if pinned:
-                logger.warning(f"[WebSearch] pinned provider '{pinned}' unavailable, falling back to auto")
+                logger.warning(
+                    "[WebSearch] pinned provider '%s' unavailable, falling back to auto multi-source",
+                    pinned,
+                )
 
         if requested:
             logger.info(
                 "[WebSearch] ignoring provider hint=%r in auto strategy; "
-                "using configured fallback order",
+                "using multi-source fan-out",
                 requested,
             )
 
-        return available[0]
+        return multi_source_providers()
+
+    def _resolve_provider(self, requested: Optional[str]) -> Optional[str]:
+        """Compatibility helper: first provider of the resolved set."""
+        providers = self._resolve_search_providers(requested)
+        return providers[0] if providers else None
 
     @staticmethod
-    def _resolution_reason(requested: Optional[str], chosen: str) -> str:
-        """Human-readable explanation for why `chosen` won the resolver."""
+    def _resolution_reason(requested: Optional[str], providers: List[str]) -> str:
+        """Human-readable explanation for the routing decision."""
         strategy = _configured_strategy()
-        if strategy == "fixed" and _configured_provider() == chosen:
+        if strategy == "fixed" and len(providers) == 1 and _configured_provider() == providers[0]:
             return "fixed-strategy"
+        if len(providers) > 1:
+            return "multi-source"
         return "auto-fallback"
+
+    # ------------------------------------------------------------------
+    # Query rewrite (Baidu Qianfan)
+    # ------------------------------------------------------------------
+
+    def _rewrite_query(self, query: str) -> Dict[str, Any]:
+        """Call Qianfan query_rewrite; fall back to the original query on any failure.
+
+        API: POST https://qianfan.baidubce.com/v2/tools/query_rewrite
+        Docs: https://cloud.baidu.com/doc/qianfan-api/s/tmokwnznj
+        Auth: Bearer QIANFAN_API_KEY from ~/.cow/.env / conf.
+        """
+        original = (query or "").strip()
+        empty = {
+            "query": original,
+            "altered_query": original,
+            "decomposition_query": [],
+            "rewritten": False,
+        }
+        if not original or not _query_rewrite_enabled():
+            return empty
+
+        api_key = _get_api_key("qianfan")
+        if not api_key:
+            logger.info("[WebSearch] query_rewrite skipped: no QIANFAN_API_KEY")
+            return empty
+
+        api_base = (conf().get("qianfan_api_base") or "https://qianfan.baidubce.com/v2").rstrip("/")
+        url = f"{api_base}/tools/query_rewrite"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {"query": original}
+
+        try:
+            resp = requests.post(
+                url, headers=headers, json=payload, timeout=REWRITE_TIMEOUT
+            )
+        except requests.Timeout:
+            logger.warning("[WebSearch] query_rewrite timed out; using original query")
+            return empty
+        except requests.RequestException as exc:
+            logger.warning("[WebSearch] query_rewrite request failed: %s", exc)
+            return empty
+
+        if resp.status_code != 200:
+            logger.warning(
+                "[WebSearch] query_rewrite HTTP %s: %s",
+                resp.status_code,
+                (resp.text or "")[:200],
+            )
+            return empty
+
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning("[WebSearch] query_rewrite returned non-JSON body")
+            return empty
+
+        if not isinstance(data, dict):
+            return empty
+
+        # Business errors surface as non-zero code even on HTTP 200.
+        code = data.get("code")
+        if code not in (None, 0, "0"):
+            logger.warning(
+                "[WebSearch] query_rewrite business error code=%s message=%s",
+                code,
+                data.get("message"),
+            )
+            return empty
+
+        altered = str(data.get("altered_query") or "").strip() or original
+        decomposition = data.get("decomposition_query") or []
+        if not isinstance(decomposition, list):
+            decomposition = []
+        decomposition = [str(q).strip() for q in decomposition if str(q).strip()]
+
+        logger.info(
+            "[WebSearch] query_rewrite ok altered=%r decomposition=%d",
+            altered if len(altered) <= 80 else (altered[:77] + "..."),
+            len(decomposition),
+        )
+        return {
+            "query": original,
+            "altered_query": altered,
+            "decomposition_query": decomposition,
+            "rewritten": altered != original or bool(decomposition),
+            "request_id": data.get("requestId") or data.get("request_id") or "",
+        }
 
     # ------------------------------------------------------------------
     # Entry point
@@ -361,64 +671,191 @@ class WebSearch(BaseTool):
             count = 10
 
         requested = args.get("provider")
-        provider = self._resolve_provider(requested)
-        if not provider:
+        providers = self._resolve_search_providers(requested)
+        if not providers:
             return ToolResult.fail(
                 "Error: No search provider configured. "
-                "Configure TAVILY_API_KEY or another supported search provider."
+                "Configure QIANFAN_API_KEY / TAVILY_API_KEY or install ddgs."
             )
 
-        # Always log the routing decision so multi-provider deployments can
-        # tell at a glance which backend served any given query.
+        # 1) Optimize the query via Baidu Qianfan before searching.
+        rewrite = self._rewrite_query(query)
+        search_query = (rewrite.get("altered_query") or query).strip() or query
+
         available = configured_providers()
-        reason = self._resolution_reason(requested, provider)
-        q_preview = query if len(query) <= 60 else (query[:57] + "...")
+        reason = self._resolution_reason(requested, providers)
+        q_preview = search_query if len(search_query) <= 60 else (search_query[:57] + "...")
         logger.info(
-            f"[WebSearch] provider={provider} reason={reason} "
-            f"available={list(available)} query={q_preview!r} count={count} freshness={freshness}"
+            "[WebSearch] providers=%s reason=%s available=%s "
+            "query=%r search_query=%r count=%s freshness=%s",
+            list(providers),
+            reason,
+            list(available),
+            query if len(query) <= 60 else (query[:57] + "..."),
+            q_preview,
+            count,
+            freshness,
         )
 
-        if provider in available:
-            candidates = [provider] + [item for item in available if item != provider]
-        else:
-            # Configuration may be reloaded between resolution and execution;
-            # still honor the already-resolved provider for this call.
-            candidates = [provider]
-        failures = []
-        for attempt, candidate in enumerate(candidates, start=1):
-            if attempt > 1:
-                previous = candidates[attempt - 2]
+        # 2) Fan-out to resolved providers (parallel for multi-source).
+        provider_payloads, failures = self._fanout_search(
+            providers, search_query, count, freshness, summary
+        )
+
+        # If the primary selection produced nothing (e.g. fixed provider down
+        # or all multi-source legs empty), try any remaining configured
+        # backends as a last resort.
+        if not provider_payloads:
+            remaining = [p for p in configured_providers() if p not in providers]
+            if remaining:
                 logger.warning(
-                    "[WebSearch] provider=%s failed; falling back to provider=%s",
-                    previous,
-                    candidate,
+                    "[WebSearch] primary providers failed (%s); trying remaining=%s",
+                    failures,
+                    remaining,
                 )
-            reserved, usage_count, quota_limit = self._reserve_provider(candidate)
+                extra_payloads, extra_failures = self._fanout_search(
+                    remaining, search_query, count, freshness, summary
+                )
+                failures.extend(extra_failures)
+                provider_payloads = extra_payloads
+
+        if not provider_payloads:
+            detail = " | ".join(failures) if failures else "no results"
+            return ToolResult.fail(f"Error: All search providers failed. {detail}")
+
+        # 3) Merge + rank by relevance; keep the most related hits.
+        ranked = merge_and_rank_results(
+            query, search_query, provider_payloads, count
+        )
+        if not ranked:
+            detail = " | ".join(failures) if failures else "empty result sets"
+            return ToolResult.fail(
+                f"Error: Search returned no usable results. {detail}"
+            )
+
+        backends = [name for name, _ in provider_payloads]
+        output: Dict[str, Any] = {
+            "query": query,
+            "altered_query": search_query,
+            "backend": "multi" if len(backends) > 1 else backends[0],
+            "backends": backends,
+            "total": len(ranked),
+            "count": len(ranked),
+            "results": ranked,
+        }
+        if rewrite.get("decomposition_query"):
+            output["decomposition_query"] = rewrite["decomposition_query"]
+        if rewrite.get("request_id"):
+            output["rewrite_request_id"] = rewrite["request_id"]
+        if failures:
+            output["provider_warnings"] = failures
+
+        return self._attach_citation_policy(ToolResult.success(output))
+
+    def _fanout_search(
+        self,
+        providers: List[str],
+        query: str,
+        count: int,
+        freshness: str,
+        summary: bool,
+    ) -> Tuple[List[Tuple[str, List[Dict[str, Any]]]], List[str]]:
+        """Run one or more providers; multi-source runs in parallel."""
+        if not providers:
+            return [], ["no providers"]
+
+        if len(providers) == 1:
+            provider = providers[0]
+            reserved, usage_count, quota_limit = self._reserve_provider(provider)
+            if not reserved:
+                return [], [
+                    f"{PROVIDER_LABELS.get(provider, provider)}: local quota "
+                    f"reached ({usage_count}/{quota_limit})"
+                ]
+            logger.info(
+                "[WebSearch] provider=%s usage=%s%s",
+                provider,
+                usage_count,
+                f"/{quota_limit}" if quota_limit is not None else "",
+            )
+            result = self._execute_provider(provider, query, count, freshness, summary)
+            if result.status != "success":
+                return [], [
+                    f"{PROVIDER_LABELS.get(provider, provider)}: {result.result}"
+                ]
+            items = list((result.result or {}).get("results") or [])
+            return [(provider, items)], []
+
+        # Parallel multi-source search.
+        payloads: List[Tuple[str, List[Dict[str, Any]]]] = []
+        failures: List[str] = []
+        runnable: List[str] = []
+
+        for provider in providers:
+            reserved, usage_count, quota_limit = self._reserve_provider(provider)
             if not reserved:
                 logger.info(
                     "[WebSearch] provider=%s skipped quota=%s/%s",
-                    candidate,
+                    provider,
                     usage_count,
                     quota_limit,
                 )
                 failures.append(
-                    f"{PROVIDER_LABELS.get(candidate, candidate)}: local quota "
+                    f"{PROVIDER_LABELS.get(provider, provider)}: local quota "
                     f"reached ({usage_count}/{quota_limit})"
                 )
                 continue
             logger.info(
                 "[WebSearch] provider=%s usage=%s%s",
-                candidate,
+                provider,
                 usage_count,
                 f"/{quota_limit}" if quota_limit is not None else "",
             )
-            result = self._execute_provider(
-                candidate, query, count, freshness, summary
+            runnable.append(provider)
+
+        if not runnable:
+            return [], failures
+
+        def _run(provider: str) -> Tuple[str, ToolResult]:
+            return provider, self._execute_provider(
+                provider, query, count, freshness, summary
             )
-            if result.status == "success":
-                return self._attach_citation_policy(result)
-            failures.append(f"{PROVIDER_LABELS.get(candidate, candidate)}: {result.result}")
-        return ToolResult.fail("Error: All search providers failed. " + " | ".join(failures))
+
+        max_workers = min(len(runnable), 3)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_run, p): p for p in runnable}
+            for fut in as_completed(futures):
+                provider = futures[fut]
+                try:
+                    name, result = fut.result()
+                except Exception as exc:  # defensive: provider wrappers already catch
+                    logger.error(
+                        "[WebSearch] provider=%s fan-out raised: %s",
+                        provider,
+                        exc,
+                        exc_info=True,
+                    )
+                    failures.append(
+                        f"{PROVIDER_LABELS.get(provider, provider)}: {exc}"
+                    )
+                    continue
+                if result.status != "success":
+                    failures.append(
+                        f"{PROVIDER_LABELS.get(name, name)}: {result.result}"
+                    )
+                    continue
+                items = list((result.result or {}).get("results") or [])
+                if not items:
+                    failures.append(
+                        f"{PROVIDER_LABELS.get(name, name)}: empty results"
+                    )
+                    continue
+                payloads.append((name, items))
+
+        # Stable order for backends field: follow MULTI_SOURCE / input order.
+        order = {p: i for i, p in enumerate(providers)}
+        payloads.sort(key=lambda pair: order.get(pair[0], 99))
+        return payloads, failures
 
     def _execute_provider(
         self, provider: str, query: str, count: int, freshness: str, summary: bool

@@ -56,9 +56,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_reply_blacklist": [],
     "conversation_history_retention_days": 90,
 
-    # 可选的公众号知识沉淀与诊断能力。
-    "learn_from_official_accounts": True,
-    "official_account_knowledge_max_chars": 4000,
+    # 可选诊断能力。
     "diagnostic_logging": True,
 
     # Agent 回复周期与工具调用进度通知。

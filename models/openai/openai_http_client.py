@@ -43,6 +43,7 @@ DEFAULT_TIMEOUT = 600  # seconds; matches old openai SDK default
 _FAILED_REQUEST_LOG = (
     Path(__file__).resolve().parents[2]
     / "tmp"
+    / "failed_requests"
     / "openai_failed_requests.jsonl"
 )
 _FAILED_REQUEST_LOG_LOCK = threading.Lock()

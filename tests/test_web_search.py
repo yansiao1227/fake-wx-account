@@ -12,6 +12,7 @@ def test_tavily_is_preferred_before_ddgs(monkeypatch):
     monkeypatch.setattr(module, "DDGS", object())
 
     assert module.configured_providers() == ["tavily", "ddgs"]
+    assert module.multi_source_providers() == ["tavily", "ddgs"]
     assert module.WebSearch()._resolve_provider(None) == "tavily"
 
 
@@ -24,21 +25,47 @@ def test_baidu_is_preferred_before_tavily_and_ddgs(monkeypatch):
     monkeypatch.setattr(module, "DDGS", object())
 
     assert module.configured_providers() == ["qianfan", "tavily", "ddgs"]
-    assert module.WebSearch()._resolve_provider(None) == "qianfan"
+    assert module.multi_source_providers() == ["qianfan", "tavily", "ddgs"]
+    # Auto strategy resolves the full multi-source trio.
+    assert module.WebSearch()._resolve_search_providers(None) == [
+        "qianfan",
+        "tavily",
+        "ddgs",
+    ]
 
 
-def test_auto_strategy_ignores_ddgs_hint_and_keeps_provider_priority(monkeypatch):
+def test_auto_strategy_ignores_ddgs_hint_and_fans_out(monkeypatch):
     tool = module.WebSearch()
     monkeypatch.setattr(
         module, "configured_providers", lambda: ["qianfan", "tavily", "ddgs"]
     )
+    monkeypatch.setattr(module, "multi_source_providers", lambda: ["qianfan", "tavily", "ddgs"])
     monkeypatch.setattr(module, "_configured_strategy", lambda: "auto")
+    monkeypatch.setattr(
+        tool,
+        "_rewrite_query",
+        lambda query: {
+            "query": query,
+            "altered_query": query,
+            "decomposition_query": [],
+            "rewritten": False,
+        },
+    )
     calls = []
 
     def execute_provider(provider, query, count, freshness, summary):
         calls.append(provider)
         return module.ToolResult.success(
-            {"backend": provider, "results": [{"url": "https://example.cn"}]}
+            {
+                "backend": provider,
+                "results": [
+                    {
+                        "title": f"{provider} hit",
+                        "url": f"https://example.cn/{provider}",
+                        "snippet": "example",
+                    }
+                ],
+            }
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
@@ -47,8 +74,9 @@ def test_auto_strategy_ignores_ddgs_hint_and_keeps_provider_priority(monkeypatch
     result = tool.execute({"query": "example", "provider": "ddgs"})
 
     assert result.status == "success"
-    assert result.result["backend"] == "qianfan"
-    assert calls == ["qianfan"]
+    assert result.result["backend"] == "multi"
+    assert set(result.result["backends"]) == {"qianfan", "tavily", "ddgs"}
+    assert set(calls) == {"qianfan", "tavily", "ddgs"}
     assert "provider" not in module.WebSearch.get_json_schema()["parameters"]["properties"]
 
 
@@ -93,19 +121,242 @@ def test_baidu_request_matches_official_search_api(monkeypatch):
     assert len(calls["json"]["messages"][0]["content"]) == 36
 
 
-def test_baidu_then_tavily_then_ddgs_fallback_order(monkeypatch):
+def test_query_rewrite_uses_qianfan_key_and_endpoint(monkeypatch):
+    calls = {}
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "altered_query": "北京今日天气 旅行计划",
+                "code": 0,
+                "decomposition_query": ["北京今日天气", "北京旅行建议"],
+                "message": "success",
+                "requestId": "req-1",
+            }
+
+    def post(url, **kwargs):
+        calls.update({"url": url, **kwargs})
+        return Response()
+
+    monkeypatch.setattr(module, "_get_api_key", lambda provider: "qf-secret")
+    monkeypatch.setattr(module.requests, "post", post)
+
+    rewrite = module.WebSearch()._rewrite_query("北京的天气怎样，适合制定怎样的旅行计划")
+
+    assert calls["url"] == "https://qianfan.baidubce.com/v2/tools/query_rewrite"
+    assert calls["headers"]["Authorization"] == "Bearer qf-secret"
+    assert calls["json"] == {
+        "query": "北京的天气怎样，适合制定怎样的旅行计划"
+    }
+    assert rewrite["altered_query"] == "北京今日天气 旅行计划"
+    assert rewrite["decomposition_query"] == ["北京今日天气", "北京旅行建议"]
+    assert rewrite["rewritten"] is True
+    assert rewrite["request_id"] == "req-1"
+
+
+def test_query_rewrite_failure_falls_back_to_original(monkeypatch):
+    monkeypatch.setattr(module, "_get_api_key", lambda provider: "qf-secret")
+
+    def post(*args, **kwargs):
+        raise module.requests.Timeout("boom")
+
+    monkeypatch.setattr(module.requests, "post", post)
+    rewrite = module.WebSearch()._rewrite_query("原始问题")
+
+    assert rewrite["altered_query"] == "原始问题"
+    assert rewrite["rewritten"] is False
+
+
+def test_execute_rewrites_then_fans_out_to_baidu_tavily_ddgs(monkeypatch):
     tool = module.WebSearch()
     monkeypatch.setattr(
         module, "configured_providers", lambda: ["qianfan", "tavily", "ddgs"]
     )
-    monkeypatch.setattr(tool, "_resolve_provider", lambda requested: "qianfan")
+    monkeypatch.setattr(
+        module, "multi_source_providers", lambda: ["qianfan", "tavily", "ddgs"]
+    )
+    monkeypatch.setattr(
+        tool,
+        "_rewrite_query",
+        lambda query: {
+            "query": query,
+            "altered_query": "optimized query",
+            "decomposition_query": ["sub a", "sub b"],
+            "rewritten": True,
+            "request_id": "r1",
+        },
+    )
+    seen = []
+
+    def execute_provider(provider, query, count, freshness, summary):
+        seen.append((provider, query))
+        return module.ToolResult.success(
+            {
+                "backend": provider,
+                "results": [
+                    {
+                        "title": f"{provider} about optimized",
+                        "url": f"https://example.com/{provider}",
+                        "snippet": f"{provider} snippet optimized query",
+                        "score": 0.9 if provider == "tavily" else None,
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(tool, "_execute_provider", execute_provider)
+    monkeypatch.setattr(tool, "_reserve_provider", lambda provider: (True, 1, None))
+
+    result = tool.execute({"query": "raw user query", "count": 5})
+
+    assert result.status == "success"
+    assert result.result["query"] == "raw user query"
+    assert result.result["altered_query"] == "optimized query"
+    assert result.result["decomposition_query"] == ["sub a", "sub b"]
+    assert result.result["backend"] == "multi"
+    assert set(result.result["backends"]) == {"qianfan", "tavily", "ddgs"}
+    assert {p for p, q in seen} == {"qianfan", "tavily", "ddgs"}
+    assert all(q == "optimized query" for _, q in seen)
+    assert result.result["count"] == 3
+    assert all("score" in item for item in result.result["results"])
+
+
+def test_multi_source_partial_failure_still_returns_ranked_hits(monkeypatch):
+    tool = module.WebSearch()
+    monkeypatch.setattr(
+        module, "configured_providers", lambda: ["qianfan", "tavily", "ddgs"]
+    )
+    monkeypatch.setattr(
+        module, "multi_source_providers", lambda: ["qianfan", "tavily", "ddgs"]
+    )
+    monkeypatch.setattr(
+        tool,
+        "_rewrite_query",
+        lambda query: {
+            "query": query,
+            "altered_query": query,
+            "decomposition_query": [],
+            "rewritten": False,
+        },
+    )
+
+    def execute_provider(provider, query, count, freshness, summary):
+        if provider == "qianfan":
+            return module.ToolResult.fail("Error: qianfan unavailable")
+        return module.ToolResult.success(
+            {
+                "backend": provider,
+                "results": [
+                    {
+                        "title": f"{provider} title example",
+                        "url": f"https://example.com/{provider}",
+                        "snippet": "example snippet",
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(tool, "_execute_provider", execute_provider)
+    monkeypatch.setattr(tool, "_reserve_provider", lambda provider: (True, 1, None))
+
+    result = tool.execute({"query": "example"})
+
+    assert result.status == "success"
+    assert "qianfan" not in result.result["backends"]
+    assert set(result.result["backends"]) == {"tavily", "ddgs"}
+    assert any("qianfan" in w.lower() or "Baidu" in w for w in result.result["provider_warnings"])
+
+
+def test_merge_and_rank_prefers_more_relevant_and_multi_source_hits():
+    payloads = [
+        (
+            "qianfan",
+            [
+                {
+                    "title": "北京今日天气实况",
+                    "url": "https://weather.example/bj",
+                    "snippet": "北京今天晴，气温适宜出行",
+                },
+                {
+                    "title": "无关新闻",
+                    "url": "https://news.example/other",
+                    "snippet": "股市波动",
+                },
+            ],
+        ),
+        (
+            "tavily",
+            [
+                {
+                    "title": "Beijing weather today",
+                    "url": "https://weather.example/bj",
+                    "snippet": "Sunny in Beijing",
+                    "score": 0.95,
+                }
+            ],
+        ),
+        (
+            "ddgs",
+            [
+                {
+                    "title": "旅游攻略",
+                    "url": "https://travel.example/guide",
+                    "snippet": "通用旅行建议",
+                }
+            ],
+        ),
+    ]
+    ranked = module.merge_and_rank_results(
+        "北京天气", "北京今日天气", payloads, limit=3
+    )
+
+    assert ranked[0]["url"] == "https://weather.example/bj"
+    assert set(ranked[0]["sources"]) == {"qianfan", "tavily"}
+    assert ranked[0]["score"] >= ranked[-1]["score"]
+
+
+def test_baidu_then_tavily_then_ddgs_fallback_when_primary_empty(monkeypatch):
+    """If multi-source trio is empty of usable results, remaining backends are tried."""
+    tool = module.WebSearch()
+    # Simulate only the trio configured; all fail then nothing remaining.
+    monkeypatch.setattr(
+        module, "configured_providers", lambda: ["qianfan", "tavily", "ddgs"]
+    )
+    monkeypatch.setattr(
+        module, "multi_source_providers", lambda: ["qianfan", "tavily", "ddgs"]
+    )
+    monkeypatch.setattr(
+        tool,
+        "_rewrite_query",
+        lambda query: {
+            "query": query,
+            "altered_query": query,
+            "decomposition_query": [],
+            "rewritten": False,
+        },
+    )
     calls = []
 
     def execute_provider(provider, query, count, freshness, summary):
         calls.append(provider)
         if provider != "ddgs":
             return module.ToolResult.fail(f"Error: {provider} unavailable")
-        return module.ToolResult.success({"backend": "ddgs", "results": []})
+        return module.ToolResult.success(
+            {
+                "backend": "ddgs",
+                "results": [
+                    {
+                        "title": "ddgs result example",
+                        "url": "https://example.com/ddgs",
+                        "snippet": "example",
+                    }
+                ],
+            }
+        )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
     monkeypatch.setattr(
@@ -114,9 +365,10 @@ def test_baidu_then_tavily_then_ddgs_fallback_order(monkeypatch):
 
     result = tool.execute({"query": "example"})
 
-    assert calls == ["qianfan", "tavily", "ddgs"]
+    assert set(calls) == {"qianfan", "tavily", "ddgs"}
     assert result.status == "success"
     assert result.result["backend"] == "ddgs"
+    assert result.result["results"][0]["url"] == "https://example.com/ddgs"
 
 
 def test_tavily_returns_unified_results(monkeypatch):
@@ -172,7 +424,17 @@ def test_tavily_returns_unified_results(monkeypatch):
 def test_tavily_failure_falls_back_to_ddgs(monkeypatch):
     tool = module.WebSearch()
     monkeypatch.setattr(module, "configured_providers", lambda: ["tavily", "ddgs"])
-    monkeypatch.setattr(tool, "_resolve_provider", lambda requested: "tavily")
+    monkeypatch.setattr(module, "multi_source_providers", lambda: ["tavily", "ddgs"])
+    monkeypatch.setattr(
+        tool,
+        "_rewrite_query",
+        lambda query: {
+            "query": query,
+            "altered_query": query,
+            "decomposition_query": [],
+            "rewritten": False,
+        },
+    )
     calls = []
 
     def execute_provider(provider, query, count, freshness, summary):
@@ -180,7 +442,16 @@ def test_tavily_failure_falls_back_to_ddgs(monkeypatch):
         if provider == "tavily":
             return module.ToolResult.fail("Error: Tavily API quota reached.")
         return module.ToolResult.success(
-            {"backend": "ddgs", "results": [{"url": "https://example.com"}]}
+            {
+                "backend": "ddgs",
+                "results": [
+                    {
+                        "title": "ddgs hit",
+                        "url": "https://example.com",
+                        "snippet": "example",
+                    }
+                ],
+            }
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
@@ -190,7 +461,7 @@ def test_tavily_failure_falls_back_to_ddgs(monkeypatch):
 
     result = tool.execute({"query": "example"})
 
-    assert calls == ["tavily", "ddgs"]
+    assert set(calls) == {"tavily", "ddgs"}
     assert result.status == "success"
     assert result.result["backend"] == "ddgs"
 
@@ -280,11 +551,35 @@ def test_tool_schema_requires_source_links():
 
 
 def test_execute_attaches_citation_policy(monkeypatch):
-    monkeypatch.setattr(module.WebSearch, "_resolve_provider", lambda self, requested: "ddgs")
+    monkeypatch.setattr(
+        module.WebSearch,
+        "_resolve_search_providers",
+        lambda self, requested: ["ddgs"],
+    )
+    monkeypatch.setattr(
+        module.WebSearch,
+        "_rewrite_query",
+        lambda self, query: {
+            "query": query,
+            "altered_query": query,
+            "decomposition_query": [],
+            "rewritten": False,
+        },
+    )
     monkeypatch.setattr(
         module.WebSearch,
         "_search_ddgs",
-        lambda self, query, count, freshness: module.ToolResult.success({"results": []}),
+        lambda self, query, count, freshness: module.ToolResult.success(
+            {
+                "results": [
+                    {
+                        "title": "t",
+                        "url": "https://example.com",
+                        "snippet": "s",
+                    }
+                ]
+            }
+        ),
     )
     monkeypatch.setattr(
         module.WebSearch,
@@ -320,14 +615,26 @@ def test_usage_store_persists_and_resets_by_period(tmp_path):
     assert reopened.reserve("qianfan", "day", 2, day_two) == (True, 1)
 
 
-def test_exhausted_baidu_is_skipped_before_network_then_uses_tavily(
+def test_exhausted_baidu_is_skipped_before_network_then_uses_others(
     monkeypatch, tmp_path
 ):
     tool = module.WebSearch({"usage_store_path": str(tmp_path / "usage.db")})
     monkeypatch.setattr(
         module, "configured_providers", lambda: ["qianfan", "tavily", "ddgs"]
     )
-    monkeypatch.setattr(tool, "_resolve_provider", lambda requested: "qianfan")
+    monkeypatch.setattr(
+        module, "multi_source_providers", lambda: ["qianfan", "tavily", "ddgs"]
+    )
+    monkeypatch.setattr(
+        tool,
+        "_rewrite_query",
+        lambda query: {
+            "query": query,
+            "altered_query": query,
+            "decomposition_query": [],
+            "rewritten": False,
+        },
+    )
     monkeypatch.setattr(
         tool,
         "_provider_quota",
@@ -340,13 +647,24 @@ def test_exhausted_baidu_is_skipped_before_network_then_uses_tavily(
 
     def execute_provider(provider, query, count, freshness, summary):
         calls.append(provider)
-        return module.ToolResult.success({"backend": provider, "results": []})
+        return module.ToolResult.success(
+            {
+                "backend": provider,
+                "results": [
+                    {
+                        "title": f"{provider} title",
+                        "url": f"https://example.com/{provider}",
+                        "snippet": "example",
+                    }
+                ],
+            }
+        )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
 
     result = tool.execute({"query": "example"})
 
     assert result.status == "success"
-    assert result.result["backend"] == "tavily"
-    assert calls == ["tavily"]
+    assert "qianfan" not in calls
+    assert set(calls) == {"tavily", "ddgs"}
     assert tool._get_usage_store().count("tavily", "month") == 1
