@@ -1,3 +1,4 @@
 {
-  "webServiceKey": "your_amap_webservice_key_here"
+  "webServiceKey": "your_amap_webservice_key_here",
+  "defaultCity": "上海"
 }

@@ -1,6 +1,6 @@
 ---
 name: amap-lbs-skill
-description: 高德地图综合服务，支持POI搜索、路径规划、旅游规划、周边搜索和热力图数据可视化
+description: 高德地图综合服务，支持POI搜索、周边搜索、路径规划（地名/坐标）、旅游规划、热力图与地图链接。路线与周边优先使用 scripts/route-plan.js 与 scripts/nearby-search.js。
 metadata:
   openclaw:
     requires:
@@ -8,7 +8,6 @@ metadata:
         - AMAP_WEBSERVICE_KEY
       bins:
         - node
-        - python3
     primaryEnv: AMAP_WEBSERVICE_KEY
     homepage: https://lbs.amap.com/api/webservice/summary
     install:
@@ -19,488 +18,269 @@ metadata:
 
 # 高德地图综合服务 Skill
 
-高德地图综合服务向开发者提供完整的地图数据服务，包括地点搜索、路径规划、旅游规划和数据可视化等功能。
+高德地图综合服务：地点搜索、**周边搜索**、**路径规划（支持中文地名）**、旅游规划与地图可视化。
 
 ## 功能特性
 
-- 🔍 POI（地点）搜索功能
-- 🏙️ 支持关键词搜索、城市限定、类型筛选
-- 📍 支持周边搜索（基于坐标和半径）
-- 🛣️ 路径规划（步行、驾车、骑行、公交）
-- 🗺️ 智能旅游规划助手
-- 🔥 热力图数据可视化
-- 🔗 地图可视化链接生成
-- 💾 配置本地持久化存储
-- 🎯 自动管理高德 Web Service Key
+- 🔍 POI / 关键词搜索
+- 📍 周边搜索（中心可为地名或坐标）
+- 🛣️ 路径规划：步行 / 驾车 / 骑行 / 公交地铁（**支持地名**，输出逐步怎么走）
+- 🗺️ 旅游规划助手
+- 🔥 热力图链接
+- 🔗 地图可视化 / 高德导航链接
+- 🎯 Key：`AMAP_WEBSERVICE_KEY` 或 skill 目录 `config.json`
 
 ## 首次配置
 
-首次使用时需要配置高德 Web Service Key：
+1. 在 [高德开放平台](https://lbs.amap.com/api/webservice/create-project-and-key) 创建 Web 服务 Key  
+2. 设置环境变量：`AMAP_WEBSERVICE_KEY=your_key`（推荐写在 `~/.cow/.env`）  
+3. 或在 skill 目录创建 `config.json`：`{"webServiceKey":"..."}`  
 
-1. 访问 [高德开放平台](https://lbs.amap.com/api/webservice/create-project-and-key) 创建应用并获取 Key
-2. 设置环境变量：`export AMAP_WEBSERVICE_KEY=your_key`
-3. 或运行时自动提示输入并保存到本地配置文件
+**工作目录**：执行脚本前先 `cd` 到本 skill 根目录（`SKILL.md` 所在目录），或使用脚本绝对路径。
 
-当用户想要搜索地址、地点、周边信息（如美食、酒店、景点等）、规划路线或可视化数据时，使用此 skill。
+```bash
+# 在 skill 根目录执行
+export AMAP_WEBSERVICE_KEY=your_key   # Windows 可用系统/会话环境变量
+```
+
+---
 
 ## 触发条件
 
-用户表达了以下意图之一：
-- 搜索某类地点或某个确定地点（如"搜美食"、"找酒店"、"天安门在哪"）
-- 基于某个位置搜索周边（如"西直门周边美食"、"北京南站附近酒店"）
-- 规划路线（如"从天安门到故宫怎么走"、"规划驾车路线"）
-- 旅游规划（如"帮我规划北京一日游"、"杭州西湖游览路线"）
-- 包含"搜"、"找"、"查"、"附近"、"周边"、"路线"、"规划"等关键词
-- 希望将地理数据可视化为热力图（如"生成热力图"、"用这份数据做热力图展示"）
+用户表达以下意图时使用本 skill：
 
-## 场景判断
-
-收到用户请求后，先判断属于哪个场景：
-
-- **场景一**：用户搜索一个**明确的类别**（美食、酒店）或**确定的地点**（天安门、西湖），没有指定"在哪个位置附近"
-- **场景二**：用户搜索**某个位置周边**的某类地点，输入中同时包含「位置」和「搜索类别」两个要素（如"西直门周边美食"、"北京南站附近酒店"）
-- **场景三**：热力图数据可视化
-- **场景四**：POI 详细搜索（使用 Web 服务 API）
-- **场景五**：路径规划
-- **场景六**：智能旅游规划
+- 搜地点 / 找店 / POI（「天安门在哪」「搜肯德基」）
+- **周边**（「西直门附近美食」「江苏路周边火锅」）
+- **路线**（「从 A 到 B 怎么走」「地铁怎么去」「驾车导航」）
+- 旅游行程（「杭州一日游」）
+- 热力图 / 地图链接
 
 ---
 
-## 场景一：明确关键词搜索
+## 场景判断（先判定再调用）
 
-直接搜索一个类别或地点，不涉及特定位置的周边搜索。
+| 场景 | 用户意图 | 优先命令 |
+|------|----------|----------|
+| A 关键词搜索（不要求周边） | 搜美食、天安门在哪 | 地图链接 或 `poi-search.js` |
+| B **周边搜索** | X 附近/周边 Y | **`nearby-search.js`** |
+| C **路径规划** | 从 A 到 B、怎么走、导航 | **`route-plan.js`** |
+| D POI 详细列表 | 要地址电话列表 | `poi-search.js` |
+| E 旅游规划 | 一日游、兴趣点串联 | `travel-planner.js` |
+| F 热力图 | 热力图可视化 | 场景「热力图」拼链接 |
+| G 仅打开网页搜 | 无 Key 时的降级 | `https://www.amap.com/search?query=` |
 
-**URL 格式：**
-
-```
-https://www.amap.com/search?query={关键词}
-```
-
-- **域名**：`www.amap.com`
-- **路由**：`/search`
-- **参数**：`query` = 搜索关键词
-
-### 执行步骤
-
-1. **发送埋点统计请求**：在执行操作前，发送以下请求进行埋点统计：
-
-   ```bash
-   curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=keyword-search&value=call"
-
-2. **提取关键词**：从用户输入中识别出核心搜索词，去掉"搜"、"找"等修饰词
-3. **生成 URL**：拼接 `https://www.amap.com/search?query={关键词}`
-4. **返回链接给用户**
-
-### 示例
-
-| 用户输入 | 提取关键词 | 生成 URL |
-|---------|-----------|---------|
-| 搜美食 | 美食 | `https://www.amap.com/search?query=美食` |
-| 找酒店 | 酒店 | `https://www.amap.com/search?query=酒店` |
-| 天安门在哪 | 天安门 | `https://www.amap.com/search?query=天安门` |
-| 找个加油站 | 加油站 | `https://www.amap.com/search?query=加油站` |
-
-### 回复模板
-
-```
-🔍 已为你生成高德地图搜索链接：
-
-https://www.amap.com/search?query={关键词}
-
-点击链接即可查看搜索结果。
-```
+> **路线 / 周边请优先用场景 B、C 的高级脚本**，不要先对地名裸调地理编码再手填坐标（易解析到外省）。
 
 ---
 
-## 场景二：基于位置的周边搜索
+## 场景 C：路径规划（推荐）
 
-用户想搜索**某个位置周边**的某类地点。需要先通过地理编码 API 获取该位置的经纬度，再拼接带坐标的搜索链接。
+**一站式脚本**：地名或坐标均可；自动 POI/地理编码消歧；连锁店默认按起点**就近**选点；输出距离、时间、**逐步怎么走**、地图/导航链接。
 
-**前置条件：** 需要用户提供高德开放平台的 API Key。
-
-### 执行步骤
-
-#### 第零步：发送埋点统计请求
-
-在执行任何操作前，先发送以下请求进行埋点统计：
+### 命令
 
 ```bash
-curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=nearby-search&value=call"
+# 可不传 city：自动推测；失败则用默认城市
+node scripts/route-plan.js --origin=江苏路 --destination=马厂老火锅
 
-#### 第一步：解析用户输入
+# 公交/地铁同样可自动推测城市
+node scripts/route-plan.js --origin=江苏路 --destination=马厂老火锅 --type=transfer
 
-从用户输入中拆分出两个要素：
-- **位置**：用户指定的中心位置（如"西直门"、"北京南站"）
-- **搜索类别**：要搜索的内容（如"美食"、"酒店"）
+# 显式指定城市（最高优先级）
+node scripts/route-plan.js --origin=江苏路 --destination=马厂老火锅 --city=上海
 
-| 用户输入 | 位置 | 搜索类别 |
-|---------|------|---------|
-| 西直门周边美食 | 西直门 | 美食 |
-| 北京南站附近酒店 | 北京南站 | 酒店 |
-| 天坛周边有什么好吃的 | 天坛 | 美食 |
+# 步行 / 骑行
+node scripts/route-plan.js --origin=北京站 --destination=天安门 --type=walking
+node scripts/route-plan.js --origin=春熙路 --destination=宽窄巷子 --type=riding
 
-#### 第二步：检查 API Key
+# 坐标仍可用（会逆地理推测城市）
+node scripts/route-plan.js --origin=121.430635,31.220408 --destination=121.457872,31.186690 --type=driving
 
-- 如果用户之前未提供过 Key，**先提示用户提供高德 API Key**，等待用户回复后再继续
-- 如果用户已提供 Key，直接使用
-
-**请求 Key 的回复模板：**
-
-```
-🔑 搜索「{位置}」周边的{搜索类别}需要使用高德 API，请提供你的高德开放平台 API Key。
-
-（如果还没有 Key，可以在 https://lbs.amap.com 注册并创建应用获取）
+# 结构化输出
+node scripts/route-plan.js --origin=江苏路 --destination=马厂老火锅 --json
 ```
 
-#### 第三步：调用地理编码 API 获取经纬度
+### 参数
 
-**API 格式：**
+| 参数 | 说明 |
+|------|------|
+| `--origin` | 起点：中文地名或 `经度,纬度` |
+| `--destination` | 终点：中文地名或 `经度,纬度` |
+| `--city` | 可选。显式城市（最高优先级） |
+| `--defaultCity` | 可选。本次调用默认城市（覆盖环境/配置里的默认） |
+| `--type` | `walking` / `driving`（默认）/ `riding` / `transfer` |
+| `--waypoints` | 途经点，多个用 `;` 或 `\|` |
+| `--pickNearest` | 默认 true：终点多候选时相对起点就近 |
+| `--json` | 输出 JSON |
 
-```
-https://restapi.amap.com/v3/geocode/geo?address={位置}&output=JSON&key={用户的key}
-```
+别名：`bike`→骑行，`bus`/`transit`/`metro`→`transfer`。
 
-**执行 curl 请求：**
+### 城市解析顺序（自动）
+
+1. **`--city` 显式指定**  
+2. **自动推测**：地点文本中的城市名（如「上海市…」）→ 坐标逆地理 → 对起终点做 POI 投票/交叉  
+3. **默认城市**：`--defaultCity` → 环境变量 `AMAP_DEFAULT_CITY`（或 `AMAP_CITY`）→ `config.json` 的 `defaultCity`  
+
+公交/地铁在「推测 + 默认」都拿不到城市时才会报错。输出中会标注城市来源（explicit / text / regeo / poi / default）。
+
+### Agent 执行要点
+
+1. 从用户话里抽出 **起点、终点、出行方式**；若用户已说城市则传 `--city`。  
+2. **不必强行先问城市**：可直接调用 `route-plan.js`，依赖自动推测 + 默认城市。  
+3. 若输出警告「来自默认配置 / 低置信度」且路线明显不对，再向用户确认城市并加 `--city` 重试。  
+4. 将脚本 stdout **原样或精炼**回复用户（保留城市来源、怎么走、门店候选、链接）。  
+5. 若终点有多家分店，脚本会列出候选；用户指定分店名时应重新规划。
+
+### 兼容旧脚本
 
 ```bash
-curl -s "https://restapi.amap.com/v3/geocode/geo?address={位置}&output=JSON&key={用户的key}"
-```
-
-**API 返回示例：**
-
-```json
-{
-  "status": "1",
-  "info": "OK",
-  "geocodes": [
-    {
-      "formatted_address": "北京市西城区西直门",
-      "location": "116.353138,39.939385"
-    }
-  ]
-}
-```
-
-从返回结果中提取 `geocodes[0].location`，格式为 `经度,纬度`（如 `116.353138,39.939385`），拆分为：
-- **经度（longitude）**：`116.353138`
-- **纬度（latitude）**：`39.939385`
-
-#### 第四步：拼接带坐标的搜索链接
-
-**URL 格式：**
-
-```
-https://ditu.amap.com/search?query={搜索类别}&query_type=RQBXY&longitude={经度}&latitude={纬度}&range=1000
-```
-
-- **域名**：`ditu.amap.com`
-- **路由**：`/search`
-- **参数**：
-  - `query` = 搜索类别（如"美食"）
-  - `query_type` = `RQBXY`（基于坐标的搜索类型）
-  - `longitude` = 经度
-  - `latitude` = 纬度
-  - `range` = 搜索范围（单位：米，默认 1000）
-
-#### 第五步：返回链接给用户
-
-### 完整示例
-
-**用户输入：** "搜索西直门周边美食"
-
-1. 解析：位置 = `西直门`，搜索类别 = `美食`
-2. 调用地理编码 API：`curl -s "https://restapi.amap.com/v3/geocode/geo?address=西直门&output=JSON&key=xxx"`
-3. 获取坐标：`116.353138,39.939385` → 经度 `116.353138`，纬度 `39.939385`
-4. 拼接链接：`https://ditu.amap.com/search?query=美食&query_type=RQBXY&longitude=116.353138&latitude=39.939385&range=1000`
-
-### 回复模板
-
-```
-📍 已查询到「{位置}」的坐标（{经度},{纬度}），为你生成周边{搜索类别}的搜索链接：
-
-https://ditu.amap.com/search?query={搜索类别}&query_type=RQBXY&longitude={经度}&latitude={纬度}&range=1000
-
-点击链接即可查看「{位置}」周边 1 公里内的{搜索类别}。
-```
-
----
-
-## 场景三：热力图展示
-
-用户有一份包含地理坐标的数据，希望在地图上以热力图的形式可视化展示。
-
-### 触发条件
-
-用户提到"热力图"、"数据可视化"、"地图上展示数据"等意图，并提供了数据地址。
-
-### URL 格式
-
-```
-http://a.amap.com/jsapi_demo_show/static/openclaw/heatmap.html?mapStyle={地图风格}&dataUrl={数据地址(URL编码)}
-```
-
-- **域名**：`a.amap.com`
-- **路由**：`/jsapi_demo_show/static/openclaw/heatmap.html`
-- **必填参数**：
-  - `dataUrl` = 用户数据的 URL 地址（**必须进行 URL 编码**）
-  - `mapStyle` = 地图风格，可选值：
-    - `grey` — 暗黑地图模式（深色背景，适合展示亮色热力点）
-    - `light` — 浅色模式（浅色背景，适合日常查看）
-
-### 执行步骤
-
-1. **发送埋点统计请求**：在执行操作前，发送以下请求进行埋点统计：
-
-   ```bash
-   curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=heatmap&value=call"
-
-2. **获取数据地址**：从用户输入中提取数据 URL，如果用户未提供，提示用户给出数据地址
-3. **确认地图风格**：询问用户偏好的地图风格（`grey` 或 `light`），如果用户未指定，默认使用 `grey`
-4. **URL 编码**：将数据地址进行 URL 编码（将 `://` → `%3A%2F%2F`，`/` → `%2F` 等）
-5. **拼接链接**：生成完整的热力图 URL
-6. **返回链接给用户**
-
-### 示例
-
-**用户输入：** "帮我用这份数据生成热力图：`https://a.amap.com/Loca/static/loca-v2/demos/mock_data/hz_house_order.json`，用暗黑模式"
-
-1. 数据地址：`https://a.amap.com/Loca/static/loca-v2/demos/mock_data/hz_house_order.json`
-2. 地图风格：`grey`
-3. URL 编码后的数据地址：`https%3A%2F%2Fa.amap.com%2FLoca%2Fstatic%2Floca-v2%2Fdemos%2Fmock_data%2Fhz_house_order.json`
-4. 最终链接：
-
-```
-http://a.amap.com/jsapi_demo_show/static/openclaw/heatmap.html?mapStyle=grey&dataUrl=https%3A%2F%2Fa.amap.com%2FLoca%2Fstatic%2Floca-v2%2Fdemos%2Fmock_data%2Fhz_house_order.json
-```
-
-### 回复模板
-
-```
-🔥 已为你生成热力图链接：
-
-http://a.amap.com/jsapi_demo_show/static/openclaw/heatmap.html?mapStyle={地图风格}&dataUrl={编码后的数据地址}
-
-地图风格：{grey/light}
-数据来源：{原始数据地址}
-
-点击链接即可查看热力图展示。
-```
-
-**请求数据地址的回复模板（用户未提供时）：**
-
-```
-🔥 生成热力图需要你提供数据地址（JSON 格式的 URL），请给出数据链接。
-
-另外，你希望使用哪种地图风格？
-- grey（暗黑模式）
-- light（浅色模式）
-```
-
----
-
-## 场景四：POI 详细搜索
-
-使用高德 Web 服务 API 进行更详细的 POI 搜索，支持更多参数和筛选条件。
-
-### 执行步骤
-
-1. **发送埋点统计请求**：在执行操作前，发送以下请求进行埋点统计：
-
-   ```bash
-   curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=poi-search&value=call"
-   ```
-
-2. **执行 POI 搜索**：根据用户需求调用搜索脚本。
-
-### 使用方法
-
-```bash
-# 基础搜索
-node scripts/poi-search.js --keywords=肯德基 --city=北京
-
-# 搜索更多结果
-node scripts/poi-search.js --keywords=餐厅 --city=上海 --page=1 --offset=20
-
-# 周边搜索（需要提供中心点坐标和搜索半径）
-node scripts/poi-search.js --keywords=酒店 --location=116.397428,39.90923 --radius=1000
-```
-
-### 参数说明
-
-| 参数 | 说明 | 必填 | 示例 |
-|------|------|------|------|
-| `--keywords` | 搜索关键词 | 是 | `--keywords=肯德基` |
-| `--city` | 城市名称或编码 | 否 | `--city=北京` |
-| `--types` | POI 类型编码 | 否 | `--types=050000` |
-| `--location` | 中心点坐标（经度,纬度） | 否 | `--location=116.397428,39.90923` |
-| `--radius` | 搜索半径（米） | 否 | `--radius=1000` |
-| `--page` | 页码 | 否 | `--page=1` |
-| `--offset` | 每页数量（最大25） | 否 | `--offset=10` |
-
-### 在代码中使用
-
-```javascript
-const { searchPOI } = require('./index');
-
-async function example() {
-  const result = await searchPOI({
-    keywords: '咖啡厅',
-    city: '杭州',
-    page: 1,
-    offset: 10
-  });
-  
-  if (result && result.pois) {
-    result.pois.forEach(poi => {
-      console.log(`${poi.name} - ${poi.address}`);
-    });
-  }
-}
-
-example();
-```
-
----
-
-## 场景五：路径规划
-
-规划不同出行方式的路线。
-
-### 执行步骤
-
-1. **发送埋点统计请求**：在执行操作前，发送以下请求进行埋点统计：
-
-   ```bash
-   curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=route-planning&value=call"
-   ```
-
-2. **执行路径规划**：根据用户需求调用路径规划脚本。
-
-### 使用方法
-
-```bash
-# 步行路线
+# 仅坐标的旧接口仍可用；若传入地名会自动走高级规划
+node scripts/route-planning.js --type=driving --origin=江苏路 --destination=马厂老火锅 --city=上海
 node scripts/route-planning.js --type=walking --origin=116.397428,39.90923 --destination=116.427281,39.903719
-
-# 驾车路线
-node scripts/route-planning.js --type=driving --origin=116.397428,39.90923 --destination=116.427281,39.903719
-
-# 公交路线
-node scripts/route-planning.js --type=transfer --origin=116.397428,39.90923 --destination=116.427281,39.903719 --city=北京
 ```
-
-### 路线类型
-
-- `walking` - 步行路线
-- `driving` - 驾车路线
-- `riding` - 骑行路线
-- `transfer` - 公交路线（需要指定城市）
 
 ---
 
-## 场景六：智能旅游规划
+## 场景 B：周边搜索（推荐）
 
-自动搜索兴趣点并规划游览路线，生成地图可视化链接。
-
-### 执行步骤
-
-1. **发送埋点统计请求**：在执行操作前，发送以下请求进行埋点统计：
-
-   ```bash
-   curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=travel-planner&value=call"
-   ```
-
-2. **执行旅游规划**：根据用户需求调用旅游规划脚本。
-
-### 使用方法
+中心点支持**地名或坐标**，无需先手动 geocode。
 
 ```bash
-# 基础旅游规划
+node scripts/nearby-search.js --around=西直门 --keywords=美食 --radius=1000
+node scripts/nearby-search.js --around=江苏路 --keywords=火锅 --radius=1500
+node scripts/nearby-search.js --around=116.397428,39.90923 --keywords=咖啡 --radius=800
+node scripts/nearby-search.js --around=江苏路 --keywords=加油站 --json
+# 也可显式指定
+node scripts/nearby-search.js --around=江苏路 --keywords=火锅 --city=上海 --radius=1500
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--around` | 中心：地名或 `经度,纬度` |
+| `--keywords` | 类别/关键词：美食、酒店、超市… |
+| `--city` | 可选；不传则自动推测，失败用默认城市 |
+| `--defaultCity` | 可选；本次默认城市 |
+| `--radius` | 米，默认 1000 |
+| `--offset` | 条数，默认 10，最大 25 |
+
+输出：中心点解析结果、按距离排序的 POI、地图搜索链接。
+
+---
+
+## 场景 D：POI 文本搜索
+
+```bash
+node scripts/poi-search.js --keywords=肯德基 --city=北京
+node scripts/poi-search.js --keywords=酒店 --location=116.397428,39.90923 --radius=1000
+node scripts/poi-search.js --keywords=餐厅 --city=上海 --page=1 --offset=20
+```
+
+适合「在某市搜品牌/类型列表」。**「某地附近」请用 nearby-search.js。**
+
+---
+
+## 场景 A：无 Key 时的网页搜索降级
+
+不调 Web API，仅生成链接：
+
+```
+https://www.amap.com/search?query={关键词}
+```
+
+示例：`query=美食`、`query=天安门`。
+
+有 Key 时优先场景 B/C/D，结果更可控。
+
+---
+
+## 场景 E：旅游规划
+
+```bash
 node scripts/travel-planner.js --city=北京 --interests=景点,美食,酒店
-
-# 指定路线类型（walking/driving/riding/transfer）
 node scripts/travel-planner.js --city=杭州 --interests=西湖,美食,茶馆 --routeType=walking
-
-# 驾车游览
-node scripts/travel-planner.js --city=上海 --interests=外滩,南京路,城隍庙 --routeType=driving
+node scripts/travel-planner.js --city=上海 --interests=外滩,南京路 --routeType=driving
 ```
 
-### 功能说明
-
-- 自动搜索指定城市的兴趣点（每类最多5个）
-- 按顺序规划各兴趣点之间的路线
-
-
+- 按兴趣检索 POI，并尝试生成段间路线摘要与地图链接  
+- 复杂「从 A 到 B」单次导航请用 **route-plan.js**
 
 ---
 
-## 场景七：导航与搜索（Python 脚本）
+## 场景 F：热力图
 
-通过 Python 脚本 `gaode_skill.py` 提供导航路线规划和 POI 搜索功能。
+```
+http://a.amap.com/jsapi_demo_show/static/openclaw/heatmap.html?mapStyle={grey|light}&dataUrl={URL编码后的数据地址}
+```
 
-### 前置条件
-
-- 已安装 Python 3
-
-### 使用方法
+执行前可按需发送埋点（可选）：
 
 ```bash
-# 导航路线规划
-python gaode_skill.py direction 北京站 天安门
-python gaode_skill.py direction 北京站 天安门 driving
-python gaode_skill.py direction 116.397428,39.90923 天安门 walking
+curl -s "https://restapi.amap.com/v3/log/init?eventId=skill.call&product=skill_openclaw&platform=JS&label=heatmap&value=call"
+```
 
-# POI 搜索
+---
+
+## 场景 G：Python / Electron 导航（可选，多数环境不可用）
+
+`gaode_skill.py` 通过 Unix Domain Socket 连接高德 JSAPI Electron 桌面应用，**不是** Web 服务路径规划。
+
+```bash
+python gaode_skill.py direction 北京站 天安门 driving
 python gaode_skill.py search 北京站周边的川菜
 ```
 
-### 路线类型
-
-- `driving` - 驾车（默认）
-- `walking` - 步行
-- `bicycling` - 骑行
+- 需要应用已启动且存在 socket：`/tmp/jsapi-electron.sock`  
+- **Windows / 无 Electron 时不要使用**；路线请统一用 `scripts/route-plan.js`
 
 ---
 
 ## 配置管理
 
-配置文件位于 `config.json`（仅所有者可读写，权限 0600），包含以下内容：
-
-> [!WARNING]
-> `config.json` 包含 API Key 敏感信息，已通过 `.gitignore` 排除版本控制。请勿手动分享此文件。
+`config.json`（勿提交密钥）：
 
 ```json
 {
-  "webServiceKey": "your_amap_webservice_key_here"
+  "webServiceKey": "your_amap_webservice_key_here",
+  "defaultCity": "上海"
 }
 ```
 
-设置 Key 的方式：
+- Key 优先级：环境变量 `AMAP_WEBSERVICE_KEY` > `AMAP_KEY`（废弃）> `config.json`  
+- 默认城市优先级：`--defaultCity` > `AMAP_DEFAULT_CITY` / `AMAP_CITY` > `config.defaultCity`
 
-1. **环境变量**：`export AMAP_WEBSERVICE_KEY=your_key`
-2. **命令行参数**：`node index.js your_key`
-3. **自动提示**：首次运行时自动提示输入
-4. **手动编辑**：直接编辑 `config.json` 文件
+---
+
+## 库函数（index.js，供脚本/二次开发）
+
+| 函数 | 作用 |
+|------|------|
+| `searchPOI` | 文本 POI 搜索 |
+| `searchAround` | 周边搜索 |
+| `geocode` / `regeocode` | 地理/逆地理编码 |
+| `resolvePlace` | 地名或坐标 → 统一地点 |
+| `resolveCityContext` / `extractCityFromText` / `getDefaultCity` | 城市推测与默认城市 |
+| `planRoute` | 高级路径规划（含城市自动解析） |
+| `planNearby` | 高级周边搜索（含城市自动解析） |
+| `formatRoutePlanText` / `formatNearbyText` | 可读输出 |
+| `walkingRoute` / `drivingRoute` / `ridingRoute` / `transitRoute` | 底层 direction API |
+| `travelPlanner` / `generateMapLink` | 旅游与可视化 |
 
 ---
 
 ## 注意事项
 
-- **遥测声明**：本 Skill 在每次执行操作前会向高德服务器 (`restapi.amap.com/v3/log/init`) 发送匿名使用统计请求，用于功能调用计数，该请求不包含用户个人信息或 API Key
-- **场景判断是关键**：区分用户是"直接搜某个东西"、"在某个位置附近搜某个东西"、"规划路线"还是"旅游规划"
-- 关键词应尽量精简准确，提取用户真正想搜的内容
-- URL 中的中文关键词浏览器会自动处理编码，无需手动 encode
-- 场景二、四、五、六需要用户提供高德 API Key，**必须先获取 Key 后再发起请求**，不能跳过
-- 如果地理编码 API 返回 `status` 不为 `"1"`，说明请求失败，需提示用户检查 Key 是否正确或地址是否有效
-- API 返回的 `location` 格式为 `经度,纬度`（注意：经度在前，纬度在后）
-- 场景二的搜索范围默认 1000 米，用户如有需要可调整 `range` 参数
-- 请妥善保管你的 Web Service Key，不要分享给他人
-- 高德 Web 服务 API 有调用频率限制，请合理使用
-- 免费用户每日调用量有限制，具体请查看高德开放平台说明
+1. **城市**：优先自动推测；配置 `AMAP_DEFAULT_CITY` 或 `config.defaultCity` 作为兜底。模糊地名仍建议用户确认。  
+2. **公交**：`--type=transfer`；城市可由推测/默认提供，二者皆无时会报错。  
+3. **坐标格式**：`经度,纬度`（高德 GCJ-02），经度在前。  
+4. **Key 权限**：需开通 Web 服务（路径规划、搜索、地理编码等）。  
+5. **配额**：城市推测会额外打 POI 请求，注意 QPS/日配额。  
+6. **埋点**：部分旧文档中的 `restapi.amap.com/v3/log/init` 为可选统计，不包含 Key 与用户隐私；失败可忽略。  
+7. **不要**为了路径规划单独 `curl` geocode 取第一条结果再规划——请走 `route-plan.js`。  
+8. 回复用户时给出：**城市（及来源）+ 起终点确认 + 时间距离 + 怎么走 + 链接**。
 
 ## 相关链接
 
 - [高德开放平台](https://lbs.amap.com/)
-- [创建应用和获取 Key](https://lbs.amap.com/api/webservice/create-project-and-key)
-- [POI 搜索 API 文档](https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch)
-- [Web 服务 API 总览](https://lbs.amap.com/api/webservice/summary)
+- [创建 Key](https://lbs.amap.com/api/webservice/create-project-and-key)
+- [路径规划](https://lbs.amap.com/api/webservice/guide/api/direction)
+- [搜索 POI](https://lbs.amap.com/api/webservice/guide/api-advanced/newpoisearch)

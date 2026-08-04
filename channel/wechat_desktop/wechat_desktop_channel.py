@@ -1186,10 +1186,39 @@ class WechatDesktopChannel(ChatChannel):
         )
         self._service.update_status(**self._reply_queue.status())
 
+    def _resolve_daily_hot_target(self, group_name: str) -> tuple[str, str]:
+        """把 ``auto_reply_groups`` 中的群显示名解析为发送用会话 ID。
+
+        若扫描缓存里能唯一匹配到该标题，优先返回 ``uia-session:...``，便于发送时
+        带上 runtime_id / row_index，降低点错会话的概率；否则退回显示名本身。
+        """
+        name = str(group_name or "").strip()
+        if not name:
+            return name, name
+        resolver = getattr(self._driver, "_resolve_selector", None)
+        if not callable(resolver):
+            return name, name
+        try:
+            selector = resolver(name)
+        except Exception:
+            return name, name
+        title = str(getattr(selector, "title", "") or name).strip() or name
+        runtime_id = str(getattr(selector, "runtime_id", "") or "").strip()
+        if runtime_id:
+            conversation_id = f"uia-session:{runtime_id}"
+            logger.info(
+                "[WechatDesktop][DailyHot] resolved target title=%s -> %s",
+                title,
+                conversation_id,
+            )
+            return conversation_id, title
+        return name, title
+
     def enqueue_daily_hot_broadcast(self, message: str) -> int:
         """把已准备好的每日热点文案按白名单群拆成预写发送任务并入全局 FIFO。
 
-        返回成功入队的群数量。网络准备在调度器子线程完成；这里只做目标过滤与入队。
+        目标仅来自 ``auto_reply_groups`` 白名单（不是当前打开的会话，也不走
+        ``auto_reply_groups_all``）。返回成功入队的群数量。
         """
         text = str(message or "").strip()
         if not text:
@@ -1203,11 +1232,21 @@ class WechatDesktopChannel(ChatChannel):
             logger.info("[WechatDesktop][DailyHot] skip enqueue because paused")
             return 0
 
+        # 仅向 auto_reply_groups 白名单群广播，不使用 auto_reply_groups_all。
         groups = [
             str(name).strip()
             for name in self.config.get("auto_reply_groups", []) or []
             if str(name).strip()
         ]
+        if not groups:
+            logger.warning(
+                "[WechatDesktop][DailyHot] no targets: auto_reply_groups is empty"
+            )
+        else:
+            logger.info(
+                "[WechatDesktop][DailyHot] enqueue targets from auto_reply_groups=%s",
+                groups,
+            )
         queued = 0
         for group_name in groups:
             if self._policy.is_blocked(group_name):
@@ -1221,10 +1260,13 @@ class WechatDesktopChannel(ChatChannel):
                 continue
             if not self._policy.is_allowlisted(group_name, True):
                 continue
+            conversation_id, conversation_name = self._resolve_daily_hot_target(
+                group_name
+            )
             event = WechatDesktopEvent(
                 kind="proactive_send",
-                conversation_id=group_name,
-                conversation_name=group_name,
+                conversation_id=conversation_id,
+                conversation_name=conversation_name,
                 sender_id="system",
                 sender_name="daily_hot_broadcast",
                 content_type="text",
@@ -1256,8 +1298,9 @@ class WechatDesktopChannel(ChatChannel):
                 self._content_hash(text),
                 detail="no allowlisted groups",
             )
-        if self._daily_hot_scheduler is not None:
-            self._service.update_status(**self._daily_hot_scheduler.status())
+        scheduler = getattr(self, "_daily_hot_scheduler", None)
+        if scheduler is not None:
+            self._service.update_status(**scheduler.status())
         return queued
 
     def _send_precomposed_reply(self, item: ReplyQueueItem) -> str:
@@ -1284,10 +1327,25 @@ class WechatDesktopChannel(ChatChannel):
             )
             return "skipped"
 
-        send_target = (
-            target_id
-            if str(target_id).startswith("uia-session:")
-            else target_name
+        # Prefer a still-valid uia-session key (exact runtime_id). If the row
+        # left the scan cache, fall back to the display name so locate never
+        # treats "uia-session:..." as a session title.
+        send_target = target_name
+        if str(target_id).startswith("uia-session:"):
+            resolver = getattr(self._driver, "_resolve_selector", None)
+            if callable(resolver):
+                try:
+                    selector = resolver(target_id)
+                    if str(getattr(selector, "runtime_id", "") or "").strip():
+                        send_target = target_id
+                except Exception:
+                    pass
+        logger.info(
+            "[WechatDesktop][DailyHot] precomposed send target_name=%s "
+            "conversation_id=%s send_target=%s",
+            target_name,
+            target_id,
+            send_target,
         )
         self._driver.begin_reply_cycle(target_name, target_id)
         self._mark_lifecycle(item.source_event_ids, "send_started")
@@ -1599,8 +1657,9 @@ class WechatDesktopChannel(ChatChannel):
                     "reply_conversation": "",
                     **self._reply_queue.status(),
                 }
-                if self._daily_hot_scheduler is not None:
-                    status_updates.update(self._daily_hot_scheduler.status())
+                scheduler = getattr(self, "_daily_hot_scheduler", None)
+                if scheduler is not None:
+                    status_updates.update(scheduler.status())
                 self._service.update_status(**status_updates)
 
     def _preserve_event_evidence(self, event: WechatDesktopEvent):

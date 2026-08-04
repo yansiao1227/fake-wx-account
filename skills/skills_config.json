@@ -1,7 +1,7 @@
 {
     "amap-lbs-skill": {
         "name": "amap-lbs-skill",
-        "description": "高德地图综合服务，支持POI搜索、路径规划、旅游规划、周边搜索和热力图数据可视化",
+        "description": "高德地图综合服务，支持POI搜索、周边搜索、路径规划（地名/坐标）、旅游规划、热力图与地图链接。路线与周边优先使用 scripts/route-plan.js 与 scripts/nearby-search.js。",
         "source": "clawhub",
         "enabled": true,
         "category": "skill",

@@ -27,7 +27,10 @@ from channel.wechat_desktop.models import (
     UiaChatMessage,
     UiaReferencedMessage,
 )
-
+from channel.wechat_desktop.operations import (
+    conversation_titles_match,
+    strip_member_count_suffix,
+)
 
 SESSION_PREFIX = "session_item_"
 MESSAGE_LIST_ID = "chat_message_list"
@@ -757,8 +760,8 @@ class WechatUiaClient:
         return rows
 
     @classmethod
-    def _active_conversation_has_content(cls, root, target: str) -> bool:
-        """Return whether *target* is already open with a populated chat pane."""
+    def _read_active_chat_state(cls, root) -> tuple[str, object | None]:
+        """Return ``(current_title, message_list_control_or_None)`` for the open chat."""
         current_title = ""
         message_list = None
         for control in cls._walk(root):
@@ -767,7 +770,13 @@ class WechatUiaClient:
                 current_title = _text(control.Name)
             elif automation_id == MESSAGE_LIST_ID:
                 message_list = control
-        if current_title != _text(target) or message_list is None:
+        return current_title, message_list
+
+    @classmethod
+    def _active_conversation_has_content(cls, root, target: str) -> bool:
+        """Return whether *target* is already open with a populated chat pane."""
+        current_title, message_list = cls._read_active_chat_state(root)
+        if message_list is None or not conversation_titles_match(current_title, target):
             return False
         try:
             return any(
@@ -778,6 +787,15 @@ class WechatUiaClient:
             )
         except Exception:
             return False
+
+    @classmethod
+    def _active_conversation_matches(cls, root, target: str) -> bool:
+        """Return whether the open detail pane is *target* with a message list."""
+        current_title, message_list = cls._read_active_chat_state(root)
+        return bool(
+            message_list is not None
+            and conversation_titles_match(current_title, target)
+        )
 
     def locate_conversation(
         self,
@@ -830,6 +848,11 @@ class WechatUiaClient:
                 # restore the cursor, and verify the chat UI before
                 # proceeding.  One bounded retry handles a dropped click
                 # during window activation.
+                #
+                # Critical: a visible message list alone is NOT enough. If the
+                # click fails to switch the detail pane, the previous chat's
+                # message list remains visible and we must not claim success
+                # (that would paste daily-hot / replies into the wrong chat).
                 for _ in range(2):
                     old_cursor = None
                     try:
@@ -849,17 +872,14 @@ class WechatUiaClient:
                         int(self.config.get("uia_selection_settle_ms", 250)),
                         500,
                     )
-                    has_message_list = any(
-                        _text(item.AutomationId) == MESSAGE_LIST_ID
-                        for item in self._walk(root)
-                    )
-                    if has_message_list:
+                    if self._active_conversation_matches(root, target):
                         return True
         return False
 
     def get_title(self) -> HeaderInfo:
         title = ""
         count = 1
+        count_from_label = False
         with self.operation_lock, self._uia_root() as root:
             for control in self._walk(root):
                 automation_id = _text(control.AutomationId)
@@ -869,7 +889,22 @@ class WechatUiaClient:
                     match = re.search(r"(\d+)", _text(control.Name))
                     if match:
                         count = max(1, int(match.group(1)))
-        return HeaderInfo(title, "group" if count > 1 else ("private" if title else "unknown"), count)
+                        count_from_label = True
+        # Some builds put the member count only in a dedicated label; others
+        # also (or instead) append "(n)" to the name control. Prefer the bare
+        # group name so callers compare cleanly with session_item_* / config.
+        base = strip_member_count_suffix(title)
+        if base and base != title:
+            if not count_from_label:
+                match = re.search(r"[（(](\d+)[）)]\s*$", title)
+                if match:
+                    count = max(1, int(match.group(1)))
+            title = base
+        return HeaderInfo(
+            title,
+            "group" if count > 1 else ("private" if title else "unknown"),
+            count,
+        )
 
     @staticmethod
     def _message_type(class_name: str, content: str) -> str:
@@ -1026,7 +1061,7 @@ class WechatUiaClient:
         if (
             not ensure_conversation
             and conversation
-            and header.title != _text(conversation)
+            and not conversation_titles_match(header.title, conversation)
         ):
             return []
         messages: list[UiaChatMessage] = []
@@ -2671,6 +2706,13 @@ class WechatUiaClient:
                     self.focus_window()
                     if not self.locate_conversation(who, runtime_id, row_index):
                         raise RuntimeError(f"Conversation is not visible: {who}")
+                    # Defense in depth: never paste into a detail pane that
+                    # still shows a different chat title (failed session switch).
+                    active = self.get_title()
+                    if not conversation_titles_match(active.title, who):
+                        raise RuntimeError(
+                            f"Active chat is {active.title!r}, expected {who!r}"
+                        )
                     before = self.get_chat_history(limit=5)
                     with self._clipboard(unicode_text=chunk):
                         try:

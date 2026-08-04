@@ -58,12 +58,29 @@ async function main() {
       routeType: routeType
     });
     
-    if (result && result.pois.length > 0) {
+    if (result && result.pois && result.pois.length > 0) {
+      const mapTaskData = result.mapTaskData || [];
       console.log('═'.repeat(80));
       console.log('\n📊 规划数据统计：');
       console.log(`   兴趣点数量: ${result.pois.length} 个`);
-      console.log(`   路线数量: ${result.mapTaskData.filter(item => item.type === 'route').length} 条`);
+      console.log(`   路线数量: ${mapTaskData.filter(item => item.type === 'route').length} 条`);
       console.log(`   出行方式: ${routeType === 'walking' ? '步行' : routeType === 'driving' ? '驾车' : routeType === 'riding' ? '骑行' : '公交'}`);
+      if (result.routeSegments && result.routeSegments.length) {
+        console.log('\n🛣️  分段摘要：');
+        result.routeSegments.forEach((seg, i) => {
+          const dist = seg.summary && seg.summary.distance != null
+            ? `${(Number(seg.summary.distance) / 1000).toFixed(2)} 公里`
+            : '-';
+          const dur = seg.summary && seg.summary.duration != null
+            ? `${Math.round(Number(seg.summary.duration) / 60)} 分钟`
+            : '-';
+          console.log(`   ${i + 1}. ${seg.from} → ${seg.to}：${dist}，约 ${dur}`);
+        });
+      }
+      if (result.mapLink) {
+        console.log('\n🗺️  地图可视化链接:');
+        console.log(result.mapLink);
+      }
       console.log('\n' + '═'.repeat(80));
       console.log('\n🎉 规划完成！\n');
       console.log('📋 数据格式符合 MapTaskData 接口规范');

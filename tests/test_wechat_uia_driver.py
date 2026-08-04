@@ -312,6 +312,9 @@ def test_send_message_splits_and_verifies_each_chunk(monkeypatch):
     monkeypatch.setattr(client, "_wait_for_send_slot", lambda _who: None)
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(
+        client, "get_title", lambda: HeaderInfo("target", "private", 1)
+    )
     monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
@@ -359,6 +362,9 @@ def test_send_message_retries_uncleared_input_with_enter_after_verification(
 
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(
+        client, "get_title", lambda: HeaderInfo("Alice", "private", 1)
+    )
     monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(
@@ -399,6 +405,9 @@ def test_expedited_send_skips_pacing_and_does_not_delay_next_reply(monkeypatch):
     monkeypatch.setattr(client, "_wait_for_send_slot", lambda who: waits.append(who))
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(
+        client, "get_title", lambda: HeaderInfo("Alice", "private", 1)
+    )
     monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
@@ -2026,6 +2035,87 @@ def test_locate_conversation_clicks_when_active_chat_is_blank(monkeypatch):
 
     assert client.locate_conversation("颜料盒") is True
     assert row.click_count == 1
+
+
+def test_locate_conversation_rejects_click_that_leaves_previous_chat(monkeypatch):
+    """A failed session switch must not look successful just because a message
+    list is still visible from the previous private chat.
+    """
+    previous_message = GeometryControl(
+        (400, 200, 900, 260), "私聊旧消息", "mmui::ChatTextItemView"
+    )
+    row = ClickableGeometryControl(
+        (0, 100, 300, 160),
+        "小小地下联络站",
+        "mmui::ChatSessionCell",
+        automation_id="session_item_小小地下联络站",
+        # Click is a no-op: detail pane stays on 颜料盒.
+    )
+    # Active chat is private 颜料盒 while the target row is the group.
+    root, _, _ = _selection_tree("颜料盒", [previous_message], row)
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_paced_wait", lambda *args, **kwargs: None)
+
+    assert client.locate_conversation("小小地下联络站") is False
+    assert row.click_count == 2
+
+
+def test_locate_conversation_accepts_group_title_with_member_count(monkeypatch):
+    """Detail headers often show '群名(n)' while session_item_/config use bare names."""
+    message = GeometryControl(
+        (400, 200, 900, 260), "群消息", "mmui::ChatTextItemView"
+    )
+
+    def activate():
+        header.Name = "小小地下联络站(9)"
+        message_list._children[:] = [message]
+
+    row = ClickableGeometryControl(
+        (0, 100, 300, 160),
+        "小小地下联络站",
+        "mmui::ChatSessionCell",
+        automation_id="session_item_小小地下联络站",
+        on_click=activate,
+    )
+    root, header, message_list = _selection_tree("颜料盒", [], row)
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_paced_wait", lambda *args, **kwargs: None)
+
+    assert client.locate_conversation("小小地下联络站") is True
+    assert row.click_count == 1
+
+
+def test_get_title_strips_member_count_suffix(monkeypatch):
+    header = GeometryControl(
+        (400, 100, 700, 130),
+        "小小地下联络站(9)",
+        "Text",
+        automation_id="current_chat_name_label",
+    )
+    root = GeometryControl((0, 0, 1000, 800), children=[header])
+    client = WechatUiaClient({})
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    info = client.get_title()
+    assert info.title == "小小地下联络站"
+    assert info.chat_number == 9
+    assert info.header_type == "group"
 
 
 class FakeClient:

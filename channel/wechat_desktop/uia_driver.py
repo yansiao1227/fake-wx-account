@@ -196,9 +196,13 @@ class WechatUiaDriver(WechatDesktopBackend):
 
     def _is_reply_conversation(self, row_key: str, row) -> bool:
         with self._operation_lock:
+            from channel.wechat_desktop.operations import conversation_titles_match
+
             return self.reply_in_flight and (
                 row_key == self._reply_conversation_id
-                or row.conversation_title == self._reply_conversation
+                or conversation_titles_match(
+                    row.conversation_title, self._reply_conversation
+                )
             )
 
     def start(self) -> bool:
@@ -991,8 +995,12 @@ class WechatUiaDriver(WechatDesktopBackend):
                         )
                         continue
                     if active_reply_conversation:
+                        from channel.wechat_desktop.operations import (
+                            conversation_titles_match,
+                        )
+
                         header = self._scan_uia(self.client.get_title)
-                        if header.title != name:
+                        if not conversation_titles_match(header.title, name):
                             self._trace(
                                 "02-skip",
                                 "conversation=%s reason=reply_monitor_not_active current=%s",

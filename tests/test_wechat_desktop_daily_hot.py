@@ -24,6 +24,12 @@ from channel.wechat_desktop.daily_hot_scheduler import (
     parse_hhmm,
 )
 from channel.wechat_desktop.fifo_queue import WechatReplyQueue
+from channel.wechat_desktop.models import ConversationInfo
+from channel.wechat_desktop.operations import (
+    conversation_titles_match,
+    resolve_conversation_selector,
+    strip_member_count_suffix,
+)
 from channel.wechat_desktop.policy import WechatDesktopPolicy
 from channel.wechat_desktop.service import reset_wechat_desktop_service_for_tests
 from channel.wechat_desktop.store import WechatDesktopStore
@@ -431,6 +437,11 @@ class _FakeDriver:
         self.sent.append((conversation, text))
         return {"success": True, "verified": True}
 
+    def _resolve_selector(self, conversation):
+        from channel.wechat_desktop.operations import WechatConversationSelector
+
+        return WechatConversationSelector(str(conversation or ""))
+
 
 def _channel_impl():
     from channel.wechat_desktop.wechat_desktop_channel import WechatDesktopChannel
@@ -472,11 +483,53 @@ def _make_channel_for_enqueue(tmp_path, config_overrides=None):
     channel._trace = lambda *args, **kwargs: None
     channel._content_hash = impl._content_hash
     channel._enqueue_reply_event = impl._enqueue_reply_event.__get__(channel)
+    channel._resolve_daily_hot_target = impl._resolve_daily_hot_target.__get__(
+        channel
+    )
     channel.enqueue_daily_hot_broadcast = impl.enqueue_daily_hot_broadcast.__get__(
         channel
     )
     channel._send_precomposed_reply = impl._send_precomposed_reply.__get__(channel)
     return channel
+
+
+def test_conversation_titles_match_ignores_member_count_suffix():
+    assert strip_member_count_suffix("小小地下联络站(9)") == "小小地下联络站"
+    assert strip_member_count_suffix("小小地下联络站（12）") == "小小地下联络站"
+    assert strip_member_count_suffix("小小地下联络站") == "小小地下联络站"
+    assert conversation_titles_match("小小地下联络站", "小小地下联络站(9)")
+    assert conversation_titles_match("小小地下联络站(9)", "小小地下联络站（10）")
+    assert not conversation_titles_match("小小地下联络站", "测试群(3)")
+
+
+def test_resolve_conversation_selector_matches_unique_title():
+    row = ConversationInfo(
+        conversation_title="小小地下联络站",
+        runtime_id="42.1.2.3",
+        row_index=2,
+    )
+    selectors = {"uia-session:42.1.2.3": row}
+    selector = resolve_conversation_selector(selectors, "小小地下联络站")
+    assert selector.title == "小小地下联络站"
+    assert selector.runtime_id == "42.1.2.3"
+    assert selector.row_index == 2
+
+
+def test_resolve_conversation_selector_matches_title_with_member_suffix():
+    row = ConversationInfo(
+        conversation_title="小小地下联络站",
+        runtime_id="42.1.2.3",
+        row_index=0,
+    )
+    selectors = {"uia-session:42.1.2.3": row}
+    selector = resolve_conversation_selector(selectors, "小小地下联络站(9)")
+    assert selector.runtime_id == "42.1.2.3"
+
+
+def test_resolve_conversation_selector_ignores_stale_uia_session_key():
+    selector = resolve_conversation_selector({}, "uia-session:missing")
+    assert selector.title == ""
+    assert selector.runtime_id == ""
 
 
 def test_enqueue_daily_hot_broadcast_filters_groups(tmp_path):
@@ -491,6 +544,35 @@ def test_enqueue_daily_hot_broadcast_filters_groups(tmp_path):
     assert names == {"群A", "群B"}
     assert getattr(item1.event, "_proactive_send") is True
     assert getattr(item1.event, "_precomposed_reply_text") == "热点正文"
+
+
+def test_enqueue_daily_hot_broadcast_resolves_session_id(tmp_path):
+    channel = _make_channel_for_enqueue(
+        tmp_path,
+        {
+            "auto_reply_groups": ["小小地下联络站"],
+            "auto_reply_blacklist": [],
+        },
+    )
+
+    class _ResolverDriver(_FakeDriver):
+        def _resolve_selector(self, conversation):
+            if conversation == "小小地下联络站":
+                from channel.wechat_desktop.operations import WechatConversationSelector
+
+                return WechatConversationSelector(
+                    title="小小地下联络站",
+                    runtime_id="42.9.9.9",
+                    row_index=0,
+                )
+            return super()._resolve_selector(conversation)
+
+    channel._driver = _ResolverDriver()
+    queued = channel.enqueue_daily_hot_broadcast("热点正文")
+    assert queued == 1
+    item = channel._reply_queue.get(timeout=0.5)
+    assert item.event.conversation_name == "小小地下联络站"
+    assert item.event.conversation_id == "uia-session:42.9.9.9"
 
 
 def test_enqueue_daily_hot_broadcast_shadow_mode(tmp_path):

@@ -2,11 +2,46 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
 
 from channel.wechat_desktop.models import ConversationInfo
+
+# WeChat group headers often append the member count, e.g. "项目群(9)" / "项目群（9）".
+# Session list AutomationId usually keeps the bare name (session_item_项目群).
+_MEMBER_COUNT_SUFFIX = re.compile(
+    r"^(?P<base>.*?)[\s\u00a0]*[（(](?P<count>\d+)[）)]\s*$"
+)
+
+
+def strip_member_count_suffix(title: str) -> str:
+    """Remove a trailing ``(n)`` / ``（n）`` member-count suffix from a chat title."""
+    value = str(title or "").strip()
+    if not value:
+        return ""
+    match = _MEMBER_COUNT_SUFFIX.match(value)
+    if not match:
+        return value
+    base = str(match.group("base") or "").strip()
+    return base or value
+
+
+def conversation_titles_match(left: str, right: str) -> bool:
+    """Compare chat titles, allowing optional group member-count suffixes.
+
+    Exact match wins. Otherwise compare after stripping a trailing ``(n)`` /
+    ``（n）`` from either side (group detail headers often include the count;
+    session rows / config usually do not).
+    """
+    a = str(left or "").strip()
+    b = str(right or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return strip_member_count_suffix(a) == strip_member_count_suffix(b)
 
 
 @dataclass(frozen=True)
@@ -23,12 +58,31 @@ def resolve_conversation_selector(
 ) -> WechatConversationSelector:
     """把内部会话 ID 转成客户端可使用的标题和 UIA 定位信息。
 
-    如果会话尚未被扫描到，则保留旧行为：把传入值当作会话标题使用。
+    优先按内部 key（``uia-session:...``）精确查找。若调用方传入的是显示名
+    （例如每日热点广播使用 ``auto_reply_groups`` 里的群名），再按标题唯一匹配。
+    标题歧义时不猜测，退回仅标题定位。
     """
 
-    row = selectors.get(conversation)
+    key = str(conversation or "")
+    row = selectors.get(key)
     if row is None:
-        return WechatConversationSelector(str(conversation or ""))
+        target = key.strip()
+        # Never treat an internal session key as a WeChat display title.
+        if target and not target.startswith("uia-session:"):
+            title_matches = [
+                item
+                for item in selectors.values()
+                if conversation_titles_match(
+                    getattr(item, "conversation_title", ""), target
+                )
+            ]
+            if len(title_matches) == 1:
+                row = title_matches[0]
+    if row is None:
+        # Stale uia-session keys must not become locate titles.
+        if key.strip().startswith("uia-session:"):
+            return WechatConversationSelector("")
+        return WechatConversationSelector(key)
     return WechatConversationSelector(
         title=row.conversation_title,
         runtime_id=row.runtime_id,
