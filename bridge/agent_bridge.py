@@ -629,19 +629,13 @@ class AgentBridge:
             # changes take effect on the user's next message.
             self._schedule_mcp_hot_reload(agent)
 
-            # Check if there are files to send (from send/read tool)
+            # Check if there are files to send (send tool and/or auto-detected
+            # image artifacts from bash/skills such as Seedream).
             if hasattr(agent, 'stream_executor') and hasattr(agent.stream_executor, 'files_to_send'):
-                files_to_send = agent.stream_executor.files_to_send
+                files_to_send = list(agent.stream_executor.files_to_send or [])
                 if files_to_send:
-                    # Send the first file (for now, handle one file at a time)
-                    file_info = files_to_send[0]
-                    logger.info(f"[AgentBridge] Sending file: {file_info.get('path')}")
-                    
-                    # Clear files_to_send for next request
                     agent.stream_executor.files_to_send = []
-                    
-                    # Return file reply based on file type
-                    return self._create_file_reply(file_info, response, context)
+                    return self._create_files_reply(files_to_send, response, context)
             
             return Reply(ReplyType.TEXT, response)
             
@@ -715,6 +709,66 @@ class AgentBridge:
 
         threading.Thread(target=_run, daemon=True, name="mcp-hot-reload").start()
 
+    def _create_files_reply(
+        self,
+        files_to_send: list,
+        text_response: str,
+        context: Context = None,
+    ) -> Reply:
+        """Build a channel reply for one or more queued file_to_send payloads.
+
+        - Single image → IMAGE_URL (with optional text_content)
+        - Multiple images → TEXT with markdown image links so chat_channel's
+          ``_extract_and_send_images`` delivers every file (WeChat / IM)
+        - Non-image first file → FILE / IMAGE_URL as before
+
+        Web already receives each ``file_to_send`` SSE event during the run, so
+        multi-image markdown is primarily for non-web channels.
+        """
+        if not files_to_send:
+            return Reply(ReplyType.TEXT, text_response or "")
+
+        images = [
+            f for f in files_to_send
+            if (f.get("file_type") or "").lower() == "image" and f.get("path")
+        ]
+        others = [
+            f for f in files_to_send
+            if (f.get("file_type") or "").lower() != "image"
+        ]
+
+        for f in files_to_send:
+            logger.info(
+                "[AgentBridge] Queued delivery: type=%s path=%s auto=%s",
+                f.get("file_type"),
+                f.get("path"),
+                bool(f.get("auto_detected")),
+            )
+
+        if len(images) == 1 and not others:
+            return self._create_file_reply(images[0], text_response, context)
+
+        if len(images) > 1:
+            md_lines = []
+            for f in images:
+                path = f.get("path") or ""
+                # Normalize separators so markdown extract + os.path.exists work
+                # on Windows (backslashes inside () are fragile).
+                path_md = path.replace("\\", "/")
+                name = f.get("file_name") or (os.path.basename(path) if path else "image")
+                md_lines.append(f"![{name}]({path_md})")
+            body = (text_response or "").rstrip()
+            md_block = "\n".join(md_lines)
+            if body:
+                body = f"{body}\n\n{md_block}"
+            else:
+                body = md_block
+            # Prefer multi-image text extract path over dropping extras.
+            return Reply(ReplyType.TEXT, body)
+
+        # Mixed / non-image: deliver the first payload (legacy single-file path).
+        return self._create_file_reply(files_to_send[0], text_response, context)
+
     def _create_file_reply(self, file_info: dict, text_response: str, context: Context = None) -> Reply:
         """
         Create a reply for sending files
@@ -756,7 +810,7 @@ class AgentBridge:
             file_url = _to_channel_url(file_path)
             logger.info(f"[AgentBridge] Sending {file_type}: {file_url}")
             reply = Reply(ReplyType.FILE, file_url)
-            reply.file_name = file_info.get("file_name", os.path.basename(file_path))
+            reply.file_name = file_info.get("file_name", os.path.basename(file_path) if file_path else "file")
             # Attach text message if present
             if text_response:
                 reply.text_content = text_response
@@ -766,7 +820,7 @@ class AgentBridge:
         file_url = _to_channel_url(file_path)
         logger.info(f"[AgentBridge] Sending generic file: {file_url}")
         reply = Reply(ReplyType.FILE, file_url)
-        reply.file_name = file_info.get("file_name", os.path.basename(file_path))
+        reply.file_name = file_info.get("file_name", os.path.basename(file_path) if file_path else "file")
         if text_response:
             reply.text_content = text_response
         return reply
@@ -1166,8 +1220,7 @@ class AgentBridge:
         from config import conf
 
         # Reload environment variables from .env file
-        workspace_root = expand_path(conf().get("agent_workspace", "~/cow"))
-        env_file = os.path.join(workspace_root, '.env')
+        env_file = expand_path("~/.cow/.env")
 
         if os.path.exists(env_file):
             load_dotenv(env_file, override=True)
@@ -1201,24 +1254,56 @@ class AgentBridge:
     def _refresh_conditional_tools(agent):
         """
         Add or remove conditional tools based on current environment variables.
-        For example, web_search should only be present when BOCHA_API_KEY or
-        LINKAI_API_KEY is set.
+
+        Search cascade: doubao_search → baidu_ai_search → web_search.
         """
+        try:
+            from agent.tools.doubao_search.doubao_search import DoubaoSearch
+
+            has_tool = any(t.name == "doubao_search" for t in agent.tools)
+            available = DoubaoSearch.is_available()
+
+            if available and not has_tool:
+                tool = DoubaoSearch()
+                tool.model = agent.model
+                agent.tools.append(tool)
+                logger.info("[AgentBridge] doubao_search tool added (now available)")
+            elif not available and has_tool:
+                agent.tools = [t for t in agent.tools if t.name != "doubao_search"]
+                logger.info("[AgentBridge] doubao_search tool removed (no longer available)")
+        except Exception as e:
+            logger.debug(f"[AgentBridge] Failed to refresh doubao_search tool: {e}")
+
+        try:
+            from agent.tools.baidu_ai_search.baidu_ai_search import BaiduAiSearch
+
+            has_ai = any(t.name == "baidu_ai_search" for t in agent.tools)
+            ai_available = BaiduAiSearch.is_available()
+
+            if ai_available and not has_ai:
+                tool = BaiduAiSearch()
+                tool.model = agent.model
+                agent.tools.append(tool)
+                logger.info("[AgentBridge] baidu_ai_search tool added (now available)")
+            elif not ai_available and has_ai:
+                agent.tools = [t for t in agent.tools if t.name != "baidu_ai_search"]
+                logger.info("[AgentBridge] baidu_ai_search tool removed (no longer available)")
+        except Exception as e:
+            logger.debug(f"[AgentBridge] Failed to refresh baidu_ai_search tool: {e}")
+
         try:
             from agent.tools.web_search.web_search import WebSearch
 
-            has_tool = any(t.name == "web_search" for t in agent.tools)
-            available = WebSearch.is_available()
+            has_web = any(t.name == "web_search" for t in agent.tools)
+            web_available = WebSearch.is_available()
 
-            if available and not has_tool:
-                # API key was added - inject the tool
+            if web_available and not has_web:
                 tool = WebSearch()
                 tool.model = agent.model
                 agent.tools.append(tool)
                 logger.info("[AgentBridge] web_search tool added (API key now available)")
-            elif not available and has_tool:
-                # API key was removed - remove the tool
+            elif not web_available and has_web:
                 agent.tools = [t for t in agent.tools if t.name != "web_search"]
                 logger.info("[AgentBridge] web_search tool removed (API key no longer available)")
         except Exception as e:
-            logger.debug(f"[AgentBridge] Failed to refresh conditional tools: {e}")
+            logger.debug(f"[AgentBridge] Failed to refresh web_search tool: {e}")

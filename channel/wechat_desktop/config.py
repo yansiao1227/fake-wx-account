@@ -56,7 +56,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_reply_blacklist": [],
     "conversation_history_retention_days": 90,
 
-    # 可选诊断能力。
+    # 可选诊断能力：会话扫描细粒度日志写入 run.log，不打印到控制台。
     "diagnostic_logging": True,
 
     # Agent 回复周期与工具调用进度通知。
@@ -87,7 +87,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "self_display_name": "",
 
     # 图片、文件和引用附件的提取策略。
-    "auto_send_images": False,
+    # Agent 生成的图片（Seedream / send 工具）需开启，否则只会发前置文本。
+    "auto_send_images": True,
     "analyze_incoming_images": False,
     "resolve_message_references": True,
     "uia_image_viewer_enabled": True,

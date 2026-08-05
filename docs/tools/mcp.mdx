@@ -35,10 +35,32 @@ Fully compatible with the MCP community standard, identical to Claude Desktop / 
 | `args` | No | Arguments passed to `command` |
 | `env` | No | Environment variables for the subprocess, commonly used for API keys |
 | `url` | SSE / Streamable HTTP | Remote endpoint URL (alternative to `command`) |
-| `type` | Remote | Remote transport type: `sse` or `streamable-http` (defaults to `sse`) |
-| `headers` | No | Extra HTTP headers for remote requests (e.g. `Authorization`); Streamable HTTP only |
+| `type` / `transport` | Remote | Remote transport: `sse`, `http` / `streamable-http` (official samples often use `transport: "http"`) |
+| `headers` | No | Extra HTTP headers (e.g. `Authorization`, `X-Agent-Plan-Key`); supports `${ENV_VAR}` placeholders |
 | `scope` | No | OAuth scope, only for remote servers that require OAuth authorization (optional) |
 | `disabled` | No | When `true`, this server is skipped — handy for temporary disabling |
+
+### Volcengine Professional Dataset (Agent Plan MCP)
+
+With an Agent Plan subscription, add:
+
+```json
+{
+  "mcpServers": {
+    "datapro": {
+      "url": "https://datapro.hqd.cn-beijing.volces.com/mcp",
+      "type": "http",
+      "transport": "http",
+      "headers": {
+        "X-Agent-Plan-Key": "${AGENT_PLAN_API_KEY}"
+      },
+      "timeout": 120
+    }
+  }
+}
+```
+
+Put the key in `~/.cow/.env` as `AGENT_PLAN_API_KEY` (or reuse `WEB_SEARCH_API_KEY` / Ark subscription key). After load, the MCP tool `dataPro_search` becomes available.
 
 ### Full Example
 

@@ -8,6 +8,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import threading
 import time
 import unicodedata
@@ -16,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-from common.log import logger
+from common.log import file_logger, logger
 from channel.wechat_desktop.group_sender_ocr import RapidOcrGroupSenderResolver
 from channel.wechat_desktop.models import (
     ConversationInfo,
@@ -40,6 +41,22 @@ MENTION_MARKERS = ("[有人@我]", "有人@我", "[Someone mentioned me]")
 
 def _text(value) -> str:
     return str(value or "").strip()
+
+
+def _encode_cf_hdrop(files: Iterable[str]) -> bytes:
+    """Encode file paths as the Windows DROPFILES payload used by CF_HDROP."""
+
+    paths = [str(path) for path in files]
+    if not paths:
+        raise ValueError("CF_HDROP requires at least one file path")
+    if any("\0" in path for path in paths):
+        raise ValueError("CF_HDROP file paths cannot contain NUL characters")
+
+    # DROPFILES is 20 bytes: pFiles, POINT(x, y), fNC, fWide. File names
+    # follow as a double-NUL-terminated UTF-16LE list when fWide is true.
+    header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+    file_list = ("\0".join(paths) + "\0\0").encode("utf-16le")
+    return header + file_list
 
 
 def _bounds(control) -> Optional[tuple[int, int, int, int]]:
@@ -139,8 +156,13 @@ class WechatUiaClient:
         self._known_outgoing_messages: dict[
             str, list[tuple[str, str, float]]
         ] = {}
-        # RapidOCR lazily loads its models only when a group has missing names.
+        # RapidOCR is preloaded at channel startup; first group scan should not
+        # pay model-load latency. Enrich still falls back to on-demand load.
         self._group_sender_ocr = RapidOcrGroupSenderResolver(self.config)
+
+    def preload_group_sender_ocr(self) -> bool:
+        """Load RapidOCR models early (channel startup). Returns readiness."""
+        return bool(self._group_sender_ocr.preload())
 
     def cancel_waits(self):
         self._stop_event.set()
@@ -481,16 +503,14 @@ class WechatUiaClient:
             not configured or self._owner_cache.nick_name == configured
         ):
             if bool(self.config.get("diagnostic_logging", False)):
-                logger.info(
-                    "[WechatDesktop][trace:05-owner] source=cache name=%s",
+                file_logger.info("[WechatDesktop][trace:05-owner] source=cache name=%s",
                     self._owner_cache.nick_name,
                 )
             return self._owner_cache
         now = time.monotonic()
         if now < self._owner_lookup_retry_after:
             if bool(self.config.get("diagnostic_logging", False)):
-                logger.info(
-                    "[WechatDesktop][trace:05-owner] "
+                file_logger.info("[WechatDesktop][trace:05-owner] "
                     "source=failure_cache retry_in=%.3fs",
                     self._owner_lookup_retry_after - now,
                 )
@@ -499,8 +519,7 @@ class WechatUiaClient:
         wx_id = ""
         discovery_method = "none"
         if bool(self.config.get("diagnostic_logging", False)):
-            logger.info(
-                "[WechatDesktop][trace:05-owner] lookup_start configured=%s cached=%s",
+            file_logger.info("[WechatDesktop][trace:05-owner] lookup_start configured=%s cached=%s",
                 bool(configured),
                 bool(self._owner_cache and self._owner_cache.nick_name),
             )
@@ -545,8 +564,7 @@ class WechatUiaClient:
                         break
                 if not discovered:
                     if bool(self.config.get("diagnostic_logging", False)):
-                        logger.info(
-                            "[WechatDesktop][trace:05-owner] "
+                        file_logger.info("[WechatDesktop][trace:05-owner] "
                             "sidebar_missing; opening_profile_popup"
                         )
                     discovered, wx_id = self._read_owner_profile_popup(root)
@@ -585,8 +603,7 @@ class WechatUiaClient:
                 min(failure_cache_seconds, 3600.0),
             )
         if bool(self.config.get("diagnostic_logging", False)):
-            logger.info(
-                "[WechatDesktop][trace:05-owner] lookup_result available=%s source=%s method=%s name=%s",
+            file_logger.info("[WechatDesktop][trace:05-owner] lookup_result available=%s source=%s method=%s name=%s",
                 bool(owner.nick_name),
                 owner.source,
                 discovery_method if owner.source == "uia" else owner.source,
@@ -655,8 +672,7 @@ class WechatUiaClient:
                         return popup
                 except Exception as exc:
                     if bool(self.config.get("diagnostic_logging", False)):
-                        logger.info(
-                            "[WechatDesktop][trace:05-owner] "
+                        file_logger.info("[WechatDesktop][trace:05-owner] "
                             "profile_popup_candidate_failed hwnd=%s error=%s",
                             hwnd,
                             exc,
@@ -696,8 +712,7 @@ class WechatUiaClient:
             popup = self._find_owner_profile_popup(main_hwnd, visible_before)
             if popup is None:
                 if bool(self.config.get("diagnostic_logging", False)):
-                    logger.info(
-                        "[WechatDesktop][trace:05-owner] "
+                    file_logger.info("[WechatDesktop][trace:05-owner] "
                         "profile_popup_not_found elapsed=%.3fs",
                         time.monotonic() - started_at,
                     )
@@ -713,8 +728,7 @@ class WechatUiaClient:
                     if candidate and candidate != display_name:
                         wx_id = candidate
             if bool(self.config.get("diagnostic_logging", False)):
-                logger.info(
-                    "[WechatDesktop][trace:05-owner] "
+                file_logger.info("[WechatDesktop][trace:05-owner] "
                     "profile_popup_read available=%s elapsed=%.3fs",
                     bool(display_name),
                     time.monotonic() - started_at,
@@ -2374,7 +2388,10 @@ class WechatUiaClient:
                     pass
             win32clipboard.EmptyClipboard()
             if files is not None:
-                win32clipboard.SetClipboardData(win32con.CF_HDROP, tuple(files))
+                win32clipboard.SetClipboardData(
+                    win32con.CF_HDROP,
+                    _encode_cf_hdrop(files),
+                )
             else:
                 expected = str(unicode_text or "")
                 win32clipboard.SetClipboardText(expected, win32con.CF_UNICODETEXT)
@@ -2400,6 +2417,13 @@ class WechatUiaClient:
                     try:
                         if fmt == win32con.CF_UNICODETEXT:
                             win32clipboard.SetClipboardText(value, fmt)
+                        elif fmt == win32con.CF_HDROP:
+                            win32clipboard.SetClipboardData(
+                                fmt,
+                                value
+                                if isinstance(value, (bytes, bytearray, memoryview))
+                                else _encode_cf_hdrop(value),
+                            )
                         else:
                             win32clipboard.SetClipboardData(fmt, value)
                     except Exception:

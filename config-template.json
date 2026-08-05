@@ -18,6 +18,13 @@
   "minimax_api_key": "",
   "zhipu_ai_api_key": "",
   "ark_api_key": "",
+  "ark_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+  "skills": {
+    "image-generation": {
+      "provider": "",
+      "model": ""
+    }
+  },
   "moonshot_api_key": "",
   "dashscope_api_key": "",
   "claude_api_key": "",
@@ -46,11 +53,25 @@
   "self_evolution_enabled": true,
   "mcp_tool_retrieval_enabled": false,
   "tools": {
+    "doubao_search": {
+      "api_key": "",
+      "auth_level": 0,
+      "query_rewrite": false,
+      "fallback_to_baidu_ai_search": true
+    },
     "web_search": {
       "strategy": "auto",
       "tavily_api_key": "",
-      "qianfan_daily_limit": 50,
-      "tavily_monthly_limit": 1000
+      "query_rewrite": true
+    },
+    "baidu_ai_search": {
+      "model": "ernie-4.5-turbo-32k",
+      "daily_limit": 100,
+      "search_source": "baidu_search_v2",
+      "search_mode": "required",
+      "enable_corner_markers": true,
+      "enable_deep_search": false,
+      "fallback_to_web_search": true
     }
   }
 }

@@ -7,6 +7,14 @@ description: 搜索互联网获取实时信息，支持多个搜索厂商
 
 另支持博查、智谱、LinkAI 等后端（`fixed` 策略或三源均不可用时的回退）。
 
+<Note>
+  火山引擎 **豆包搜索** 是独立工具：[`doubao_search`](/zh/tools/doubao-search)，**不是** `web_search` 的厂商。优先降级链：`doubao_search` → `baidu_ai_search` → `web_search`。
+</Note>
+
+<Tip>
+  对一般事实问答与时效性问题，优先使用 [`baidu_ai_search`](/zh/tools/baidu-ai-search)（智能搜索生成草稿+来源，由 Agent 汇总）；其日额度用尽时会自动退化为本工具。
+</Tip>
+
 <Tip>
   推荐通过 [Web 控制台](/zh/channels/web) 的「模型管理 → 搜索」面板可视化配置厂商与策略，无需手动编辑配置文件。
 </Tip>
@@ -17,7 +25,7 @@ description: 搜索互联网获取实时信息，支持多个搜索厂商
 2. **三源并行**：将 `altered_query` 同时发给百度千帆搜索、Tavily、DDGS（已配置/可用的）。
 3. **关联度排序**：按 URL 去重，结合标题/摘要与 query 的词面重合、厂商自带 score、多源命中等打分，取 top-N 返回。
 
-改写失败时自动回退为原始 query；无千帆 Key 时跳过改写，仍可搜索。
+改写失败（含超时）时**不重试**，直接用原始 query 搜索。改写/百度/Tavily 若返回额度或限流类错误，会写入**当日失效标志**，当天后续调用跳过该能力，避免重复无效请求。不再对百度/Tavily 做本地请求次数预占计数。
 
 ## 厂商
 

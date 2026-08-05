@@ -49,7 +49,7 @@ def _import_optional_tools():
     except Exception as e:
         logger.error(f"[Tools] Scheduler tool failed to load: {e}")
 
-    # WebSearch Tool (conditionally loaded based on API key availability at init time)
+    # WebSearch Tool (conditionally registered when a provider key is available)
     try:
         from agent.tools.web_search.web_search import WebSearch
         tools['WebSearch'] = WebSearch
@@ -57,6 +57,24 @@ def _import_optional_tools():
         logger.error(f"[Tools] WebSearch not loaded - missing dependency: {e}")
     except Exception as e:
         logger.error(f"[Tools] WebSearch failed to load: {e}")
+
+    # BaiduAiSearch Tool (Qianfan intelligent search; falls back to web_search)
+    try:
+        from agent.tools.baidu_ai_search.baidu_ai_search import BaiduAiSearch
+        tools['BaiduAiSearch'] = BaiduAiSearch
+    except ImportError as e:
+        logger.error(f"[Tools] BaiduAiSearch not loaded - missing dependency: {e}")
+    except Exception as e:
+        logger.error(f"[Tools] BaiduAiSearch failed to load: {e}")
+
+    # DoubaoSearch Tool (Volcengine 豆包搜索 / SearchInfinity)
+    try:
+        from agent.tools.doubao_search.doubao_search import DoubaoSearch
+        tools['DoubaoSearch'] = DoubaoSearch
+    except ImportError as e:
+        logger.error(f"[Tools] DoubaoSearch not loaded - missing dependency: {e}")
+    except Exception as e:
+        logger.error(f"[Tools] DoubaoSearch failed to load: {e}")
 
     # WebFetch Tool
     try:
@@ -83,6 +101,8 @@ _optional_tools = _import_optional_tools()
 EnvConfig = _optional_tools.get('EnvConfig')
 SchedulerTool = _optional_tools.get('SchedulerTool')
 WebSearch = _optional_tools.get('WebSearch')
+BaiduAiSearch = _optional_tools.get('BaiduAiSearch')
+DoubaoSearch = _optional_tools.get('DoubaoSearch')
 WebFetch = _optional_tools.get('WebFetch')
 Vision = _optional_tools.get('Vision')
 GoogleSearch = _optional_tools.get('GoogleSearch')
@@ -148,7 +168,9 @@ __all__ = [
     'EvolutionUndoTool',
     'EnvConfig',
     'SchedulerTool',
+    'BaiduAiSearch',
     'WebSearch',
+    'DoubaoSearch',
     'WebFetch',
     'Vision',
     'BrowserTool',

@@ -3,7 +3,19 @@ title: web_search - Web Search
 description: Search the internet for real-time information, with support for multiple search providers
 ---
 
-Search the internet for real-time information, news, research, and more. Supports four backends — Bocha, ERNIE, GLM, and LinkAI — and works once any one of them is configured.
+Search the internet for multi-source raw results (titles, URLs, snippets). Supports Bocha, ERNIE/Qianfan, GLM, Tavily, LinkAI, and DDGS once any one of them is configured.
+
+Default pipeline: optional Qianfan **query rewrite**, then parallel fan-out to **Baidu / Tavily / DDGS**, merge and rank by relevance.
+
+<Note>
+  Volcengine Doubao Search is a **separate** tool: [`doubao_search`](/tools/doubao-search). It is not a `web_search` provider. Preferred cascade: `doubao_search` → `baidu_ai_search` → `web_search`.
+</Note>
+
+Quota behavior: there is **no local request counter** for Baidu or Tavily. When rewrite, Baidu, or Tavily hits a remote free-tier / rate-limit error, a **same-day exhaustion flag** is stored and that capability is skipped for the rest of the day (no retries). Transient failures fall back for the current call only.
+
+<Tip>
+  For general factual Q&A and current-events questions, prefer [`baidu_ai_search`](/tools/baidu-ai-search) (intelligent search generation with a draft summary + sources for the agent to compose). When its daily free quota is exhausted, it automatically falls back to this tool.
+</Tip>
 
 <Tip>
   It is recommended to configure providers and routing strategy visually from the "Model Management → Search" panel in the [Web console](/channels/web), without manually editing the configuration file.
@@ -17,8 +29,10 @@ Search the internet for real-time information, news, research, and more. Support
 | ERNIE | Reuses `qianfan_api_key` | [Qianfan Console](https://cloud.baidu.com/doc/qianfan/s/2mh4su4uy) |
 | Zhipu | Reuses `zhipu_ai_api_key` | [Zhipu Open Platform](https://docs.bigmodel.cn/cn/guide/tools/web-search) |
 | LinkAI | Reuses `linkai_api_key` | [LinkAI Console](https://link-ai.tech/console/interface) |
+| Tavily | `tools.web_search.tavily_api_key` | [Tavily](https://tavily.com/) |
+| DDGS | none | install `ddgs` |
 
-Except for Bocha which requires a dedicated `bocha_api_key`, the other three reuse the corresponding model's API key — configuring the model automatically grants search capability.
+Except for Bocha which requires a dedicated `bocha_api_key`, Qianfan / Zhipu / LinkAI reuse the corresponding model API keys — configuring the model automatically grants search capability.
 
 ## Routing Strategy
 

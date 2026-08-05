@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional
 
-from common.log import logger
+from common.log import file_logger, logger
 from channel.wechat_desktop.models import (
     ReplyTargetValidation,
     UNKNOWN_SENDER_NAME,
@@ -127,6 +127,13 @@ class WechatUiaDriver(WechatDesktopBackend):
             lambda: self._observation(read_owner=False),
         )
 
+    def preload_group_sender_ocr(self) -> bool:
+        """Eagerly load RapidOCR models used for group sender resolution."""
+        preload = getattr(self.client, "preload_group_sender_ocr", None)
+        if not callable(preload):
+            return False
+        return bool(preload())
+
     def _scan_uia(self, operation, *args, **kwargs):
         with self._uia_priority.lease(reply=False):
             return operation(*args, **kwargs)
@@ -141,8 +148,9 @@ class WechatUiaDriver(WechatDesktopBackend):
             self._reply_ui_pending.clear()
 
     def _trace(self, stage: str, message: str, *args) -> None:
+        """Session-scan diagnostics: file only (run.log), never the console."""
         if bool(self.config.get("diagnostic_logging", False)):
-            logger.info(
+            file_logger.info(
                 "[WechatDesktop][trace:%s] " + message,
                 stage,
                 *args,

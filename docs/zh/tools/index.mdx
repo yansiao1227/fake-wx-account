@@ -47,8 +47,14 @@ description: CowAgent 内置工具系统
 以下工具需要安装额外依赖或配置 API Key 后启用：
 
 <CardGroup cols={2}>
+  <Card title="doubao_search - 豆包搜索" icon="magnifying-glass" href="/zh/tools/doubao-search">
+    优先使用的独立实时联网搜索（火山引擎豆包搜索）
+  </Card>
+  <Card title="baidu_ai_search - 智能搜索" icon="sparkles" href="/zh/tools/baidu-ai-search">
+    智能搜索草稿+来源，由 Agent 汇总；额度用完退化为 web_search
+  </Card>
   <Card title="web_search - 联网搜索" icon="magnifying-glass" href="/zh/tools/web-search">
-    搜索互联网获取实时信息
+    多源原始检索结果（标题 / 链接 / 摘要）
   </Card>
   <Card title="vision - 图片理解" icon="eye" href="/zh/tools/vision">
     分析图片内容（识别、描述、OCR 文字提取等）

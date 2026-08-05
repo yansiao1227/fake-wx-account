@@ -459,6 +459,9 @@ def load_config():
         "moonshot_api_key": "MOONSHOT_API_KEY",
         "moonshot_api_base": "MOONSHOT_API_BASE",
         "ark_api_key": "ARK_API_KEY",
+        # Canonical config key is ark_base_url (used by doubao bot / UI).
+        # Also accept legacy ark_api_base if present in older configs.
+        "ark_base_url": "ARK_API_BASE",
         "ark_api_base": "ARK_API_BASE",
         "dashscope_api_key": "DASHSCOPE_API_KEY",
         "dashscope_api_base": "DASHSCOPE_API_BASE",

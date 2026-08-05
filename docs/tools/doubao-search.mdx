@@ -1,0 +1,65 @@
+---
+title: doubao_search - Doubao Search
+description: Volcengine Doubao Search (SearchInfinity) as a standalone real-time web search tool
+---
+
+Standalone real-time web search powered by [Volcengine Doubao Search](https://www.volcengine.com/docs/87772/2272953) (豆包搜索 / SearchInfinity). Returns web titles, URLs, snippets, and optional summaries.
+
+This tool is **not** mixed into `web_search` multi-source fan-out. Prefer it first for factual / timely questions.
+
+### Search degradation chain
+
+```text
+doubao_search  →  baidu_ai_search  →  web_search
+```
+
+When Doubao has no key, hits free-tier / rate-limit exhaustion, or fails, it automatically falls back to [`baidu_ai_search`](/tools/baidu-ai-search), which may further fall back to [`web_search`](/tools/web-search).
+
+## Credential
+
+| Source | Field |
+| --- | --- |
+| Environment (recommended) | `WEB_SEARCH_API_KEY` in `~/.cow/.env` |
+| Alternate env | `DOUBAO_SEARCH_API_KEY` |
+| Config | `tools.doubao_search.api_key` |
+
+How to get a key:
+
+1. Personal: [豆包搜索控制台](https://console.volcengine.com/search-infinity/api-key)
+2. Agent Plan: first enable **豆包搜索 / 联网搜索** under [Harness](https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&advancedActiveKey=agentPlan), then copy the key from the [API Key page](https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D)
+
+Official free quota: **500 calls / month** (resets on the 1st; check console for current policy).
+
+## Configuration
+
+```json
+{
+  "tools": {
+    "doubao_search": {
+      "api_key": "",
+      "auth_level": 0,
+      "query_rewrite": false,
+      "fallback_to_baidu_ai_search": true
+    }
+  }
+}
+```
+
+- `auth_level`: `0` all sources, `1` authoritative only
+- `query_rewrite`: enable Doubao server-side query rewrite
+- `fallback_to_baidu_ai_search`: degrade to `baidu_ai_search` (then possibly `web_search`) on failure (default `true`)
+
+## Tool Parameters
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | Yes | Search keywords (recommend 1–100 characters) |
+| `count` | integer | No | Result count (1–50, default 10) |
+| `freshness` | string | No | `noLimit` / `oneDay` / `oneWeek` / `oneMonth` / `oneYear` / `YYYY-MM-DD..YYYY-MM-DD` |
+| `auth_level` | integer | No | Override config (`0` / `1`) |
+| `query_rewrite` | boolean | No | Override config server-side rewrite |
+| `summary` | boolean | No | Include longer summaries when available (default true) |
+
+## Citation
+
+When the answer uses search results, cite supporting URLs as clickable source links. The tool also returns a `citationPolicy` field on success.

@@ -4,6 +4,7 @@ Agent Stream Execution Module - Multi-turn reasoning based on tool-call
 Provides streaming output, event system, and complete tool-call loop
 """
 import json
+import os
 import time
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
@@ -308,7 +309,55 @@ class AgentStreamExecutor:
                 })
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
-    
+
+    def _queue_files_from_tool_result(self, tool_name: str, result_data) -> None:
+        """Queue file_to_send payloads from an explicit send result or auto-detect.
+
+        Seedream / image-generation skills write local images via ``bash``; the
+        model often forgets a follow-up ``send`` call. Auto-detect those paths
+        so channels can deliver images without relying on the LLM.
+        """
+        queued_paths = {
+            os.path.normcase(os.path.abspath(str(f.get("path") or "")))
+            for f in self.files_to_send
+            if f.get("path")
+        }
+
+        def _queue(payload: dict, source: str) -> None:
+            path = payload.get("path") or ""
+            if not path:
+                return
+            key = os.path.normcase(os.path.abspath(str(path)))
+            if key in queued_paths:
+                return
+            queued_paths.add(key)
+            self.files_to_send.append(payload)
+            logger.info(
+                "📎 File queued for sending (%s): %s",
+                source,
+                payload.get("file_name", path),
+            )
+            self._emit_event("file_to_send", payload)
+
+        # Explicit send/read file_to_send dict
+        if isinstance(result_data, dict) and result_data.get("type") == "file_to_send":
+            _queue(result_data, tool_name or "tool")
+
+        # Auto-detect generated local images (bash Seedream JSON, etc.)
+        try:
+            from agent.tools.utils.image_artifacts import (
+                extract_image_artifacts_from_tool_result,
+            )
+            auto = extract_image_artifacts_from_tool_result(
+                tool_name,
+                result_data,
+                status="success",
+            )
+            for payload in auto:
+                _queue(payload, f"auto:{tool_name or 'tool'}")
+        except Exception as e:
+            logger.debug(f"[Agent] image auto-detect skipped: {e}")
+
     def _is_thinking_enabled(self) -> bool:
         """Whether deep-thinking mode is on at the model layer.
 
@@ -628,6 +677,7 @@ class AgentStreamExecutor:
                 # Execute tools
                 tool_results = []
                 tool_result_blocks = []
+                direct_final_answer = None
 
                 try:
                     for tool_index, tool_call in enumerate(tool_calls):
@@ -657,14 +707,14 @@ class AgentStreamExecutor:
                                     f"with same arguments. This may indicate a loop."
                                 )
                         
-                        # Check if this is a file to send
-                        if result.get("status") == "success" and isinstance(result.get("result"), dict):
-                            result_data = result.get("result")
-                            if result_data.get("type") == "file_to_send":
-                                self.files_to_send.append(result_data)
-                                logger.info(f"📎 File queued for sending: {result_data.get('file_name', result_data.get('path'))}")
-                                self._emit_event("file_to_send", result_data)
-                        
+                        # Queue explicit send/read file payloads, and auto-detect
+                        # local images produced by bash/skills (e.g. Seedream).
+                        if result.get("status") == "success":
+                            self._queue_files_from_tool_result(
+                                tool_call.get("name", ""),
+                                result.get("result"),
+                            )
+
                         # Check for critical error - abort entire conversation
                         if result.get("status") == "critical_error":
                             logger.error(f"💥 Fatal error detected, aborting conversation")
@@ -723,45 +773,52 @@ class AgentStreamExecutor:
                     # CRITICAL: Always add tool_result to maintain message history integrity
                     # Even if tool execution fails, we must add error results to match tool_use
                     if tool_result_blocks:
-                        # Keep the agent loop goal-directed after tool execution.
-                        # This block is stored alongside tool_result, so conversation
-                        # persistence treats it as internal rather than user input.
-                        tool_result_blocks.append({
-                            "type": "text",
-                            "text": _completion_gate_prompt(),
-                        })
-                        # Add tool results to message history as user message (Claude format)
+                        # Optional ready-made final answer from a tool: skip the
+                        # completion-gate prompt and the extra cowagent summarization turn.
+                        direct_final_answer = self._extract_direct_final_answer(
+                            tool_calls, tool_results
+                        )
+                        history_blocks = list(tool_result_blocks)
+                        if not direct_final_answer:
+                            # Keep the agent loop goal-directed after tool execution.
+                            # This block is stored alongside tool_result, so conversation
+                            # persistence treats it as internal rather than user input.
+                            history_blocks.append({
+                                "type": "text",
+                                "text": _completion_gate_prompt(),
+                            })
                         self.messages.append({
                             "role": "user",
-                            "content": tool_result_blocks
+                            "content": history_blocks,
                         })
-                        
-                        # Detect potential infinite loop: same tool called multiple times with success
-                        # If detected, add a hint to LLM to stop calling tools and provide response
-                        if turn >= 3 and len(tool_calls) > 0:
-                            tool_name = tool_calls[0]["name"]
-                            args_hash = self._hash_args(tool_calls[0]["arguments"])
-                            
-                            # Count recent successful calls with same tool+args
-                            recent_success_count = 0
-                            for name, ahash, success in reversed(self.tool_failure_history[-10:]):
-                                if name == tool_name and ahash == args_hash and success:
-                                    recent_success_count += 1
-                            
-                            # If tool was called successfully 3+ times with same args, add hint to stop loop
-                            if recent_success_count >= 3:
-                                logger.warning(
-                                    f"⚠️  Detected potential loop: '{tool_name}' called {recent_success_count} times "
-                                    f"with same args. Adding hint to LLM to provide final response."
-                                )
-                                # Add a gentle hint message to guide LLM to respond
-                                self.messages.append({
-                                    "role": "user",
-                                    "content": [{
-                                        "type": "text",
-                                        "text": "工具已成功执行并返回结果。请基于这些信息向用户做出回复，不要重复调用相同的工具。"
-                                    }]
-                                })
+
+                        if not direct_final_answer:
+                            # Detect potential infinite loop: same tool called multiple times with success
+                            # If detected, add a hint to LLM to stop calling tools and provide response
+                            if turn >= 3 and len(tool_calls) > 0:
+                                tool_name = tool_calls[0]["name"]
+                                args_hash = self._hash_args(tool_calls[0]["arguments"])
+                                
+                                # Count recent successful calls with same tool+args
+                                recent_success_count = 0
+                                for name, ahash, success in reversed(self.tool_failure_history[-10:]):
+                                    if name == tool_name and ahash == args_hash and success:
+                                        recent_success_count += 1
+                                
+                                # If tool was called successfully 3+ times with same args, add hint to stop loop
+                                if recent_success_count >= 3:
+                                    logger.warning(
+                                        f"⚠️  Detected potential loop: '{tool_name}' called {recent_success_count} times "
+                                        f"with same args. Adding hint to LLM to provide final response."
+                                    )
+                                    # Add a gentle hint message to guide LLM to respond
+                                    self.messages.append({
+                                        "role": "user",
+                                        "content": [{
+                                            "type": "text",
+                                            "text": "工具已成功执行并返回结果。请基于这些信息向用户做出回复，不要重复调用相同的工具。"
+                                        }]
+                                    })
                     elif tool_calls:
                         # If we have tool_calls but no tool_result_blocks (unexpected error),
                         # create error results for all tool calls to maintain message integrity
@@ -778,6 +835,28 @@ class AgentStreamExecutor:
                             "role": "user",
                             "content": emergency_blocks
                         })
+
+                if direct_final_answer:
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": [{
+                            "type": "text",
+                            "text": direct_final_answer,
+                        }],
+                    })
+                    final_response = direct_final_answer
+                    logger.info(
+                        "[Agent] direct final answer from tool "
+                        "(skip LLM summary): %s...",
+                        direct_final_answer[:120].replace("\n", " "),
+                    )
+                    self._emit_event("turn_end", {
+                        "turn": turn,
+                        "has_tool_calls": True,
+                        "tool_count": len(tool_calls),
+                        "direct_final_answer": True,
+                    })
+                    break
 
                 self._emit_event("turn_end", {
                     "turn": turn,
@@ -1344,6 +1423,37 @@ class AgentStreamExecutor:
         })
 
         return full_content, tool_calls
+
+    @staticmethod
+    def _extract_direct_final_answer(
+        tool_calls: List[Dict],
+        tool_results: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Return a ready-made user reply when a single tool supplies one.
+
+        Opt-in short-circuit for tools that set ``direct_final_answer``. Search
+        tools (doubao_search / baidu_ai_search / web_search) do not use this;
+        multi-tool turns never short-circuit.
+        """
+        if not tool_calls or not tool_results:
+            return None
+        if len(tool_calls) != 1 or len(tool_results) != 1:
+            return None
+        result = tool_results[0]
+        if result.get("status") != "success":
+            return None
+        payload = result.get("result")
+        if not isinstance(payload, dict):
+            return None
+        if not payload.get("direct_final_answer"):
+            return None
+        # Fallback / multi-source raw hits must still go through the LLM.
+        if payload.get("fallback_from"):
+            return None
+        text = str(
+            payload.get("final_answer_text") or payload.get("answer") or ""
+        ).strip()
+        return text or None
 
     def _execute_tool(self, tool_call: Dict) -> Dict[str, Any]:
         """

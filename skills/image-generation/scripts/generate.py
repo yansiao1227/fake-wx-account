@@ -598,19 +598,66 @@ def _pixels_to_ratio(pixel_str: str) -> str | None:
 # Seedream provider (Volcengine Ark, OpenAI-compatible /images/generations)
 # ---------------------------------------------------------------------------
 
-# Friendly aliases → real Seedream model id (Ark Model IDs).
+# Agent Plan endpoint (enterprise subscription) only accepts short model names
+# such as ``doubao-seedream-5-0-lite``. Standard Ark ``/api/v3`` accepts the
+# dated Model IDs. See: https://www.volcengine.com/docs/82379/1541523
+# Agent Plan docs: https://www.volcengine.com/docs/82379/2374452
+_SEEDREAM_PLAN_DEFAULT = "doubao-seedream-5-0-lite"
+_SEEDREAM_STANDARD_DEFAULT = "doubao-seedream-5-0-260128"
+
+# Friendly aliases → real Seedream model id for standard Ark ``/api/v3``.
 _SEEDREAM_MODEL_ALIASES = {
-    "seedream": "doubao-seedream-5-0-260128",
-    "seedream-lite": "doubao-seedream-5-0-260128",
-    "seedream-5.0": "doubao-seedream-5-0-260128",
-    "seedream-5.0-lite": "doubao-seedream-5-0-260128",
-    "seedream-5-0-lite": "doubao-seedream-5-0-260128",
-    "doubao-seedream-5-0": "doubao-seedream-5-0-260128",
-    "doubao-seedream-5-0-lite": "doubao-seedream-5-0-260128",
+    "seedream": _SEEDREAM_STANDARD_DEFAULT,
+    "seedream-lite": _SEEDREAM_STANDARD_DEFAULT,
+    "seedream-5.0": _SEEDREAM_STANDARD_DEFAULT,
+    "seedream-5.0-lite": _SEEDREAM_STANDARD_DEFAULT,
+    "seedream-5-0-lite": _SEEDREAM_STANDARD_DEFAULT,
+    "doubao-seedream-5-0": _SEEDREAM_STANDARD_DEFAULT,
+    "doubao-seedream-5-0-lite": _SEEDREAM_STANDARD_DEFAULT,
+    "doubao-seedream-5.0-lite": _SEEDREAM_STANDARD_DEFAULT,
     "seedream-4.5": "doubao-seedream-4-5-251128",
     "seedream-4-5": "doubao-seedream-4-5-251128",
     "doubao-seedream-4-5": "doubao-seedream-4-5-251128",
 }
+
+# Friendly aliases → Agent Plan-compatible model ids (``/api/plan/v3``).
+# Plan currently exposes Seedream 5.0 lite; other dated / 4.x ids return
+# UnsupportedModel on the plan endpoint.
+_SEEDREAM_PLAN_MODEL_ALIASES = {
+    "seedream": _SEEDREAM_PLAN_DEFAULT,
+    "seedream-lite": _SEEDREAM_PLAN_DEFAULT,
+    "seedream-5.0": _SEEDREAM_PLAN_DEFAULT,
+    "seedream-5.0-lite": _SEEDREAM_PLAN_DEFAULT,
+    "seedream-5-0-lite": _SEEDREAM_PLAN_DEFAULT,
+    "doubao-seedream-5-0": _SEEDREAM_PLAN_DEFAULT,
+    "doubao-seedream-5-0-lite": _SEEDREAM_PLAN_DEFAULT,
+    "doubao-seedream-5.0-lite": _SEEDREAM_PLAN_DEFAULT,
+    # Historical dated defaults used by this skill — rewrite for Plan.
+    "doubao-seedream-5-0-260128": _SEEDREAM_PLAN_DEFAULT,
+}
+
+
+def _is_agent_plan_base(api_base: str) -> bool:
+    """True when base URL is Volcengine Ark Agent Plan (``/api/plan/...``)."""
+    return "/api/plan" in (api_base or "").lower()
+
+
+def _resolve_seedream_model(model: str | None, api_base: str) -> str:
+    """Map a user/skill model alias to the vendor model id for this base URL."""
+    raw = (model or "").strip()
+    lower = raw.lower()
+    if _is_agent_plan_base(api_base):
+        if not lower:
+            return _SEEDREAM_PLAN_DEFAULT
+        if lower in _SEEDREAM_PLAN_MODEL_ALIASES:
+            return _SEEDREAM_PLAN_MODEL_ALIASES[lower]
+        # Dated 5.0 lite ids (e.g. doubao-seedream-5-0-YYMMDD) → plan short name
+        if lower.startswith("doubao-seedream-5-0") and "pro" not in lower:
+            return _SEEDREAM_PLAN_DEFAULT
+        return raw or _SEEDREAM_PLAN_DEFAULT
+    if not lower:
+        return _SEEDREAM_STANDARD_DEFAULT
+    return _SEEDREAM_MODEL_ALIASES.get(lower, raw or _SEEDREAM_STANDARD_DEFAULT)
 
 # Seedream supports either a coarse tier ("2K"/"3K"/"4K") or explicit "WxH".
 # We pass the user's tier through as-is when valid; otherwise translate ratio
@@ -655,14 +702,18 @@ class SeedreamProvider(ImageProvider):
     accepts an extra `image` field (string or list) for image-to-image and
     multi-image fusion, plus `sequential_image_generation` / `watermark` flags.
     Reference docs accept both `2K` shorthand and explicit `WxH` for `size`.
+
+    Supports both standard Ark (``/api/v3``) and Agent Plan
+    (``/api/plan/v3``) base URLs. Model ids are rewritten for Plan
+    compatibility (short names such as ``doubao-seedream-5-0-lite``).
     """
 
-    DEFAULT_MODEL = "doubao-seedream-5-0-260128"  # seedream 5.0 lite
+    DEFAULT_MODEL = _SEEDREAM_STANDARD_DEFAULT  # seedream 5.0 lite (standard Ark)
 
     def __init__(self, api_key: str, api_base: str, model: str):
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
-        self.model = _SEEDREAM_MODEL_ALIASES.get((model or "").lower(), model or self.DEFAULT_MODEL)
+        self.model = _resolve_seedream_model(model, self.api_base)
 
     def generate(
         self,
@@ -1046,10 +1097,26 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
          model and fall back to automatic routing — every provider then uses
          its own DEFAULT_MODEL.
     """
+    # Seedream / Ark credentials:
+    #   ARK_API_KEY (primary) → AGENT_PLAN_API_KEY (Agent Plan subscription fallback)
+    # Base URL:
+    #   ARK_API_BASE if set; else Agent Plan base when only AGENT_PLAN_API_KEY is
+    #   present; else standard Ark /api/v3.
+    ark_key = (
+        os.environ.get("ARK_API_KEY", "").strip()
+        or os.environ.get("AGENT_PLAN_API_KEY", "").strip()
+    )
+    ark_base = os.environ.get("ARK_API_BASE", "").strip()
+    if not ark_base:
+        if os.environ.get("AGENT_PLAN_API_KEY", "").strip() and not os.environ.get("ARK_API_KEY", "").strip():
+            ark_base = "https://ark.cn-beijing.volces.com/api/plan/v3"
+        else:
+            ark_base = "https://ark.cn-beijing.volces.com/api/v3"
+
     keys = {
         "OpenAI": os.environ.get("OPENAI_API_KEY", ""),
         "Gemini": os.environ.get("GEMINI_API_KEY", ""),
-        "Seedream": os.environ.get("ARK_API_KEY", ""),
+        "Seedream": ark_key,
         "Qwen": os.environ.get("DASHSCOPE_API_KEY", ""),
         "MiniMax": os.environ.get("MINIMAX_API_KEY", ""),
         "LinkAI": os.environ.get("LINKAI_API_KEY", ""),
@@ -1057,7 +1124,7 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
     bases = {
         "OpenAI": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
         "Gemini": os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com"),
-        "Seedream": os.environ.get("ARK_API_BASE", "https://ark.cn-beijing.volces.com/api/v3"),
+        "Seedream": ark_base,
         "Qwen": os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com"),
         "MiniMax": os.environ.get("MINIMAX_API_BASE", "https://api.minimaxi.com"),
         "LinkAI": os.environ.get("LINKAI_API_BASE", "https://api.link-ai.tech"),

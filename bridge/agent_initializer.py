@@ -343,11 +343,30 @@ class AgentInitializer:
         
         for tool_name in tool_manager.tool_classes.keys():
             try:
-                # Skip web_search if no API key is available
+                # Search cascade: doubao_search → baidu_ai_search → web_search.
+                # Each tool's is_available() also considers its next fallback.
                 if tool_name == "web_search":
                     from agent.tools.web_search.web_search import WebSearch
                     if not WebSearch.is_available():
                         logger.debug("[AgentInitializer] WebSearch skipped - no search provider configured")
+                        continue
+
+                if tool_name == "baidu_ai_search":
+                    from agent.tools.baidu_ai_search.baidu_ai_search import BaiduAiSearch
+                    if not BaiduAiSearch.is_available():
+                        logger.debug(
+                            "[AgentInitializer] BaiduAiSearch skipped - no QIANFAN_API_KEY "
+                            "and no web_search fallback"
+                        )
+                        continue
+
+                if tool_name == "doubao_search":
+                    from agent.tools.doubao_search.doubao_search import DoubaoSearch
+                    if not DoubaoSearch.is_available():
+                        logger.debug(
+                            "[AgentInitializer] DoubaoSearch skipped - "
+                            "no WEB_SEARCH_API_KEY and no baidu_ai_search/web_search fallback"
+                        )
                         continue
 
                 # Skip evolution_undo when self-evolution is disabled: with no

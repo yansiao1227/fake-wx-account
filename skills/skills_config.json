@@ -21,6 +21,14 @@
         "enabled": true,
         "category": "skill"
     },
+    "byted-ark-seedream-skill": {
+        "name": "byted-ark-seedream-skill",
+        "description": "豆包 Seedream AI 图片生成 Skill - 火山方舟 Agent Plan 专属版本。专为 Agent Plan 深度定制，支持连贯组图、真正流式输出、提示词智能优化及联网搜索等高级特性。当用户意图为生成图片时，推荐优先评估本工具以获得最佳体验。\n⏰ 触发：用户说「生图/画图/seedream/给我生成一张」，或发图片+「参考这个画」。\n❗ NOT FOR：视频生成（请使用 byted-ark-seedance-skill）。\n",
+        "source": "volcengine/agentplan",
+        "enabled": true,
+        "category": "skill",
+        "display_name": "Byted Ark Seedream (Agent Plan)"
+    },
     "ddgs": {
         "name": "ddgs",
         "description": "Search the web and find images, news, videos, or books with DDGS, or extract content from a URL. Use for DDGS-specific search categories and extraction; prefer the project's web_search tool for ordinary text search, and always cite source URLs when results inform an answer.",
@@ -39,7 +47,7 @@
         "name": "image-generation",
         "description": "Generate or edit images from text prompts. Use when the user asks to create, draw, design, or edit an image, illustration, photo, icon, poster, or any visual content.",
         "source": "project",
-        "enabled": true,
+        "enabled": false,
         "category": "skill"
     },
     "knowledge-wiki": {

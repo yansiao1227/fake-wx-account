@@ -9,8 +9,12 @@
 Default search pipeline (strategy 'auto')
   1. Call Baidu Qianfan ``/v2/tools/query_rewrite`` with ``QIANFAN_API_KEY``
      to produce an optimized ``altered_query`` (and optional decomposition).
+     When rewrite quota is exhausted for the day, skip rewrite and search the
+     original query (no retry).
   2. Fan-out the rewritten query to the multi-source trio in parallel:
      baidu/qianfan, tavily, ddgs (whichever are configured/available).
+     Providers marked exhausted for the day (remote quota/rate-limit) are
+     skipped without further requests.
   3. Deduplicate by URL, score by relevance to the original + rewritten
      query, and return the top-N results for the model to summarize.
 
@@ -32,16 +36,15 @@ Credentials
   - ddgs    : no credential required; requires the ``ddgs`` Python package
 
 Query rewrite docs: https://cloud.baidu.com/doc/qianfan-api/s/tmokwnznj
+
+Note: 火山引擎豆包搜索 is a separate tool ``doubao_search``, not a web_search
+provider.
 """
 
 import json
 import os
 import re
-import sqlite3
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -57,8 +60,16 @@ except ImportError:  # Optional dependency; API-key providers still work.
         pass
 
 from agent.tools.base_tool import BaseTool, ToolResult
+from agent.tools.search_quota import (
+    CAP_QIANFAN,
+    CAP_QUERY_REWRITE,
+    CAP_TAVILY,
+    SearchCapabilityState,
+    get_search_capability_state,
+    looks_like_quota_error,
+)
 from common.log import logger
-from config import conf, get_data_root
+from config import conf
 
 
 DEFAULT_TIMEOUT = 30
@@ -72,7 +83,7 @@ CITATION_POLICY = (
 PROVIDER_ORDER = ("qianfan", "tavily", "bocha", "zhipu", "linkai", "ddgs")
 
 # Default multi-source fan-out trio (baidu search is exposed as provider id
-# ``qianfan`` for credential and quota continuity).
+# ``qianfan`` for credential continuity with Qianfan APIs).
 MULTI_SOURCE_PROVIDERS = ("qianfan", "tavily", "ddgs")
 
 PROVIDER_LABELS = {
@@ -84,9 +95,10 @@ PROVIDER_LABELS = {
     "ddgs": "DDGS",
 }
 
-_DEFAULT_PROVIDER_QUOTAS = {
-    "qianfan": ("day", 50),
-    "tavily": ("month", 1000),
+# Providers that may be skipped for the rest of the day after remote quota errors.
+_EXHAUSTIBLE_PROVIDERS = {
+    "qianfan": CAP_QIANFAN,
+    "tavily": CAP_TAVILY,
 }
 
 # Lightweight CJK / Latin tokeniser for relevance scoring.
@@ -94,89 +106,6 @@ _TOKEN_RE = re.compile(
     r"[A-Za-z0-9_]+|[\u4e00-\u9fff]",
     re.UNICODE,
 )
-
-
-class WebSearchUsageStore:
-    """Persist provider request counts and reserve quota atomically."""
-
-    _schema_lock = threading.Lock()
-
-    def __init__(self, path: Optional[str] = None):
-        configured = path or _tools_web_search_conf().get("usage_store_path")
-        self.path = Path(configured or (Path(get_data_root()) / "web_search_usage.db"))
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
-
-    def _connect(self):
-        connection = sqlite3.connect(str(self.path), timeout=10)
-        connection.row_factory = sqlite3.Row
-        return connection
-
-    def _ensure_schema(self):
-        with self._schema_lock, self._connect() as db:
-            db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS provider_usage (
-                    provider TEXT NOT NULL,
-                    period_key TEXT NOT NULL,
-                    request_count INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (provider, period_key)
-                )
-                """
-            )
-
-    @staticmethod
-    def period_key(period: str, now: Optional[datetime] = None) -> str:
-        current = now or datetime.now().astimezone()
-        if period == "day":
-            return current.strftime("%Y-%m-%d")
-        if period == "month":
-            return current.strftime("%Y-%m")
-        return "all"
-
-    def count(self, provider: str, period: str, now: Optional[datetime] = None) -> int:
-        key = self.period_key(period, now)
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT request_count FROM provider_usage WHERE provider=? AND period_key=?",
-                (provider, key),
-            ).fetchone()
-        return int(row["request_count"]) if row else 0
-
-    def reserve(
-        self,
-        provider: str,
-        period: str,
-        limit: Optional[int],
-        now: Optional[datetime] = None,
-    ) -> tuple[bool, int]:
-        """Increment before the request; return False without increment at quota."""
-        key = self.period_key(period, now)
-        updated_at = (now or datetime.now().astimezone()).isoformat()
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT request_count FROM provider_usage WHERE provider=? AND period_key=?",
-                (provider, key),
-            ).fetchone()
-            current = int(row["request_count"]) if row else 0
-            if limit is not None and current >= max(0, int(limit)):
-                db.rollback()
-                return False, current
-            next_count = current + 1
-            db.execute(
-                """
-                INSERT INTO provider_usage(provider, period_key, request_count, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(provider, period_key) DO UPDATE SET
-                    request_count=excluded.request_count,
-                    updated_at=excluded.updated_at
-                """,
-                (provider, key, next_count, updated_at),
-            )
-            db.commit()
-            return True, next_count
 
 
 def _tools_web_search_conf() -> dict:
@@ -415,7 +344,10 @@ class WebSearch(BaseTool):
 
     name: str = "web_search"
     description: str = (
-        "Search the web for real-time information. Returns titles, URLs, and snippets. "
+        "Search the web for multi-source raw results (titles, URLs, snippets). "
+        "Search cascade: doubao_search → baidu_ai_search → web_search. Prefer doubao_search "
+        "first, then baidu_ai_search for summarized Q&A; use this tool as the last-resort "
+        "fallback or when you need a broader multi-provider result list. "
         "When using these results in an answer, cite the supporting result URLs as "
         "clickable source links; do not present search-derived factual claims without citations."
     )
@@ -450,47 +382,35 @@ class WebSearch(BaseTool):
     def __init__(self, config: dict = None):
         self.config = config or {}
         self._usage_store_path = self.config.get("usage_store_path")
-        self._usage_store: Optional[WebSearchUsageStore] = None
+        self._capability_state: Optional[SearchCapabilityState] = None
 
-    def _get_usage_store(self) -> WebSearchUsageStore:
-        if self._usage_store is None:
-            self._usage_store = WebSearchUsageStore(self._usage_store_path)
-        return self._usage_store
+    def _get_capability_state(self) -> SearchCapabilityState:
+        if self._capability_state is None:
+            self._capability_state = get_search_capability_state(self._usage_store_path)
+        return self._capability_state
 
-    @staticmethod
-    def _provider_quota(provider: str) -> tuple[str, Optional[int]]:
-        default_period, default_limit = _DEFAULT_PROVIDER_QUOTAS.get(
-            provider, ("all", None)
-        )
-        search_config = _tools_web_search_conf()
-        if provider == "qianfan":
-            limit = search_config.get("qianfan_daily_limit", default_limit)
-        elif provider == "tavily":
-            limit = search_config.get("tavily_monthly_limit", default_limit)
-        else:
-            limit = None
+    def _provider_exhausted(self, provider: str) -> bool:
+        cap = _EXHAUSTIBLE_PROVIDERS.get(provider)
+        if not cap:
+            return False
         try:
-            normalized_limit = None if limit is None else max(0, int(limit))
-        except (TypeError, ValueError):
-            normalized_limit = default_limit
-        return default_period, normalized_limit
+            return self._get_capability_state().is_exhausted(cap)
+        except Exception as exc:
+            logger.debug("[WebSearch] capability check failed provider=%s: %s", provider, exc)
+            return False
 
-    def _reserve_provider(self, provider: str) -> tuple[bool, int, Optional[int]]:
-        period, limit = self._provider_quota(provider)
+    def _mark_provider_exhausted(self, provider: str, reason: str) -> None:
+        cap = _EXHAUSTIBLE_PROVIDERS.get(provider)
+        if not cap:
+            return
         try:
-            reserved, count = self._get_usage_store().reserve(
-                provider, period, limit
-            )
-            return reserved, count, limit
-        except sqlite3.Error as exc:
-            logger.error(
-                "[WebSearch] failed to persist provider usage provider=%s: %s",
+            self._get_capability_state().mark_exhausted(cap, reason)
+        except Exception as exc:
+            logger.warning(
+                "[WebSearch] failed to mark provider exhausted provider=%s: %s",
                 provider,
                 exc,
             )
-            # Fail closed for metered APIs so a broken counter cannot exceed
-            # free quotas. Unlimited providers such as DDGS remain available.
-            return limit is None, 0, limit
 
     @staticmethod
     def is_available() -> bool:
@@ -564,6 +484,10 @@ class WebSearch(BaseTool):
     def _rewrite_query(self, query: str) -> Dict[str, Any]:
         """Call Qianfan query_rewrite; fall back to the original query on any failure.
 
+        Quota/rate-limit failures mark query_rewrite exhausted for the day so
+        later searches skip the rewrite API entirely (no retry). Other failures
+        only affect the current call.
+
         API: POST https://qianfan.baidubce.com/v2/tools/query_rewrite
         Docs: https://cloud.baidu.com/doc/qianfan-api/s/tmokwnznj
         Auth: Bearer QIANFAN_API_KEY from ~/.cow/.env / conf.
@@ -577,6 +501,15 @@ class WebSearch(BaseTool):
         }
         if not original or not _query_rewrite_enabled():
             return empty
+
+        try:
+            if self._get_capability_state().is_exhausted(CAP_QUERY_REWRITE):
+                logger.info(
+                    "[WebSearch] query_rewrite skipped: daily exhaustion flag set"
+                )
+                return empty
+        except Exception as exc:
+            logger.debug("[WebSearch] query_rewrite exhaustion check failed: %s", exc)
 
         api_key = _get_api_key("qianfan")
         if not api_key:
@@ -602,12 +535,23 @@ class WebSearch(BaseTool):
             logger.warning("[WebSearch] query_rewrite request failed: %s", exc)
             return empty
 
+        body_preview = (resp.text or "")[:200]
         if resp.status_code != 200:
             logger.warning(
                 "[WebSearch] query_rewrite HTTP %s: %s",
                 resp.status_code,
-                (resp.text or "")[:200],
+                body_preview,
             )
+            if looks_like_quota_error(resp.status_code, body_preview):
+                try:
+                    self._get_capability_state().mark_exhausted(
+                        CAP_QUERY_REWRITE,
+                        f"HTTP {resp.status_code}: {body_preview}",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[WebSearch] failed to mark query_rewrite exhausted: %s", exc
+                    )
             return empty
 
         try:
@@ -622,11 +566,22 @@ class WebSearch(BaseTool):
         # Business errors surface as non-zero code even on HTTP 200.
         code = data.get("code")
         if code not in (None, 0, "0"):
+            message = str(data.get("message") or "")
             logger.warning(
                 "[WebSearch] query_rewrite business error code=%s message=%s",
                 code,
-                data.get("message"),
+                message,
             )
+            if looks_like_quota_error(200, f"{code} {message}", code=code):
+                try:
+                    self._get_capability_state().mark_exhausted(
+                        CAP_QUERY_REWRITE,
+                        f"code={code}: {message}",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[WebSearch] failed to mark query_rewrite exhausted: %s", exc
+                    )
             return empty
 
         altered = str(data.get("altered_query") or "").strip() or original
@@ -760,57 +715,27 @@ class WebSearch(BaseTool):
         freshness: str,
         summary: bool,
     ) -> Tuple[List[Tuple[str, List[Dict[str, Any]]]], List[str]]:
-        """Run one or more providers; multi-source runs in parallel."""
+        """Run one or more providers; multi-source runs in parallel.
+
+        Exhausted providers (daily remote-quota flag) are skipped without a
+        network call. Their results are never merged into the output.
+        """
         if not providers:
             return [], ["no providers"]
 
-        if len(providers) == 1:
-            provider = providers[0]
-            reserved, usage_count, quota_limit = self._reserve_provider(provider)
-            if not reserved:
-                return [], [
-                    f"{PROVIDER_LABELS.get(provider, provider)}: local quota "
-                    f"reached ({usage_count}/{quota_limit})"
-                ]
-            logger.info(
-                "[WebSearch] provider=%s usage=%s%s",
-                provider,
-                usage_count,
-                f"/{quota_limit}" if quota_limit is not None else "",
-            )
-            result = self._execute_provider(provider, query, count, freshness, summary)
-            if result.status != "success":
-                return [], [
-                    f"{PROVIDER_LABELS.get(provider, provider)}: {result.result}"
-                ]
-            items = list((result.result or {}).get("results") or [])
-            return [(provider, items)], []
-
-        # Parallel multi-source search.
         payloads: List[Tuple[str, List[Dict[str, Any]]]] = []
         failures: List[str] = []
         runnable: List[str] = []
 
         for provider in providers:
-            reserved, usage_count, quota_limit = self._reserve_provider(provider)
-            if not reserved:
+            if self._provider_exhausted(provider):
+                label = PROVIDER_LABELS.get(provider, provider)
                 logger.info(
-                    "[WebSearch] provider=%s skipped quota=%s/%s",
+                    "[WebSearch] provider=%s skipped: daily exhaustion flag set",
                     provider,
-                    usage_count,
-                    quota_limit,
                 )
-                failures.append(
-                    f"{PROVIDER_LABELS.get(provider, provider)}: local quota "
-                    f"reached ({usage_count}/{quota_limit})"
-                )
+                failures.append(f"{label}: daily quota exhausted (skipping)")
                 continue
-            logger.info(
-                "[WebSearch] provider=%s usage=%s%s",
-                provider,
-                usage_count,
-                f"/{quota_limit}" if quota_limit is not None else "",
-            )
             runnable.append(provider)
 
         if not runnable:
@@ -820,6 +745,20 @@ class WebSearch(BaseTool):
             return provider, self._execute_provider(
                 provider, query, count, freshness, summary
             )
+
+        if len(runnable) == 1:
+            provider = runnable[0]
+            result = self._execute_provider(provider, query, count, freshness, summary)
+            if result.status != "success":
+                return [], [
+                    f"{PROVIDER_LABELS.get(provider, provider)}: {result.result}"
+                ] + failures
+            items = list((result.result or {}).get("results") or [])
+            if not items:
+                return [], [
+                    f"{PROVIDER_LABELS.get(provider, provider)}: empty results"
+                ] + failures
+            return [(provider, items)], failures
 
         max_workers = min(len(runnable), 3)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -927,13 +866,16 @@ class WebSearch(BaseTool):
             json=payload,
             timeout=DEFAULT_TIMEOUT,
         )
+        body_preview = (resp.text or "")[:200]
         if resp.status_code == 401:
             return ToolResult.fail("Error: Invalid Tavily API key.")
-        if resp.status_code == 429:
-            return ToolResult.fail("Error: Tavily API quota or rate limit reached.")
+        if looks_like_quota_error(resp.status_code, body_preview):
+            reason = f"Tavily quota/rate-limit HTTP {resp.status_code}: {body_preview}"
+            self._mark_provider_exhausted("tavily", reason)
+            return ToolResult.fail(f"Error: {reason}")
         if resp.status_code != 200:
             return ToolResult.fail(
-                f"Error: Tavily API returned HTTP {resp.status_code}: {resp.text[:200]}"
+                f"Error: Tavily API returned HTTP {resp.status_code}: {body_preview}"
             )
 
         data = resp.json()
@@ -1128,15 +1070,27 @@ class WebSearch(BaseTool):
         logger.debug(f"[WebSearch] qianfan: query='{trimmed_query}', count={count}, freshness={freshness!r}")
         resp = requests.post(url, headers=headers, json=payload, timeout=DEFAULT_TIMEOUT)
 
+        body_preview = (resp.text or "")[:200]
         if resp.status_code == 401:
             return ToolResult.fail("Error: Invalid Qianfan API key.")
+        if looks_like_quota_error(resp.status_code, body_preview):
+            reason = f"Baidu/Qianfan search quota HTTP {resp.status_code}: {body_preview}"
+            self._mark_provider_exhausted("qianfan", reason)
+            return ToolResult.fail(f"Error: {reason}")
         if resp.status_code != 200:
-            return ToolResult.fail(f"Error: Qianfan API returned HTTP {resp.status_code}: {resp.text[:200]}")
+            return ToolResult.fail(
+                f"Error: Qianfan API returned HTTP {resp.status_code}: {body_preview}"
+            )
 
         data = resp.json()
         # Even on HTTP 200 Baidu surfaces business errors as {"code","message"}.
         if isinstance(data, dict) and data.get("code"):
-            return ToolResult.fail(f"Error: Qianfan returned {data.get('code')}: {data.get('message','')}")
+            code = data.get("code")
+            message = str(data.get("message") or "")
+            err = f"Error: Qianfan returned {code}: {message}"
+            if looks_like_quota_error(200, f"{code} {message}", code=code):
+                self._mark_provider_exhausted("qianfan", err)
+            return ToolResult.fail(err)
 
         refs = data.get("references") or []
         results = []

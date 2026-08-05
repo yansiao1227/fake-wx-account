@@ -3031,6 +3031,7 @@ class ModelsHandler:
 
     # Canonical search provider order. Mirrors PROVIDER_ORDER in
     # agent/tools/web_search/web_search.py — keep them in sync.
+    # Note: 豆包搜索 is a standalone tool (doubao_search), not a web_search provider.
     _SEARCH_PROVIDERS = ("bocha", "qianfan", "zhipu", "linkai", "ddgs")
 
     _SEARCH_PROVIDER_LABELS = {
@@ -3725,7 +3726,8 @@ class ModelsHandler:
 
         The other three providers (zhipu/qianfan/linkai) reuse model-vendor
         credentials, so they go through set_provider with the standard
-        model-vendor flow.
+        model-vendor flow. Doubao search is a standalone tool
+        (tools.doubao_search / WEB_SEARCH_API_KEY), not part of web_search.
         """
         api_key = (data.get("api_key") or "").strip() if isinstance(data.get("api_key"), str) else ""
         local_config = conf()

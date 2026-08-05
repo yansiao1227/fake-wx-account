@@ -111,10 +111,13 @@ C:\Users\26832\.cow\.env
 | 项 | 约定 |
 | --- | --- |
 | 千帆 Key | 环境变量 `QIANFAN_API_KEY`，写在 `~/.cow/.env` |
-| 其他厂商 Key | 同样优先 `~/.cow/.env`（如 `OPENAI_API_KEY`） |
+| 豆包搜索 Key | 环境变量 `WEB_SEARCH_API_KEY`（或 `tools.doubao_search.api_key`），写在 `~/.cow/.env` |
+| 专业数据集 Agent Plan | `AGENT_PLAN_API_KEY`（可与 `WEB_SEARCH_API_KEY` 同为订阅 Ark Key），写在 `~/.cow/.env`；MCP 配置在 `~/cow/mcp.json` 的 `datapro`（工具 `dataPro_search`） |
+| 图片生成 Seedream / 方舟 | 环境变量 `ARK_API_KEY` + `ARK_API_BASE`（Agent Plan 用 `https://ark.cn-beijing.volces.com/api/plan/v3`）；无 `ARK_API_KEY` 时回退 `AGENT_PLAN_API_KEY` |
+| 其他厂商 Key | 同样优先 `~/.cow/.env`（如 `OPENAI_API_KEY`、`ARK_API_KEY`） |
 | 仓库 `config.json` | 不要把生产密钥当作唯一存储；可留空占位 |
 | `config-template.json` | 可保留空字符串字段说明，不填真值 |
 | 读取顺序 | 先确保加载 `~/.cow/.env`，再读 `os.environ`；`conf()` 中同名字段仅作可选回退 |
 
-禁止把真实密钥写入文档、日志、提交说明或测试夹具。每日热点、skill、web_search
-等凡使用千帆的能力，均按上述顺序解析密钥。
+禁止把真实密钥写入文档、日志、提交说明或测试夹具。每日热点、skill、web_search、
+baidu_ai_search（智能搜索）、豆包搜索等凡使用云厂商密钥的能力，均按上述顺序解析密钥。

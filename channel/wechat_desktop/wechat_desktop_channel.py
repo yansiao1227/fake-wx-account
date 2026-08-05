@@ -38,7 +38,7 @@ from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.policy import WechatDesktopPolicy
 from channel.wechat_desktop.service import get_wechat_desktop_service
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
-from common.log import logger
+from common.log import file_logger, logger
 from common.singleton import singleton
 from common.utils import expand_path
 from config import conf
@@ -338,9 +338,12 @@ class WechatDesktopChannel(ChatChannel):
         self.name = str(self.config.get("self_display_name", "") or "我")
 
     def _trace(self, stage: str, message: str, *args):
-        """按配置输出细粒度诊断日志；关闭时不承担格式化成本。"""
+        """细粒度扫描/会话诊断日志：只写 run.log，不打印到控制台。
+
+        关闭 ``diagnostic_logging`` 时不承担格式化成本。
+        """
         if bool(self.config.get("diagnostic_logging", False)):
-            logger.info(
+            file_logger.info(
                 "[WechatDesktop][trace:%s] " + message,
                 stage,
                 *args,
@@ -439,9 +442,35 @@ class WechatDesktopChannel(ChatChannel):
                 lifecycle["send_result"],
             )
 
+    def _warmup_group_sender_ocr(self) -> None:
+        """Background preload of RapidOCR so first group scan is not delayed."""
+        try:
+            preload = getattr(self._driver, "preload_group_sender_ocr", None)
+            if not callable(preload):
+                return
+            ready = bool(preload())
+            if ready:
+                logger.info("[WechatDesktop] RapidOCR preloaded at channel startup")
+            elif bool(self.config.get("uia_group_sender_ocr_enabled", True)):
+                logger.warning(
+                    "[WechatDesktop] RapidOCR preload finished without a ready engine"
+                )
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] RapidOCR preload failed (non-fatal): %s",
+                exc,
+            )
+
     def startup(self):
         """初始化运行状态、启动三个工作线程，并阻塞到通道停止。"""
         self._stop_event.clear()
+        # Load RapidOCR models as early as possible so first group-sender
+        # recognition does not pay multi-second model-load latency.
+        threading.Thread(
+            target=self._warmup_group_sender_ocr,
+            name="cow-wechat-rapidocr-warmup",
+            daemon=True,
+        ).start()
         try:
             activated = self._driver.ensure_foreground()
             logger.info(
@@ -2459,6 +2488,16 @@ class WechatDesktopChannel(ChatChannel):
                 not paused
                 and self._policy.can_auto_send(target_name, is_group, "image")
             )
+            self._trace(
+                "10-image-ready",
+                "target=%s path=%s paused=%s can_auto=%s auto_send_images=%s group=%s",
+                target_name,
+                str(reply.content or "")[:200],
+                paused,
+                can_auto,
+                bool(self.config.get("auto_send_images", False)),
+                is_group,
+            )
             if can_auto:
                 try:
                     self._mark_lifecycle(source_event_ids, "send_started")
@@ -2470,6 +2509,12 @@ class WechatDesktopChannel(ChatChannel):
                             "send_verified" if verified else "send_started",
                             send_result="verified" if verified else "unverified",
                         )
+                        self._trace(
+                            "12-image-success" if verified else "12-image-unverified",
+                            "target=%s verified=%s",
+                            target_name,
+                            verified,
+                        )
                         context["wechat_desktop_queue_terminal"] = "completed"
                         self._store.audit(
                             "send_image",
@@ -2479,15 +2524,38 @@ class WechatDesktopChannel(ChatChannel):
                             detail=str(result.get("message", "")),
                         )
                         return
+                    logger.warning(
+                        "[WechatDesktop] automatic image send returned unsuccessful: %s",
+                        result,
+                    )
                 except Exception as exc:
-                    logger.warning(f"[WechatDesktop] automatic image send failed: {exc}")
+                    logger.warning(
+                        "[WechatDesktop] automatic image send failed: %s path=%s",
+                        exc,
+                        str(reply.content or "")[:200],
+                    )
+            else:
+                logger.warning(
+                    "[WechatDesktop] image auto-send blocked target=%s "
+                    "paused=%s auto_send_images=%s shadow_mode=%s path=%s",
+                    target_name,
+                    paused,
+                    bool(self.config.get("auto_send_images", False)),
+                    bool(self.config.get("shadow_mode", True)),
+                    str(reply.content or "")[:200],
+                )
             context["wechat_desktop_queue_terminal"] = "failed" if can_auto else "skipped"
             self._store.audit(
                 "send_image",
                 target_name,
                 "failed" if can_auto else "blocked",
                 self._content_hash(reply.content),
-                detail="direct image send failed or was blocked; no approval flow is enabled",
+                detail=(
+                    "direct image send failed or was blocked; "
+                    f"can_auto={can_auto} auto_send_images="
+                    f"{bool(self.config.get('auto_send_images', False))} "
+                    f"shadow_mode={bool(self.config.get('shadow_mode', True))}"
+                ),
             )
             return
         context["wechat_desktop_queue_terminal"] = "skipped"

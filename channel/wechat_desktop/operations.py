@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping
+from urllib.parse import unquote
 
 from channel.wechat_desktop.models import ConversationInfo
 
@@ -103,6 +104,51 @@ def build_delivery_result(result: dict, observation: dict) -> dict:
     }
 
 
+def resolve_local_media_path(path_or_url: str) -> Path:
+    """Normalize local file paths and ``file://`` URLs for Windows/Unix.
+
+    AgentBridge packages local images as ``file://C:\\...`` / ``file:///C:/...``.
+    ``Path(\"file://D:\\\\foo\").resolve()`` on Windows becomes the broken path
+    ``D:foo`` (missing separator), so callers must strip the scheme first.
+    """
+    raw = str(path_or_url or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError("empty media path")
+
+    if raw.lower().startswith("file:"):
+        rest = raw[5:]  # after "file:"
+        # file:///C:/x  or  file:///home/x
+        if rest.startswith("///"):
+            rest = rest[3:]
+            # Unix absolute: file:///home/x → need leading slash back
+            if not re.match(r"^[A-Za-z]:", rest):
+                rest = "/" + rest
+        # file://C:\x  or  file://localhost/C:/x  or  file://server/share
+        elif rest.startswith("//"):
+            rest = rest[2:]
+            lower_rest = rest.lower()
+            if lower_rest.startswith("localhost/") or lower_rest.startswith(
+                "localhost\\"
+            ):
+                rest = rest[10:]
+            elif not re.match(r"^[A-Za-z]:", rest) and (
+                "/" in rest or "\\" in rest
+            ):
+                # UNC: server/share → \\server\share
+                rest = "\\\\" + rest.replace("/", "\\")
+        # file:/C:/x
+        elif rest.startswith("/"):
+            if len(rest) >= 3 and rest[2] == ":":
+                rest = rest[1:]
+        raw = unquote(rest)
+
+    path = Path(raw).expanduser()
+    try:
+        return path.resolve(strict=False)
+    except OSError:
+        return path
+
+
 class WechatSendOperations:
     """微信发送动作集合。
 
@@ -140,7 +186,9 @@ class WechatSendOperations:
     def send_image(self, conversation: str, image_path: str) -> dict:
         """解析为绝对路径后，通过微信文件粘贴能力发送图片。"""
 
-        path = str(Path(image_path).resolve())
+        path = str(resolve_local_media_path(image_path))
+        if not Path(path).is_file():
+            raise FileNotFoundError(f"image file does not exist: {path}")
         with self._reply_session():
             selector = self._selector_resolver(conversation)
             result = self._client.send_file(

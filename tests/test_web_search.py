@@ -69,7 +69,6 @@ def test_auto_strategy_ignores_ddgs_hint_and_fans_out(monkeypatch):
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
-    monkeypatch.setattr(tool, "_reserve_provider", lambda provider: (True, 1, None))
 
     result = tool.execute({"query": "example", "provider": "ddgs"})
 
@@ -209,7 +208,6 @@ def test_execute_rewrites_then_fans_out_to_baidu_tavily_ddgs(monkeypatch):
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
-    monkeypatch.setattr(tool, "_reserve_provider", lambda provider: (True, 1, None))
 
     result = tool.execute({"query": "raw user query", "count": 5})
 
@@ -261,7 +259,6 @@ def test_multi_source_partial_failure_still_returns_ranked_hits(monkeypatch):
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
-    monkeypatch.setattr(tool, "_reserve_provider", lambda provider: (True, 1, None))
 
     result = tool.execute({"query": "example"})
 
@@ -359,9 +356,6 @@ def test_baidu_then_tavily_then_ddgs_fallback_when_primary_empty(monkeypatch):
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
-    monkeypatch.setattr(
-        tool, "_reserve_provider", lambda provider: (True, 1, None)
-    )
 
     result = tool.execute({"query": "example"})
 
@@ -455,9 +449,6 @@ def test_tavily_failure_falls_back_to_ddgs(monkeypatch):
         )
 
     monkeypatch.setattr(tool, "_execute_provider", execute_provider)
-    monkeypatch.setattr(
-        tool, "_reserve_provider", lambda provider: (True, 1, None)
-    )
 
     result = tool.execute({"query": "example"})
 
@@ -581,12 +572,6 @@ def test_execute_attaches_citation_policy(monkeypatch):
             }
         ),
     )
-    monkeypatch.setattr(
-        module.WebSearch,
-        "_reserve_provider",
-        lambda self, provider: (True, 1, None),
-    )
-
     result = module.WebSearch().execute({"query": "example"})
 
     assert result.status == "success"
@@ -594,30 +579,28 @@ def test_execute_attaches_citation_policy(monkeypatch):
     assert "clickable source links" in result.result["citationPolicy"]
 
 
-def test_provider_quota_defaults_match_free_allowances():
-    assert module.WebSearch._provider_quota("qianfan") == ("day", 50)
-    assert module.WebSearch._provider_quota("tavily") == ("month", 1000)
-    assert module.WebSearch._provider_quota("ddgs") == ("all", None)
+def test_capability_state_exhaustion_resets_by_day(tmp_path):
+    from agent.tools.search_quota import CAP_QIANFAN, SearchCapabilityState
 
-
-def test_usage_store_persists_and_resets_by_period(tmp_path):
     path = tmp_path / "web-search-usage.db"
-    first = module.WebSearchUsageStore(str(path))
+    first = SearchCapabilityState(str(path))
     day_one = datetime(2026, 7, 30, 23, 59)
     day_two = datetime(2026, 7, 31, 0, 1)
 
-    assert first.reserve("qianfan", "day", 2, day_one) == (True, 1)
-    assert first.reserve("qianfan", "day", 2, day_one) == (True, 2)
-    assert first.reserve("qianfan", "day", 2, day_one) == (False, 2)
+    assert first.is_exhausted(CAP_QIANFAN, day_one) is False
+    first.mark_exhausted(CAP_QIANFAN, "quota", day_one)
+    assert first.is_exhausted(CAP_QIANFAN, day_one) is True
 
-    reopened = module.WebSearchUsageStore(str(path))
-    assert reopened.count("qianfan", "day", day_one) == 2
-    assert reopened.reserve("qianfan", "day", 2, day_two) == (True, 1)
+    reopened = SearchCapabilityState(str(path))
+    assert reopened.is_exhausted(CAP_QIANFAN, day_one) is True
+    assert reopened.is_exhausted(CAP_QIANFAN, day_two) is False
 
 
 def test_exhausted_baidu_is_skipped_before_network_then_uses_others(
     monkeypatch, tmp_path
 ):
+    from agent.tools.search_quota import CAP_QIANFAN
+
     tool = module.WebSearch({"usage_store_path": str(tmp_path / "usage.db")})
     monkeypatch.setattr(
         module, "configured_providers", lambda: ["qianfan", "tavily", "ddgs"]
@@ -635,14 +618,7 @@ def test_exhausted_baidu_is_skipped_before_network_then_uses_others(
             "rewritten": False,
         },
     )
-    monkeypatch.setattr(
-        tool,
-        "_provider_quota",
-        lambda provider: ("day", 1)
-        if provider == "qianfan"
-        else (("month", 10) if provider == "tavily" else ("all", None)),
-    )
-    tool._get_usage_store().reserve("qianfan", "day", 1)
+    tool._get_capability_state().mark_exhausted(CAP_QIANFAN, "daily quota")
     calls = []
 
     def execute_provider(provider, query, count, freshness, summary):
@@ -667,4 +643,37 @@ def test_exhausted_baidu_is_skipped_before_network_then_uses_others(
     assert result.status == "success"
     assert "qianfan" not in calls
     assert set(calls) == {"tavily", "ddgs"}
-    assert tool._get_usage_store().count("tavily", "month") == 1
+
+
+def test_query_rewrite_quota_marks_exhausted_and_skips_later(monkeypatch, tmp_path):
+    from agent.tools.search_quota import CAP_QUERY_REWRITE
+
+    tool = module.WebSearch({"usage_store_path": str(tmp_path / "usage.db")})
+    monkeypatch.setattr(module, "_get_api_key", lambda provider: "qf-secret")
+    monkeypatch.setattr(module, "_query_rewrite_enabled", lambda: True)
+
+    class Response:
+        status_code = 429
+        text = "rate limit exceeded free quota"
+
+        @staticmethod
+        def json():
+            return {"code": 429, "message": "quota"}
+
+    posts = {"n": 0}
+
+    def post(*args, **kwargs):
+        posts["n"] += 1
+        return Response()
+
+    monkeypatch.setattr(module.requests, "post", post)
+
+    first = tool._rewrite_query("原始问题")
+    assert first["altered_query"] == "原始问题"
+    assert first["rewritten"] is False
+    assert posts["n"] == 1
+    assert tool._get_capability_state().is_exhausted(CAP_QUERY_REWRITE) is True
+
+    second = tool._rewrite_query("另一个问题")
+    assert second["altered_query"] == "另一个问题"
+    assert posts["n"] == 1  # no second network call

@@ -22,8 +22,13 @@ from channel.wechat_desktop.models import (
     UiaReferencedMessage,
     WechatDesktopEvent,
 )
+from channel.wechat_desktop.operations import resolve_local_media_path
 from channel.wechat_desktop.shell_hook import WindowsShellHook
-from channel.wechat_desktop.uia_client import WechatUiaClient, parse_session_accessible_name
+from channel.wechat_desktop.uia_client import (
+    WechatUiaClient,
+    _encode_cf_hdrop,
+    parse_session_accessible_name,
+)
 from channel.wechat_desktop.uia_driver import (
     WechatUiaDriver,
     _UiaPriorityCoordinator,
@@ -43,6 +48,43 @@ from channel.wechat_desktop.wechat_desktop_channel import (
     _tool_notice_subject,
 )
 from common.log import logger
+
+
+def test_cf_hdrop_payload_is_wide_dropfiles_data():
+    paths = [r"D:\images\one.jpg", r"D:\images\two.png"]
+
+    payload = _encode_cf_hdrop(paths)
+
+    assert isinstance(payload, bytes)
+    assert len(payload) > 20
+    assert int.from_bytes(payload[0:4], "little") == 20
+    assert int.from_bytes(payload[16:20], "little") == 1
+    assert payload[20:].decode("utf-16le") == "\0".join(paths) + "\0\0"
+
+
+def test_file_clipboard_passes_bytes_to_win32clipboard(monkeypatch):
+    import win32clipboard
+
+    captured = []
+    monkeypatch.setattr(win32clipboard, "OpenClipboard", lambda: None)
+    monkeypatch.setattr(win32clipboard, "CloseClipboard", lambda: None)
+    monkeypatch.setattr(win32clipboard, "EmptyClipboard", lambda: None)
+    monkeypatch.setattr(
+        win32clipboard,
+        "IsClipboardFormatAvailable",
+        lambda _fmt: False,
+    )
+    monkeypatch.setattr(
+        win32clipboard,
+        "SetClipboardData",
+        lambda fmt, value: captured.append((fmt, value)),
+    )
+
+    with WechatUiaClient({})._clipboard(files=[r"D:\images\one.jpg"]):
+        pass
+
+    assert len(captured) == 1
+    assert isinstance(captured[0][1], bytes)
 
 
 def test_send_button_uses_real_click_and_restores_cursor(monkeypatch):
@@ -1938,6 +1980,17 @@ def test_rapidocr_uses_body_side_to_resolve_outgoing_direction():
     assert resolved[0].direction == "outgoing"
 
 
+def test_resolve_local_media_path_handles_file_urls(tmp_path: Path):
+    img = tmp_path / "seedream_1.jpg"
+    img.write_bytes(b"fake-image")
+    expected = img.resolve()
+
+    assert resolve_local_media_path(str(img)) == expected
+    assert resolve_local_media_path(f"file://{img}") == expected
+    assert resolve_local_media_path(img.as_uri()) == expected
+    assert resolve_local_media_path(f"file://{img}").is_file()
+
+
 def test_rapidocr_output_uses_official_boxes_txts_scores_api():
     output = SimpleNamespace(
         boxes=[[[1, 2], [11, 2], [11, 8], [1, 8]]],
@@ -1948,6 +2001,40 @@ def test_rapidocr_output_uses_official_boxes_txts_scores_api():
     lines = RapidOcrGroupSenderResolver._output_lines(output, (100, 200))
 
     assert lines == [OcrTextLine("成员甲", 0.98, (101, 202, 111, 208))]
+
+
+def test_rapidocr_preload_loads_engine_once(monkeypatch):
+    created = {"n": 0}
+    called = {"n": 0}
+
+    class FakeEngine:
+        def __call__(self, image):
+            called["n"] += 1
+            return SimpleNamespace(boxes=[], txts=(), scores=())
+
+    def fake_rapidocr():
+        created["n"] += 1
+        return FakeEngine()
+
+    import types
+    import sys
+
+    fake_mod = types.ModuleType("rapidocr")
+    fake_mod.RapidOCR = fake_rapidocr
+    monkeypatch.setitem(sys.modules, "rapidocr", fake_mod)
+
+    resolver = RapidOcrGroupSenderResolver({"uia_group_sender_ocr_enabled": True})
+    assert resolver.preload() is True
+    assert resolver.preload() is True
+    assert created["n"] == 1
+    assert called["n"] >= 1
+    assert resolver._get_engine() is resolver._engine
+
+
+def test_rapidocr_preload_skipped_when_disabled():
+    resolver = RapidOcrGroupSenderResolver({"uia_group_sender_ocr_enabled": False})
+    assert resolver.preload() is False
+    assert resolver._engine is None
 
 
 def test_group_sender_name_survives_flattened_followup_snapshot():

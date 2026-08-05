@@ -44,8 +44,11 @@ To manually specify a Vision model:
 
 ```json
 {
+  "ark_api_key": "YOUR_API_KEY",
+  "ark_base_url": "https://ark.cn-beijing.volces.com/api/v3",
   "skills": {
     "image-generation": {
+      "provider": "doubao",
       "model": "seedream-5.0-lite"
     }
   }
@@ -53,6 +56,31 @@ To manually specify a Vision model:
 ```
 
 Available models: `seedream-5.0-lite`, `seedream-4.5`.
+
+### Agent Plan (enterprise subscription)
+
+When using a Volcengine **Agent Plan** key, point the base URL at the plan endpoint and keep the short model name:
+
+```json
+{
+  "ark_api_key": "YOUR_AGENT_PLAN_KEY",
+  "ark_base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+  "skills": {
+    "image-generation": {
+      "provider": "doubao",
+      "model": "seedream-5.0-lite"
+    }
+  }
+}
+```
+
+| Item | Value |
+| --- | --- |
+| Endpoint | `POST https://ark.cn-beijing.volces.com/api/plan/v3/images/generations` |
+| Env keys | `ARK_API_KEY` / `ARK_API_BASE` (or `AGENT_PLAN_API_KEY` as key fallback) |
+| Compatible model | `doubao-seedream-5-0-lite` (alias `seedream-5.0-lite`) |
+
+Agent Plan keys only authenticate against `/api/plan/v3`, not the standard `/api/v3`. The image-generation skill rewrites dated Seedream model IDs to the Plan-compatible short name automatically.
 
 ## Embedding
 

@@ -5,7 +5,66 @@ from pathlib import Path
 from typing import Dict, Any, Type
 from agent.tools.base_tool import BaseTool
 from common.log import logger
+from common.utils import expand_path
 from config import conf
+
+
+def _load_mcp_env_file() -> None:
+    """Load MCP credentials before expanding placeholders in mcp.json."""
+    import os
+
+    env_file = expand_path("~/.cow/.env")
+    if not os.path.exists(env_file):
+        return
+
+    try:
+        from dotenv import load_dotenv
+
+        # Keep this consistent with AgentInitializer: ~/.cow/.env is the
+        # canonical credential source and must also support key rotation.
+        load_dotenv(env_file, override=True)
+    except ImportError:
+        logger.warning("[ToolManager] python-dotenv not installed; MCP env placeholders may remain unresolved")
+    except Exception as e:
+        logger.warning(f"[ToolManager] Failed to load MCP environment file {env_file}: {e}")
+
+
+def _expand_mcp_env_value(value: Any) -> Any:
+    """Expand ${VAR} / $VAR placeholders in MCP config string values."""
+    import os
+    import re
+
+    if isinstance(value, dict):
+        return {k: _expand_mcp_env_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_mcp_env_value(v) for v in value]
+    if not isinstance(value, str):
+        return value
+
+    def _lookup(key: str, original: str) -> str:
+        val = os.environ.get(key)
+        if val:
+            return val
+        # Agent Plan key often reuses the Ark / 豆包搜索 subscription key.
+        if key == "AGENT_PLAN_API_KEY":
+            for alt in ("WEB_SEARCH_API_KEY", "ARK_API_KEY", "DOUBAO_SEARCH_API_KEY"):
+                alt_val = os.environ.get(alt)
+                if alt_val:
+                    return alt_val
+        return original
+
+    def _replace_braced(match: re.Match) -> str:
+        return _lookup(match.group(1), match.group(0))
+
+    # ${VAR}
+    expanded = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace_braced, value)
+    # $VAR (avoid matching $ alone)
+    expanded = re.sub(
+        r"\$([A-Za-z_][A-Za-z0-9_]*)",
+        lambda m: _lookup(m.group(1), m.group(0)),
+        expanded,
+    )
+    return expanded
 
 
 def _normalize_mcp_configs(raw) -> list:
@@ -14,18 +73,37 @@ def _normalize_mcp_configs(raw) -> list:
     Supports:
       - list format (mcp_servers):  [{"name": "x", "type": "stdio", ...}]
       - dict format (mcpServers):   {"x": {"command": "npx", ...}}
+
+    Official Volcengine-style configs often use ``transport: "http"`` instead of
+    ``type``. Map that before defaulting remote URL servers to SSE.
     """
     if isinstance(raw, list):
-        return raw
-    if isinstance(raw, dict):
-        result = []
+        items = list(raw)
+    elif isinstance(raw, dict):
+        items = []
         for name, cfg in raw.items():
+            if not isinstance(cfg, dict):
+                continue
             entry = {"name": name, **cfg}
-            if "type" not in entry:
-                entry["type"] = "sse" if "url" in entry else "stdio"
-            result.append(entry)
-        return result
-    return []
+            items.append(entry)
+    else:
+        return []
+
+    result = []
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        entry = dict(entry)
+        # transport → type (official samples: transport: "http")
+        if "type" not in entry and entry.get("transport"):
+            entry["type"] = str(entry.get("transport")).strip().lower()
+        if "type" not in entry:
+            entry["type"] = "sse" if "url" in entry else "stdio"
+        # Expand ${ENV} in headers/url/command/args/env values so secrets can
+        # live in ~/.cow/.env instead of mcp.json.
+        entry = _expand_mcp_env_value(entry)
+        result.append(entry)
+    return result
 
 
 class ToolManager:
@@ -292,6 +370,11 @@ class ToolManager:
         """
         import os
         import json as _json
+
+        # MCP warmup can run before the first Agent is initialized. Load the
+        # canonical env file here so ${VAR} headers never depend on startup
+        # ordering, and reload it whenever mcp.json is hot-reloaded.
+        _load_mcp_env_file()
 
         mcp_json_path = self._mcp_json_path()
 

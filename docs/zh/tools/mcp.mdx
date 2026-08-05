@@ -35,10 +35,34 @@ Docker 部署时，官方 `docker-compose.yml` 已经把宿主机 `./cow` 挂载
 | `args` | 否 | 传给 command 的参数列表 |
 | `env` | 否 | 子进程的环境变量，常用于 API Key |
 | `url` | SSE / Streamable HTTP | 远程端点 URL（与 `command` 二选一） |
-| `type` | 远程 | 远程传输类型，可选 `sse` 或 `streamable-http`，默认 `sse` |
-| `headers` | 否 | 远程请求附加 HTTP 头（如 `Authorization`），仅 Streamable HTTP 使用 |
+| `type` / `transport` | 远程 | 远程传输类型：`sse`、`http` / `streamable-http`（官方样例常用 `transport: "http"`） |
+| `headers` | 否 | 远程请求附加 HTTP 头（如 `Authorization`、`X-Agent-Plan-Key`）；支持 `${ENV_VAR}` 占位符 |
 | `scope` | 否 | OAuth 授权范围，仅需要 OAuth 授权的远程 server 使用（可选） |
 | `disabled` | 否 | `true` 时跳过该 server，便于临时关闭 |
+
+### 火山方舟专业数据集（Agent Plan MCP）
+
+订阅 Agent Plan / 专业数据集后，官方推荐通过 Streamable HTTP MCP 接入：
+
+```json
+{
+  "mcpServers": {
+    "datapro": {
+      "url": "https://datapro.hqd.cn-beijing.volces.com/mcp",
+      "type": "http",
+      "transport": "http",
+      "headers": {
+        "X-Agent-Plan-Key": "${AGENT_PLAN_API_KEY}"
+      },
+      "timeout": 120
+    }
+  }
+}
+```
+
+- Key 放在 `~/.cow/.env` 的 `AGENT_PLAN_API_KEY`（也可复用订阅用的 `WEB_SEARCH_API_KEY` / Ark Key）。
+- 成功后会注册 MCP 工具 `dataPro_search`（统一专业数据检索入口）。
+- 产品说明见 [专业数据集](https://www.volcengine.com/docs/82379/2479086)。
 
 ### 完整示例
 

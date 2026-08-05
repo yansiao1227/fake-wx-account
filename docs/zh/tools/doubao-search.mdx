@@ -1,0 +1,65 @@
+---
+title: doubao_search - 豆包搜索
+description: 火山引擎豆包搜索（SearchInfinity）独立联网搜索工具
+---
+
+独立的实时联网搜索工具，基于[火山引擎豆包搜索](https://www.volcengine.com/docs/87772/2272953)（原联网搜索 / 融合信息搜索 / SearchInfinity）。返回网页标题、URL、摘要等结果。
+
+**不与** `web_search` 多源 fan-out 混用；作为单独搜索工具注册，并处于降级链最优先位置。
+
+### 搜索降级链
+
+```text
+doubao_search  →  baidu_ai_search  →  web_search
+```
+
+无 Key、额度/限流耗尽或调用失败时，自动降级到 [`baidu_ai_search`](/zh/tools/baidu-ai-search)，后者还可继续降级到 [`web_search`](/zh/tools/web-search)。
+
+## 凭证
+
+| 来源 | 字段 |
+| --- | --- |
+| 环境变量（推荐） | `~/.cow/.env` 中的 `WEB_SEARCH_API_KEY` |
+| 备选环境变量 | `DOUBAO_SEARCH_API_KEY` |
+| 配置 | `tools.doubao_search.api_key` |
+
+获取 Key：
+
+1. 个人用户：[豆包搜索控制台](https://console.volcengine.com/search-infinity/api-key)
+2. Agent Plan：先在 [Harness](https://console.volcengine.com/ark/region:ark+cn-beijing/openManagement?LLM=%7B%7D&advancedActiveKey=agentPlan) 开通「豆包搜索 / 联网搜索」，再从 [API Key 页](https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?apikey=%7B%7D) 复制
+
+免费额度：每月 **500 次**（次月 1 日重置；以控制台实际策略为准）。
+
+## 配置
+
+```json
+{
+  "tools": {
+    "doubao_search": {
+      "api_key": "",
+      "auth_level": 0,
+      "query_rewrite": false,
+      "fallback_to_baidu_ai_search": true
+    }
+  }
+}
+```
+
+- `auth_level`：`0` 全部来源，`1` 仅权威来源
+- `query_rewrite`：是否启用豆包服务端 Query 改写
+- `fallback_to_baidu_ai_search`：失败时是否降级到 `baidu_ai_search`（默认 `true`，后者还可到 `web_search`）
+
+## 工具参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `query` | string | 是 | 搜索关键词（建议 1–100 字） |
+| `count` | integer | 否 | 返回条数（1–50，默认 10） |
+| `freshness` | string | 否 | `noLimit` / `oneDay` / `oneWeek` / `oneMonth` / `oneYear` / `YYYY-MM-DD..YYYY-MM-DD` |
+| `auth_level` | integer | 否 | 覆盖配置（`0` / `1`） |
+| `query_rewrite` | boolean | 否 | 覆盖配置服务端改写 |
+| `summary` | boolean | 否 | 是否返回更长摘要（默认 true） |
+
+## 引用要求
+
+使用搜索结果作答时，必须以可点击链接引用支持事实的 URL。成功调用会附带 `citationPolicy` 字段。

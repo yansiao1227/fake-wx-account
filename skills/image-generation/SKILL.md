@@ -21,7 +21,7 @@ Supported models (passed via `model` only when the user asks for a specific one)
 
 - **OpenAI** — `gpt-image-2`, `gpt-image-1`
 - **Gemini Nano Banana** — `nano-banana-2`, `nano-banana-pro`, `nano-banana`
-- **Seedream (Volcengine Ark)** — `seedream-5.0-lite`, `seedream-4.5`
+- **Seedream (Volcengine Ark / Agent Plan)** — `seedream-5.0-lite` (Agent Plan), `seedream-4.5` (standard Ark only)
 - **Qwen (DashScope)** — `qwen-image-2.0`, `qwen-image-2.0-pro`
 - **MiniMax** — `image-01`
 
@@ -105,6 +105,14 @@ The script needs **at least one** of these API keys (set via `env_config` or `co
 `OPENAI_API_KEY` / `GEMINI_API_KEY` / `ARK_API_KEY` / `DASHSCOPE_API_KEY` / `MINIMAX_API_KEY` / `LINKAI_API_KEY`
 
 Each also has an optional `*_API_BASE` for custom endpoints. The script automatically picks the first configured backend and falls back to the next if it fails — no need to specify a model.
+
+**Volcengine Agent Plan (企业版订阅)**：
+
+- Key: `ARK_API_KEY`（也兼容 `AGENT_PLAN_API_KEY`）
+- Base: `ARK_API_BASE=https://ark.cn-beijing.volces.com/api/plan/v3`
+- 全路径：`POST {ARK_API_BASE}/images/generations`
+- Plan 侧当前兼容模型：`doubao-seedream-5-0-lite`（技能别名 `seedream-5.0-lite`）
+- 不要用标准 Ark 的带日期 Model ID（如 `doubao-seedream-5-0-260128`），Plan 会返回 `UnsupportedModel`
 
 ### Error Handling
 

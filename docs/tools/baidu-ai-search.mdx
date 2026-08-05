@@ -1,0 +1,98 @@
+---
+title: baidu_ai_search - Intelligent Search
+description: Baidu Qianfan intelligent search that returns summarized answers with citations, falling back to web_search when quota is exhausted
+---
+
+Search the open web via [Baidu Qianfan Intelligent Search](https://cloud.baidu.com/doc/qianfan-api/s/Hmbu8m06u) and return an LLM-summarized answer with citation markers and source references.
+
+Search cascade sibling of [`doubao_search`](/tools/doubao-search): returns a model draft answer plus sources as **normal tool output**. Cowagent still composes the user-facing reply (no direct-final-answer short-circuit). The user query is sent **as-is** (no query rewrite). When the daily free quota is exhausted (or the remote API reports quota / rate-limit errors), `baidu_ai_search` automatically degrades to [`web_search`](/tools/web-search).
+
+## Credential
+
+Reuses the Qianfan API key:
+
+| Source | Field |
+| --- | --- |
+| Env / `~/.cow/.env` | `QIANFAN_API_KEY` |
+| Config fallback | `qianfan_api_key` |
+
+## Routing Policy
+
+1. **Prefer intelligent search** while local daily quota remains and the day is not marked exhausted.
+2. Call `POST /v2/ai_search/chat/completions` with a model (intelligent generation mode). **No query rewrite.**
+3. On success, return `answer` / `references` / `results` to the agent loop so **cowagent can summarize and format** the final user reply (same flow as `doubao_search`).
+4. On local quota exhaustion, missing key, timeout, or remote quota/billing errors → mark the day exhausted for `baidu_ai_search` and **fall back to `web_search`**.
+
+## Configuration
+
+```json
+{
+  "tools": {
+    "baidu_ai_search": {
+      "model": "ernie-4.5-turbo-32k",
+      "daily_limit": 100,
+      "search_source": "baidu_search_v2",
+      "search_mode": "required",
+      "enable_corner_markers": true,
+      "enable_deep_search": false,
+      "fallback_to_web_search": true
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `model` | `ernie-4.5-turbo-32k` | Model used for search + summarization (required by the API for intelligent generation) |
+| `daily_limit` | `100` | Local free-tier daily cap; set `null` to disable local metering |
+| `search_source` | `baidu_search_v2` | `baidu_search_v1` or `baidu_search_v2` |
+| `search_mode` | `required` | Force web search for tool calls (`auto` / `required` / `disabled`) |
+| `enable_corner_markers` | `true` | Include citation markers in the summary |
+| `enable_deep_search` | `false` | Enable deeper multi-hop search (higher latency / cost) |
+| `fallback_to_web_search` | `true` | Degrade to multi-source `web_search` when unavailable |
+
+Shared SQLite under the data root (`web_search_usage.db`) stores:
+
+- **request counters** for local `baidu_ai_search` `daily_limit`
+- **daily exhaustion flags** for `baidu_ai_search` (and web_search capabilities such as `query_rewrite` / `qianfan` / `tavily`)
+
+Once a capability is marked exhausted for the calendar day, further calls skip that remote API.
+
+## Tool Parameters
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | Yes | Natural-language question or search query |
+| `count` | integer | No | Max web references for summarization (1–20, default 10) |
+| `freshness` | string | No | `noLimit` (default), `oneDay`, `oneWeek`, `oneMonth`, `oneYear` |
+
+## Response Shape
+
+Successful intelligent search:
+
+```json
+{
+  "query": "...",
+  "backend": "baidu_ai_search",
+  "model": "ernie-4.5-turbo-32k",
+  "answer": "Summarized draft with citation markers...",
+  "references": [{"title": "...", "url": "...", "snippet": "..."}],
+  "results": [{"title": "...", "url": "...", "snippet": "..."}]
+}
+```
+
+Fallback to web search:
+
+```json
+{
+  "query": "...",
+  "backend": "multi",
+  "fallback_from": "baidu_ai_search",
+  "fallback_reason": "daily intelligent-search quota reached (100/100)",
+  "results": [...]
+}
+```
+
+<Note>
+  Official free allowance is about 100 calls/day for intelligent search generation. Local `daily_limit` tracks usage so the agent can degrade cleanly before remote rejection. Remote quota errors also set a same-day exhaustion flag so the API is not retried.
+</Note>

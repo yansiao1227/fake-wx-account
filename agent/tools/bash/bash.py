@@ -99,13 +99,57 @@ SAFETY:
             if os.path.exists(env_file):
                 try:
                     from dotenv import dotenv_values
-                    dotenv_vars = dotenv_values(env_file)
+                    # dotenv_values may return None for blank/invalid keys (e.g. UTF-8 BOM
+                    # produces a "\ufeff" key with value None). subprocess on Windows
+                    # requires every env value to be a string.
+                    raw_dotenv = dotenv_values(env_file) or {}
+                    dotenv_vars = {
+                        str(k): str(v)
+                        for k, v in raw_dotenv.items()
+                        if k is not None and v is not None and str(k).strip()
+                    }
                     env.update(dotenv_vars)
                     logger.debug(f"[Bash] Loaded {len(dotenv_vars)} variables from {env_file}")
                 except ImportError:
                     logger.debug("[Bash] python-dotenv not installed, skipping .env loading")
                 except Exception as e:
                     logger.debug(f"[Bash] Failed to load .env: {e}")
+
+            # Expose agent workspace to child skills. Prefer existing env;
+            # fall back to this tool's cwd (typically agent_workspace ~/cow).
+            workspace_root = (
+                env.get("AGENT_WORKSPACE")
+                or env.get("COW_WORKSPACE")
+                or self.cwd
+                or os.getcwd()
+            )
+            env.setdefault("AGENT_WORKSPACE", str(workspace_root))
+            env.setdefault("COW_WORKSPACE", str(workspace_root))
+
+            # Seedream images live under the *project* root (repo / app install
+            # dir), not the global agent workspace (~/cow). That keeps generated
+            # assets next to the code and avoids filling the shared cow tmp.
+            try:
+                from config import get_root
+
+                project_root = get_root()
+            except Exception:
+                project_root = os.getcwd()
+            env.setdefault("COW_PROJECT_ROOT", str(project_root))
+            default_seedream_dir = os.path.join(
+                str(project_root), "tmp", "seedream-images"
+            )
+            # Force-correct legacy paths that still point at agent_workspace/tmp
+            # or ~/cow/tmp/seedream-images (common misconfig in ~/.cow/.env).
+            for key in ("ARK_SEEDREAM_SAVE_PATH", "ARK_SAVE_PATH"):
+                current = (env.get(key) or "").strip()
+                if not current or self._is_legacy_cow_seedream_path(
+                    current, workspace_root
+                ):
+                    env[key] = default_seedream_dir
+
+            # Windows CreateProcess / subprocess rejects non-string env values.
+            env = self._sanitize_env(env)
 
             # getuid() only exists on Unix-like systems
             if hasattr(os, 'getuid'):
@@ -342,6 +386,66 @@ SAFETY:
             except (PermissionError, ProcessLookupError):
                 if process.poll() is None:
                     process.kill()
+
+    @staticmethod
+    def _is_legacy_cow_seedream_path(path: str, workspace_root: str) -> bool:
+        """True when path is the old global-cow tmp seedream location."""
+        try:
+            normalized = os.path.normcase(
+                os.path.abspath(os.path.expanduser(str(path or "").strip()))
+            )
+        except Exception:
+            return False
+        if not normalized:
+            return False
+        candidates = []
+        if workspace_root:
+            candidates.append(
+                os.path.join(str(workspace_root), "tmp", "seedream-images")
+            )
+        candidates.extend(
+            [
+                os.path.expanduser("~/cow/tmp/seedream-images"),
+                os.path.expanduser("~/.cow/tmp/seedream-images"),
+            ]
+        )
+        for candidate in candidates:
+            try:
+                cand = os.path.normcase(os.path.abspath(candidate))
+            except Exception:
+                continue
+            if normalized == cand or normalized.startswith(cand + os.sep):
+                return True
+        # Fallback substring match for odd path forms.
+        lowered = normalized.replace("/", "\\")
+        return (
+            "\\cow\\tmp\\seedream-images" in lowered
+            or "\\.cow\\tmp\\seedream-images" in lowered
+        )
+
+    @staticmethod
+    def _sanitize_env(env: dict) -> dict:
+        """Ensure env mapping is subprocess-safe (str keys and str values only).
+
+        On Windows, CreateProcess raises TypeError: environment can only contain
+        strings when any value is None / int / bytes. dotenv blank keys and some
+        host injectors can introduce non-strings into the merged env.
+        """
+        cleaned = {}
+        for key, value in env.items():
+            if key is None or value is None:
+                continue
+            if not isinstance(key, str):
+                key = str(key)
+            if not key:
+                continue
+            if not isinstance(value, str):
+                if isinstance(value, bytes):
+                    value = value.decode("utf-8", errors="replace")
+                else:
+                    value = str(value)
+            cleaned[key] = value
+        return cleaned
 
     @staticmethod
     def _redact_progress(text: str, dotenv_vars: dict) -> str:

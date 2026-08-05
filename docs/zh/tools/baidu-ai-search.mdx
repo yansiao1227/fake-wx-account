@@ -1,0 +1,98 @@
+---
+title: baidu_ai_search - 智能搜索
+description: 百度千帆智能搜索生成，直接返回带引用的总结回答；额度用完后自动退化为 web_search
+---
+
+通过[百度千帆智能搜索生成](https://cloud.baidu.com/doc/qianfan-api/s/Hmbu8m06u)检索全网实时信息，并由大模型生成带角标的总结草稿与参考链接。
+
+与 [`doubao_search`](/zh/tools/doubao-search) 相同：结果作为**普通工具输出**交给 cowagent，由 Agent **再汇总/组织**用户可见回复（不做直出短路）。查询**不做 Query 改写**，原样发送。当本地每日免费额度用尽，或远端返回额度/限流错误时，会自动退化为 [`web_search`](/zh/tools/web-search) 多源原始检索结果。
+
+## 凭证
+
+复用千帆 API Key：
+
+| 来源 | 字段 |
+| --- | --- |
+| 环境变量 / `~/.cow/.env` | `QIANFAN_API_KEY` |
+| 配置回退 | `qianfan_api_key` |
+
+## 路由策略
+
+1. 在本地日额度剩余且当日未标记失效时**优先走智能搜索**。
+2. 调用 `POST /v2/ai_search/chat/completions`（传入 `model` 即为智能搜索生成模式）。**不进行 query 重写。**
+3. 成功时返回 `answer` / `references` / `results`，由 **cowagent 汇总并组织**最终用户回复（与 `doubao_search` 同一套流程）。
+4. 本地额度耗尽、缺 Key、超时、远端额度/账单错误 → 标记当日 `baidu_ai_search` 失效，并**自动退化为 `web_search`**。
+
+## 配置
+
+```json
+{
+  "tools": {
+    "baidu_ai_search": {
+      "model": "ernie-4.5-turbo-32k",
+      "daily_limit": 100,
+      "search_source": "baidu_search_v2",
+      "search_mode": "required",
+      "enable_corner_markers": true,
+      "enable_deep_search": false,
+      "fallback_to_web_search": true
+    }
+  }
+}
+```
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `model` | `ernie-4.5-turbo-32k` | 搜索+总结所用模型（智能搜索生成必填） |
+| `daily_limit` | `100` | 本地日额度；`null` 表示不限制本地计数 |
+| `search_source` | `baidu_search_v2` | `baidu_search_v1` 或 `baidu_search_v2` |
+| `search_mode` | `required` | 工具调用强制联网（`auto` / `required` / `disabled`） |
+| `enable_corner_markers` | `true` | 总结中返回引用角标 |
+| `enable_deep_search` | `false` | 深度搜索（更高时延/成本） |
+| `fallback_to_web_search` | `true` | 不可用时退化为 `web_search` |
+
+与 `web_search` 共用数据根目录下 SQLite（`web_search_usage.db`）：
+
+- **请求计数**：仅用于 `baidu_ai_search` 本地 `daily_limit`
+- **当日失效标志**：`baidu_ai_search` / `query_rewrite` / `qianfan`（百度搜索）/ `tavily` 等
+
+某能力当日标记失效后，后续调用会跳过该远端接口，避免重复打满额度的请求。
+
+## 工具参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `query` | string | 是 | 自然语言问题或检索词 |
+| `count` | integer | 否 | 参与总结的网页条数（1–20，默认 10） |
+| `freshness` | string | 否 | `noLimit`（默认）、`oneDay`、`oneWeek`、`oneMonth`、`oneYear` |
+
+## 返回结构
+
+智能搜索成功：
+
+```json
+{
+  "query": "...",
+  "backend": "baidu_ai_search",
+  "model": "ernie-4.5-turbo-32k",
+  "answer": "带角标的总结草稿...",
+  "references": [{"title": "...", "url": "...", "snippet": "..."}],
+  "results": [{"title": "...", "url": "...", "snippet": "..."}]
+}
+```
+
+退化为 web_search：
+
+```json
+{
+  "query": "...",
+  "backend": "multi",
+  "fallback_from": "baidu_ai_search",
+  "fallback_reason": "daily intelligent-search quota reached (100/100)",
+  "results": [...]
+}
+```
+
+<Note>
+  官方智能搜索生成每日免费额度约 100 次。本地 `daily_limit` 用于在远端拒绝前平滑退化；远端额度错误也会写入当日失效标志，当天不再重试智能搜接口。
+</Note>

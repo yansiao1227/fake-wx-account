@@ -20,7 +20,7 @@ from channel.wechat_desktop.models import (
     UNKNOWN_SENDER_NAME,
     UiaChatMessage,
 )
-from common.log import logger
+from common.log import file_logger, logger
 
 
 @dataclass(frozen=True)
@@ -310,7 +310,9 @@ class RapidOcrGroupSenderResolver:
             try:
                 from rapidocr import RapidOCR
 
+                logger.info("[WechatDesktop] loading RapidOCR models...")
                 self._engine = RapidOCR()
+                logger.info("[WechatDesktop] RapidOCR models loaded")
             except Exception as exc:
                 self._engine_unavailable = True
                 logger.warning(
@@ -319,6 +321,32 @@ class RapidOcrGroupSenderResolver:
                 )
                 return None
             return self._engine
+
+    def preload(self) -> bool:
+        """Eagerly load RapidOCR models so the first group scan is not delayed.
+
+        Safe to call repeatedly. Returns True when an engine is ready.
+        Skips work when group-sender OCR is disabled in config.
+        """
+        if not bool(self.config.get("uia_group_sender_ocr_enabled", True)):
+            return False
+        engine = self._get_engine()
+        if engine is None:
+            return False
+        # First inference can still pay graph/runtime setup cost; run a tiny
+        # blank image so the first real chat-pane OCR is closer to steady-state.
+        try:
+            import numpy as np
+
+            with self._lock:
+                engine(np.zeros((32, 32, 3), dtype=np.uint8))
+        except Exception as exc:
+            # Model load already succeeded; dummy inference failure is non-fatal.
+            logger.debug(
+                "[WechatDesktop] RapidOCR warm-up inference skipped: %s",
+                exc,
+            )
+        return True
 
     @staticmethod
     def _output_lines(result, offset: tuple[int, int]) -> list[OcrTextLine]:
@@ -412,7 +440,8 @@ class RapidOcrGroupSenderResolver:
                 for before, after in zip(messages, enriched)
             )
             if sender_matched or direction_matched:
-                logger.info(
+                # High-frequency during session scan; keep off the console.
+                file_logger.info(
                     "[WechatDesktop] RapidOCR resolved %s direction(s) and "
                     "%s sender name(s)",
                     direction_matched,
