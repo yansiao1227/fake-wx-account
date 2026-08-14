@@ -108,11 +108,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "uia_share_browser_close_settle_ms_max": 500,
     # 分享卡片双路解析里的平台提取器（knowledge-acquisition skill，与 web_fetch 并行）。
     # 关则只跑 web_fetch；skill_path 为空时按仓库 skills 目录约定查找。
+    # 视频字幕：skill 只拉 ≤60 秒 B 站官方字幕，通道会再补拉官方/AI 字幕（不限时长）。
     "knowledge_acquisition_enabled": True,
     "knowledge_acquisition_skill_path": "",
     "knowledge_acquisition_node_executable": "node",
     "knowledge_acquisition_timeout_seconds": 45,
     "knowledge_acquisition_max_content_chars": 50000,
+    "knowledge_acquisition_fetch_subtitles": True,
     "uia_image_viewer_enabled": True,
     "uia_image_viewer_before_close_ms_min": 300,
     "uia_image_viewer_before_close_ms_max": 500,

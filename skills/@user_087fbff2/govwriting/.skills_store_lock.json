@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "govwriting": {
+      "name": "公文写作",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=govwriting",
+      "source": "community",
+      "version": "3.2.2",
+      "installedAt": "2026-06-29T14:10:46Z"
+    }
+  }
+}

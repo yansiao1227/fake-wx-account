@@ -6,6 +6,13 @@
         "enabled": true,
         "category": "skill"
     },
+    "govwriting": {
+        "name": "govwriting",
+        "description": "以文辅政修炼手册。区别于格式手册，本技能聚焦\"写公文的人怎么想、怎么站位、怎么修炼\"。包含八诀修炼体系、写前准备五步法、领导意图确认流程、15种法定公文模板、14种高难度事务公文专项、16个常见文稿问题诊断、语言五性与十弊清单、修改七步法、AI润色工作流。全程贯穿\"以文辅政\"的方法论。",
+        "source": "custom",
+        "enabled": true,
+        "category": "skill"
+    },
     "amap-lbs-skill": {
         "name": "amap-lbs-skill",
         "description": "高德地图综合服务，支持POI搜索、周边搜索、路径规划（地名/坐标）、旅游规划、热力图与地图链接。路线与周边优先使用 scripts/route-plan.js 与 scripts/nearby-search.js。",

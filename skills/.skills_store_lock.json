@@ -15,6 +15,21 @@
       "internalSlug": "knowledge-acquisition",
       "publicSlug": "knowledge-acquisition",
       "installDir": "D:\\workshop\\repositories\\fake-wx-account\\skills\\@clawhub_yz6214589-hash\\knowledge-acquisition"
+    },
+    "@user_087fbff2/govwriting": {
+      "name": "公文写作",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=govwriting&namespace=user_087fbff2",
+      "source": "community",
+      "version": "3.2.8",
+      "namespace": {
+        "canonicalName": "@user_087fbff2/govwriting",
+        "displayName": "user_087fbff2",
+        "handle": "user_087fbff2",
+        "publicSlug": "govwriting"
+      },
+      "internalSlug": "govwriting",
+      "publicSlug": "govwriting",
+      "installDir": "D:\\workshop\\repositories\\fake-wx-account\\skills\\@user_087fbff2\\govwriting"
     }
   }
 }
