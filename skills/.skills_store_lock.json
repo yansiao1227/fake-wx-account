@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "skills": {
+    "@clawhub_yz6214589-hash/knowledge-acquisition": {
+      "name": "知识获取",
+      "zip_url": "https://api.skillhub.cn/api/v1/download?slug=knowledge-acquisition&namespace=clawhub_yz6214589-hash",
+      "source": "clawhub",
+      "version": "2.0.1",
+      "namespace": {
+        "canonicalName": "@clawhub_yz6214589-hash/knowledge-acquisition",
+        "displayName": "yz6214589-hash",
+        "handle": "clawhub_yz6214589-hash",
+        "publicSlug": "knowledge-acquisition"
+      },
+      "internalSlug": "knowledge-acquisition",
+      "publicSlug": "knowledge-acquisition",
+      "installDir": "D:\\workshop\\repositories\\fake-wx-account\\skills\\@clawhub_yz6214589-hash\\knowledge-acquisition"
+    }
+  }
+}

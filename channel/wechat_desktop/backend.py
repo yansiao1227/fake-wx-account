@@ -40,7 +40,7 @@ class WechatDesktopBackend(ABC):
 
     @abstractmethod
     def materialize_event(
-        self, event: WechatDesktopEvent
+        self, event: WechatDesktopEvent, *, before_share_fetch=None
     ) -> tuple[WechatDesktopEvent, int]:
         """按需下载或截图事件中的附件。"""
 

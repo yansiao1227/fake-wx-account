@@ -110,7 +110,34 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
         reference_type = str(reference.get("content_type") or "text").lower()
         reference_path = str(reference.get("file_path") or "").strip()
         reference_content = str(reference.get("content") or "").strip()
-        if reference_type == "image" and reference_path:
+        if reference_type == "share_card":
+            url = str(reference.get("url") or "").strip()
+            platform = str(reference.get("platform") or "").strip()
+            fetched = str(reference.get("fetched_content") or "").strip()
+            fetch_status = str(reference.get("fetch_status") or "").strip()
+            knowledge = str(reference.get("knowledge_content") or "").strip()
+            knowledge_status = str(
+                reference.get("knowledge_status") or ""
+            ).strip()
+            parts = [f"[第三方分享卡片] {reference_content or '标题不可用'}"]
+            if platform:
+                parts.append(f"平台：{platform}")
+            if url:
+                parts.append(f"链接：{url}")
+            if fetched:
+                parts.append(f"WebFetch 网页结果：\n{fetched}")
+            elif fetch_status:
+                parts.append("WebFetch 网页结果不可用。")
+            if knowledge:
+                parts.append(
+                    f"knowledge-acquisition 平台解析结果：\n{knowledge}"
+                )
+            elif knowledge_status and knowledge_status != "disabled":
+                parts.append("knowledge-acquisition 平台解析结果不可用。")
+            if not fetched and not knowledge:
+                parts.append("两路内容均不可用；不要根据标题猜测页面内容。")
+            reference_content = "\n".join(parts)
+        elif reference_type == "image" and reference_path:
             reference_content = f"[图片: {reference_path}]"
         elif reference_type == "file" and reference_path:
             reference_content = f"[文件: {reference_path}]"
@@ -778,6 +805,9 @@ class WechatDesktopChannel(ChatChannel):
         if event.content_type == "image" and not event.reference:
             self._ignore_standalone_attachment(event)
             return
+        if event.content_type == "share_card" and not event.reference:
+            self._ignore_standalone_attachment(event)
+            return
         if event.content_type == "file" and not event.reference:
             self._submit_materialization([event])
             return
@@ -1026,7 +1056,7 @@ class WechatDesktopChannel(ChatChannel):
         return bool(attachment and question)
 
     def _materialize_batch(
-        self, events: list[WechatDesktopEvent]
+        self, events: list[WechatDesktopEvent], *, before_share_fetch=None
     ) -> WechatDesktopEvent:
         """解析批次附件，并把多条消息折叠为一个可回复事件。
 
@@ -1036,7 +1066,12 @@ class WechatDesktopChannel(ChatChannel):
         """
         resolved_events = []
         for event in events:
-            event, resolve_count = self._driver.materialize_event(event)
+            if before_share_fetch is None:
+                event, resolve_count = self._driver.materialize_event(event)
+            else:
+                event, resolve_count = self._driver.materialize_event(
+                    event, before_share_fetch=before_share_fetch
+                )
             self._preserve_event_evidence(event)
             resolved_events.append(event)
             self._mark_lifecycle(
@@ -1119,11 +1154,14 @@ class WechatDesktopChannel(ChatChannel):
 
     @staticmethod
     def _has_referenced_attachment(event: WechatDesktopEvent) -> bool:
-        """引用图片/文件需要在真正消费回复任务时占用微信窗口解析。"""
-        return str(event.reference.get("content_type") or "").lower() in {
-            "file",
-            "image",
-        }
+        """任何未解析引用都在 FIFO 队首占用微信窗口定位原文。"""
+        if not event.reference:
+            return False
+        reference_type = str(event.reference.get("content_type") or "").lower()
+        return (
+            reference_type in {"file", "image", "share_card"}
+            or not bool(event.reference.get("resolved", False))
+        )
 
     def _prepare_deferred_materialization(
         self, events: list[WechatDesktopEvent]
@@ -1544,6 +1582,29 @@ class WechatDesktopChannel(ChatChannel):
             )
             return False
 
+    def _send_share_content_fetch_notice(self, item: ReplyQueueItem) -> bool:
+        """在已确认分享链接、即将双路提取时发送专用趣味提示。"""
+        if not bool(self.config.get("agent_tool_notice_enabled", True)):
+            return False
+        context = {
+            "msg": WechatDesktopMessage(item.event),
+            "receiver": item.event.conversation_id or item.event.conversation_name,
+            "isgroup": item.event.is_group,
+            "wechat_desktop_queue_token": item.token,
+            "wechat_desktop_source_type": item.event.source_type,
+        }
+        try:
+            return self._send_agent_tool_notice(
+                context,
+                {
+                    "tool_name": "web_fetch + knowledge-acquisition",
+                    "notice_template_key": "share_content_fetch_notice_templates",
+                },
+            )
+        except Exception as exc:
+            logger.warning("[WechatDesktop] share content fetch notice failed: %s", exc)
+            return False
+
     def _consume_reply_queue(self):
         """串行消费最终回复任务，并等待每个 Agent 周期到达终态。
 
@@ -1577,7 +1638,15 @@ class WechatDesktopChannel(ChatChannel):
                         item.event.conversation_id,
                     )
                     notice_sent = self._send_deferred_attachment_notice(item)
-                    materialized = self._materialize_batch(deferred_events)
+
+                    def before_share_fetch():
+                        nonlocal notice_sent
+                        if not notice_sent:
+                            notice_sent = self._send_share_content_fetch_notice(item)
+
+                    materialized = self._materialize_batch(
+                        deferred_events, before_share_fetch=before_share_fetch
+                    )
                     setattr(
                         materialized,
                         "_preflight_attachment_notice_sent",
@@ -1975,11 +2044,13 @@ class WechatDesktopChannel(ChatChannel):
 
         kind, name = _tool_notice_subject(data)
         name = re.sub(r"[\r\n`]+", " ", name).strip()[:80] or kind
-        template_key = (
-            "agent_skill_notice_templates"
-            if kind == "skill"
-            else "agent_tool_notice_templates"
-        )
+        template_key = str(data.get("notice_template_key") or "").strip()
+        if not template_key:
+            template_key = (
+                "agent_skill_notice_templates"
+                if kind == "skill"
+                else "agent_tool_notice_templates"
+            )
         templates = [
             str(item)
             for item in self.config.get(template_key, [])

@@ -74,6 +74,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
         "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
     ],
+    "share_content_fetch_notice_templates": [
+        "网页侦察兵和平台解析器已经兵分两路，正在给这张卡片做拆解 🕵️",
+        "链接拿到了，`web_fetch` 和知识提取器正组队搬运内容 🌐",
+        "卡片已经翻面，两路解析小分队同时出发，稍等我带情报回来 🚚",
+    ],
     "agent_failure_notice_enabled": True,
     "agent_failure_notice_templates": [
         "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
@@ -91,6 +96,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_send_images": True,
     "analyze_incoming_images": False,
     "resolve_message_references": True,
+    # 引用分享卡片后抄链接：点开内置浏览器、展开菜单、写入剪贴板、关闭回主窗
+    # 各步的随机等待（毫秒）。过小容易点空，机器慢或菜单弹不出时再加大。
+    "uia_share_browser_open_settle_ms_min": 600,
+    "uia_share_browser_open_settle_ms_max": 1200,
+    "uia_share_browser_menu_settle_ms_min": 250,
+    "uia_share_browser_menu_settle_ms_max": 500,
+    "uia_share_browser_clipboard_settle_ms_min": 200,
+    "uia_share_browser_clipboard_settle_ms_max": 450,
+    "uia_share_browser_close_settle_ms_min": 250,
+    "uia_share_browser_close_settle_ms_max": 500,
+    # 分享卡片双路解析里的平台提取器（knowledge-acquisition skill，与 web_fetch 并行）。
+    # 关则只跑 web_fetch；skill_path 为空时按仓库 skills 目录约定查找。
+    "knowledge_acquisition_enabled": True,
+    "knowledge_acquisition_skill_path": "",
+    "knowledge_acquisition_node_executable": "node",
+    "knowledge_acquisition_timeout_seconds": 45,
+    "knowledge_acquisition_max_content_chars": 50000,
     "uia_image_viewer_enabled": True,
     "uia_image_viewer_before_close_ms_min": 300,
     "uia_image_viewer_before_close_ms_max": 500,

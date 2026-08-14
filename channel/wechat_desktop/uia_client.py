@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
+from urllib.parse import urlparse
 
 from common.log import file_logger, logger
 from channel.wechat_desktop.group_sender_ocr import RapidOcrGroupSenderResolver
@@ -924,6 +925,8 @@ class WechatUiaClient:
     def _message_type(class_name: str, content: str) -> str:
         class_value = _text(class_name).casefold()
         content_value = _text(content)
+        if WechatUiaClient._share_card_metadata(content_value)[0]:
+            return "share_card"
         if (
             "image" in class_value
             or content_value in {"[图片]", "[Image]"}
@@ -945,6 +948,48 @@ class WechatUiaClient:
         ):
             return "file"
         return "text"
+
+    @staticmethod
+    def _share_card_metadata(content: str) -> tuple[str, str]:
+        """Return a WeChat share-card title and optional platform label."""
+
+        lines = [line.strip() for line in _text(content).splitlines() if line.strip()]
+        if not lines:
+            return "", ""
+        first = lines[0]
+        marker = next(
+            (item for item in ("[链接]", "[link]") if first.casefold().startswith(item.casefold())),
+            "",
+        )
+        if not marker:
+            return "", ""
+        title = first[len(marker) :].strip()
+        remaining = lines[1:]
+        if not title and remaining:
+            title, remaining = remaining[0], remaining[1:]
+        if not title:
+            return "", ""
+        return title, remaining[-1] if remaining else ""
+
+    @staticmethod
+    def _normalized_reference_text(value: str) -> str:
+        value = unicodedata.normalize("NFKC", _text(value)).casefold()
+        return re.sub(r"[^\w\u4e00-\u9fff]+", "", value)
+
+    @classmethod
+    def _share_card_matches_preview(cls, content: str, preview: str) -> bool:
+        title, _platform = cls._share_card_metadata(content)
+        title_value = cls._normalized_reference_text(title)
+        preview_value = cls._normalized_reference_text(preview)
+        return bool(
+            title_value
+            and preview_value
+            and (
+                title_value == preview_value
+                or title_value in preview_value
+                or preview_value in title_value
+            )
+        )
 
     @staticmethod
     def _parse_reference_label(content: str) -> Optional[dict]:
@@ -1241,6 +1286,21 @@ class WechatUiaClient:
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
         finally:
             win32api.SetCursorPos(cursor)
+
+    @classmethod
+    def _click_control_point(cls, control) -> bool:
+        """Physically click the centre of an already verified UIA control."""
+
+        bounds = _bounds(control) if control is not None else None
+        if not bounds or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+            return False
+        cls._left_click_point(
+            (
+                int((bounds[0] + bounds[2]) / 2),
+                int((bounds[1] + bounds[3]) / 2),
+            )
+        )
+        return True
 
     @staticmethod
     def _press_escape_key() -> None:
@@ -1545,6 +1605,7 @@ class WechatUiaClient:
             "image": ("chatbubblereferitemview", "chatimageitemview"),
         }
         ranked = []
+        preview_matches = []
         for control in message_list.GetChildren():
             class_name = _text(control.ClassName).casefold()
             if "chat" not in class_name or "itemview" not in class_name:
@@ -1553,6 +1614,10 @@ class WechatUiaClient:
             if not bounds:
                 continue
             name = _text(control.Name)
+            # The current quoted bubble may remain in the viewport and contains
+            # the same preview text. It is never a valid original candidate.
+            if cls._parse_reference_label(name) is not None:
+                continue
             row_center = (bounds[1] + bounds[3]) / 2
             score = -abs(row_center - center_y)
             if any(
@@ -1565,7 +1630,17 @@ class WechatUiaClient:
             if message_type == "file" and cls._file_card_metadata(name)[0]:
                 score += 200
             ranked.append((score, control))
-        return max(ranked, key=lambda item: item[0])[1] if ranked else None
+            normalized_name = cls._normalized_reference_text(name)
+            normalized_preview = cls._normalized_reference_text(preview)
+            if normalized_preview and normalized_preview in normalized_name:
+                preview_matches.append(control)
+        # The locate bar normally centers the original, but a viewport can
+        # contain repeated text. Never resolve an ambiguous quote by proximity.
+        if len(preview_matches) == 1:
+            return preview_matches[0]
+        if len(preview_matches) > 1:
+            return None
+        return max(ranked, key=lambda item: item[0])[1] if ranked and not preview else None
 
     def _return_to_reference(self) -> bool:
         button = self._find_desktop_control(
@@ -1573,7 +1648,8 @@ class WechatUiaClient:
         )
         if button is None:
             return False
-        self._click_and_restore(button)
+        if not self._click_control_point(button):
+            return False
         self._paced_wait(
             "uia_reference_return_settle_ms_min",
             "uia_reference_return_settle_ms_max",
@@ -1619,11 +1695,11 @@ class WechatUiaClient:
     def resolve_message_reference(
         self, message: UiaChatMessage
     ) -> UiaChatMessage:
-        """Resolve one quote through WeChat's native locate-original action."""
+        """Locate one quoted original, classify it, and materialize it safely."""
         reference = message.reference
         if (
             reference is None
-            or reference.message_type != "file"
+            or reference.message_type == "image"
             or not message.bounds
         ):
             return message
@@ -1634,8 +1710,11 @@ class WechatUiaClient:
             int(left + (right - left) * 0.25),
             int(top + (bottom - top) * 0.72),
         )
-        original = None
         located = False
+        restored = False
+        message_list_verified = False
+        resolved_message = message
+        original = None
         try:
             self.focus_window()
             with self.operation_lock, self._uia_root() as root:
@@ -1655,7 +1734,8 @@ class WechatUiaClient:
                         "leaving UI untouched"
                     )
                     return message
-                self._click_and_restore(menu_item)
+                if not self._click_control_point(menu_item):
+                    return message
                 located = True
                 self._paced_wait(
                     "uia_reference_locate_settle_ms_min",
@@ -1673,50 +1753,80 @@ class WechatUiaClient:
                 )
                 if message_list is None:
                     return message
+                message_list_verified = True
                 control = self._pick_located_original_control(
                     message_list, reference.message_type, reference.content
                 )
                 if control is None:
-                    return message
-                content = _text(control.Name)
-                class_name = _text(control.ClassName)
-                original = UiaChatMessage(
+                    logger.warning(
+                        "[WechatDesktop] located reference original is ambiguous"
+                    )
+                else:
+                    content = _text(control.Name)
+                    class_name = _text(control.ClassName)
+                    original_type = self._message_type(class_name, content)
+                    if original_type == "share_card" and not self._share_card_matches_preview(
+                        content, reference.content
+                    ):
+                        logger.warning(
+                            "[WechatDesktop] share-card title does not match quote preview"
+                        )
+                    else:
+                        original = UiaChatMessage(
+                            sender_name=reference.sender_name,
+                            content=content,
+                            message_type=original_type,
+                            direction="unknown",
+                            runtime_id=_runtime_id(control),
+                            bounds=_bounds(control),
+                        )
+            if original is not None:
+                # The original must remain visible for attachment extraction,
+                # but nested UIA initializers are avoided by leaving the tree.
+                file_path = ""
+                if original.message_type == "image":
+                    file_path = self.fetch_message_image(original)
+                elif original.message_type == "file":
+                    file_path = self.fetch_message_file(original)
+                title, platform = self._share_card_metadata(original.content)
+                share_url = ""
+                if original.message_type == "share_card" and original.bounds:
+                    share_url = self.fetch_share_url_from_point(
+                        self._share_card_activation_point(original.bounds)
+                    )
+                resolved_reference = UiaReferencedMessage(
                     sender_name=reference.sender_name,
-                    content=content,
-                    message_type=self._message_type(class_name, content),
-                    direction="unknown",
-                    runtime_id=_runtime_id(control),
-                    bounds=_bounds(control),
+                    content=(
+                        title
+                        if original.message_type == "share_card"
+                        else original.content
+                    ),
+                    message_type=original.message_type,
+                    file_path=file_path,
+                    resolved=(
+                        original.message_type != "share_card" or bool(share_url)
+                    ),
+                    degraded=(
+                        original.message_type in {"image", "file"}
+                        and not file_path
+                    ),
+                    strategy=(
+                        "wechat_share_browser_copy_link"
+                        if share_url
+                        else "wechat_locate_original"
+                    ),
+                    original_content=original.content,
+                    url=share_url,
+                    platform=platform,
                 )
-            file_path = ""
-            if original.message_type == "image":
-                file_path = self.fetch_message_image(original)
-            elif original.message_type == "file":
-                file_path = self.fetch_message_file(original)
-            resolved_reference = UiaReferencedMessage(
-                sender_name=reference.sender_name,
-                content=original.content,
-                message_type=original.message_type,
-                file_path=file_path,
-                resolved=True,
-                degraded=(
-                    original.message_type in {"image", "file"} and not file_path
-                ),
-                strategy="wechat_locate_original",
-            )
-            logger.info(
-                "[WechatDesktop] reference resolved type=%s attachment=%s",
-                original.message_type,
-                bool(file_path),
-            )
-            return replace(message, reference=resolved_reference)
+                resolved_message = replace(message, reference=resolved_reference)
         except Exception as exc:
             logger.warning("[WechatDesktop] failed to resolve reference: %s", exc)
-            return message
         finally:
             if located:
                 try:
-                    if not self._return_to_reference():
+                    restored = self._return_to_reference()
+                    if not restored and message_list_verified:
                         logger.warning(
                             "[WechatDesktop] return-to-reference control unavailable; "
                             "falling back to End"
@@ -1728,10 +1838,413 @@ class WechatUiaClient:
                             300,
                             600,
                         )
+                        restored = True
                 except Exception as exc:
                     logger.warning(
                         "[WechatDesktop] failed to return to reference: %s", exc
                     )
+        if (
+            resolved_message.reference is not None
+            and resolved_message.reference.message_type == "share_card"
+        ):
+            if resolved_message.reference.url:
+                return resolved_message
+            if not restored:
+                return replace(
+                    resolved_message,
+                    reference=replace(
+                        resolved_message.reference,
+                        degraded=True,
+                        strategy="wechat_locate_original_return_failed",
+                    ),
+                )
+            url = self.fetch_referenced_share_url(resolved_message)
+            return replace(
+                resolved_message,
+                reference=replace(
+                    resolved_message.reference,
+                    url=url,
+                    resolved=bool(url),
+                    degraded=not bool(url),
+                    strategy="wechat_share_browser_copy_link",
+                ),
+            )
+        return resolved_message
+
+    @staticmethod
+    def _share_card_activation_point(
+        bounds: tuple[int, int, int, int]
+    ) -> tuple[int, int]:
+        left, top, right, bottom = (int(value) for value in bounds)
+        return (
+            int(left + (right - left) * 0.25),
+            int(top + (bottom - top) * 0.5),
+        )
+
+    @staticmethod
+    def _is_safe_public_url(value: str) -> bool:
+        parsed = urlparse(_text(value))
+        return bool(
+            parsed.scheme.casefold() in {"http", "https"}
+            and parsed.hostname
+            and parsed.username is None
+            and parsed.password is None
+        )
+
+    @classmethod
+    def _find_share_browser_controls(cls, root):
+        controls = [root, *cls._walk(root, 800)]
+        root_bounds = _bounds(root)
+        more_candidates = []
+        close_candidates = []
+        for control in controls:
+            name = _text(getattr(control, "Name", "")).casefold()
+            control_type = _text(
+                getattr(control, "ControlTypeName", "")
+            ).casefold()
+            bounds = _bounds(control)
+            if not bounds:
+                continue
+            if name in {"关闭", "close"} and "button" in control_type:
+                close_candidates.append(control)
+            if name in {
+                "更多",
+                "more",
+                "更多选项",
+                "more options",
+                "...",
+                "⋯",
+            } and ("button" in control_type or "menuitem" in control_type):
+                more_candidates.append(control)
+        if root_bounds:
+            left, top, right, bottom = root_bounds
+
+            def upper_right(control):
+                bounds = _bounds(control)
+                if not bounds:
+                    return False
+                center_x = (bounds[0] + bounds[2]) / 2
+                center_y = (bounds[1] + bounds[3]) / 2
+                return center_x >= left + (right - left) * 0.65 and center_y <= top + (
+                    bottom - top
+                ) * 0.25
+
+            more_candidates = [item for item in more_candidates if upper_right(item)]
+            close_candidates = [
+                item
+                for item in close_candidates
+                if upper_right(item)
+                and (_bounds(item)[0] + _bounds(item)[2]) / 2
+                >= left + (right - left) * 0.85
+            ]
+        return (
+            more_candidates[0] if len(more_candidates) == 1 else None,
+            max(
+                close_candidates,
+                key=lambda item: (_bounds(item)[0] + _bounds(item)[2]) / 2,
+            )
+            if close_candidates
+            else None,
+        )
+
+    @staticmethod
+    def _is_verified_share_browser_window(browser_hwnd: int, main_hwnd: int) -> bool:
+        try:
+            import win32api
+            import win32con
+            import win32gui
+            import win32process
+
+            if (
+                not browser_hwnd
+                or not main_hwnd
+                or int(browser_hwnd) == int(main_hwnd)
+                or not win32gui.IsWindow(browser_hwnd)
+                or not win32gui.IsWindowVisible(browser_hwnd)
+            ):
+                return False
+            _, browser_pid = win32process.GetWindowThreadProcessId(browser_hwnd)
+            _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            if int(browser_pid) == int(main_pid):
+                return True
+            process = win32api.OpenProcess(
+                win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+                False,
+                browser_pid,
+            )
+            try:
+                executable = Path(
+                    win32process.GetModuleFileNameEx(process, 0)
+                ).resolve()
+            finally:
+                process.Close()
+            normalized = str(executable).replace("/", "\\").casefold()
+            return bool(
+                executable.name.casefold() == "wechatappex.exe"
+                and "\\tencent\\xwechat\\xplugin\\" in normalized
+                and win32gui.GetClassName(browser_hwnd) == "Chrome_WidgetWin_0"
+                and _text(win32gui.GetWindowText(browser_hwnd)).casefold()
+                in {"微信", "wechat"}
+            )
+        except Exception:
+            return False
+
+    def _verified_share_browser_controls(self, browser_hwnd: int, main_hwnd: int):
+        try:
+            import uiautomation as auto
+
+            if not self._is_verified_share_browser_window(
+                browser_hwnd, main_hwnd
+            ):
+                return None, None
+            with auto.UIAutomationInitializerInThread():
+                root = auto.ControlFromHandle(browser_hwnd)
+                return self._find_share_browser_controls(root)
+        except Exception:
+            return None, None
+
+    def _find_opened_share_browser(
+        self, main_hwnd: int, visible_before: set[int]
+    ) -> int:
+        import win32gui
+
+        native_candidates = []
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+
+        def callback(hwnd, _):
+            value = int(hwnd or 0)
+            if (
+                value
+                and win32gui.IsWindowVisible(value)
+                and (value not in visible_before or value == foreground)
+            ):
+                native_candidates.append(value)
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        # COM/UIA must not run inside EnumWindows' native callback.
+        candidates = []
+        for value in native_candidates:
+            more, close = self._verified_share_browser_controls(value, main_hwnd)
+            if more is not None and close is not None:
+                candidates.append(value)
+        if foreground in candidates:
+            return foreground
+        return candidates[0] if len(candidates) == 1 else 0
+
+    @staticmethod
+    def _clipboard_unicode_after(action) -> str:
+        import win32clipboard
+        import win32con
+
+        saved = []
+        win32clipboard.OpenClipboard()
+        try:
+            for fmt in (win32con.CF_UNICODETEXT, win32con.CF_TEXT, win32con.CF_HDROP):
+                try:
+                    if win32clipboard.IsClipboardFormatAvailable(fmt):
+                        saved.append((fmt, win32clipboard.GetClipboardData(fmt)))
+                except Exception:
+                    pass
+            win32clipboard.EmptyClipboard()
+        finally:
+            win32clipboard.CloseClipboard()
+        value = ""
+        try:
+            action()
+            win32clipboard.OpenClipboard()
+            try:
+                if win32clipboard.IsClipboardFormatAvailable(
+                    win32con.CF_UNICODETEXT
+                ):
+                    value = _text(
+                        win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT)
+                    )
+            finally:
+                win32clipboard.CloseClipboard()
+        finally:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                for fmt, saved_value in saved:
+                    try:
+                        if fmt == win32con.CF_UNICODETEXT:
+                            win32clipboard.SetClipboardText(saved_value, fmt)
+                        else:
+                            win32clipboard.SetClipboardData(fmt, saved_value)
+                    except Exception:
+                        pass
+            finally:
+                win32clipboard.CloseClipboard()
+        return value
+
+    def _click_copy_link_menu(self, browser_hwnd: int) -> bool:
+        menu_item = self._find_desktop_control("复制链接", "mmui::XMenuView")
+        if menu_item is None:
+            try:
+                import uiautomation as auto
+
+                desktop = auto.GetRootControl()
+                matches = [
+                    control
+                    for control in [desktop, *self._walk(desktop, 1200)]
+                    if _text(getattr(control, "Name", "")).casefold()
+                    in {"复制链接", "copy link"}
+                    and "xmenu"
+                    in _text(getattr(control, "ClassName", "")).casefold()
+                ]
+                menu_item = matches[0] if len(matches) == 1 else None
+            except Exception:
+                menu_item = None
+        if menu_item is not None:
+            return self._click_control_point(menu_item)
+        # Some WebView builds do not expose menu text through UIA. OCR is only
+        # allowed inside the already verified browser window and must recognize
+        # the exact first-item label before a click is issued.
+        try:
+            import numpy as np
+            import win32gui
+            from PIL import ImageGrab
+
+            bounds = tuple(int(value) for value in win32gui.GetWindowRect(browser_hwnd))
+            image = ImageGrab.grab(bbox=bounds, all_screens=True)
+            engine = self._group_sender_ocr._get_engine()
+            if engine is None:
+                return False
+            output = engine(np.asarray(image))
+            lines = self._group_sender_ocr._output_lines(output, (bounds[0], bounds[1]))
+            matches = [
+                line
+                for line in lines
+                if line.text.strip().casefold() in {"复制链接", "copy link"}
+                and line.score >= 0.8
+            ]
+            if len(matches) != 1:
+                return False
+            line = matches[0]
+            self._left_click_point(
+                (
+                    int((line.bounds[0] + line.bounds[2]) / 2),
+                    int((line.bounds[1] + line.bounds[3]) / 2),
+                )
+            )
+            return True
+        except Exception as exc:
+            logger.warning("[WechatDesktop] copy-link OCR fallback failed: %s", exc)
+            return False
+
+    def _close_share_browser(self, browser_hwnd: int, main_hwnd: int) -> bool:
+        import win32gui
+
+        _more, close = self._verified_share_browser_controls(
+            browser_hwnd, main_hwnd
+        )
+        if close is None:
+            return False
+        if not self._click_control_point(close):
+            return False
+        self._paced_wait(
+            "uia_share_browser_close_settle_ms_min",
+            "uia_share_browser_close_settle_ms_max",
+            250,
+            500,
+        )
+        closed = not (
+            win32gui.IsWindow(browser_hwnd)
+            and win32gui.IsWindowVisible(browser_hwnd)
+        )
+        return bool(closed and self._restore_main_window_after_viewer(main_hwnd))
+
+    def fetch_referenced_share_url(self, message: UiaChatMessage) -> str:
+        """Open a verified share-card quote and copy its browser URL."""
+
+        reference = message.reference
+        if (
+            reference is None
+            or reference.message_type != "share_card"
+            or not message.bounds
+        ):
+            return ""
+        try:
+            self.focus_window()
+            with self.operation_lock, self._uia_root() as root:
+                control = self._find_message_control(root, message)
+                click_bounds = _bounds(control) if control is not None else message.bounds
+                if not click_bounds:
+                    return ""
+                point = self._reference_image_activation_point(click_bounds)
+            return self.fetch_share_url_from_point(point)
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop] failed to prepare share quote activation: %s",
+                exc,
+            )
+            return ""
+
+    def fetch_share_url_from_point(self, point: tuple[int, int]) -> str:
+        """Open a share card at a verified message point and copy its URL."""
+
+        main_hwnd = self.get_owner_window_handle()
+        visible_before = self._visible_top_level_window_handles()
+        browser_hwnd = 0
+        try:
+            self._left_click_point(point)
+            self._paced_wait(
+                "uia_share_browser_open_settle_ms_min",
+                "uia_share_browser_open_settle_ms_max",
+                600,
+                1200,
+            )
+            browser_hwnd = self._find_opened_share_browser(
+                main_hwnd, visible_before
+            )
+            if not browser_hwnd:
+                return ""
+            more, _close = self._verified_share_browser_controls(
+                browser_hwnd, main_hwnd
+            )
+            more_bounds = _bounds(more) if more is not None else None
+            if not more_bounds:
+                return ""
+            more_point = (
+                int((more_bounds[0] + more_bounds[2]) / 2),
+                int((more_bounds[1] + more_bounds[3]) / 2),
+            )
+
+            def copy_action():
+                self._right_click_point(more_point)
+                self._paced_wait(
+                    "uia_share_browser_menu_settle_ms_min",
+                    "uia_share_browser_menu_settle_ms_max",
+                    250,
+                    500,
+                )
+                if not self._click_copy_link_menu(browser_hwnd):
+                    return
+                self._paced_wait(
+                    "uia_share_browser_clipboard_settle_ms_min",
+                    "uia_share_browser_clipboard_settle_ms_max",
+                    200,
+                    450,
+                )
+
+            value = self._clipboard_unicode_after(copy_action)
+            if not self._is_safe_public_url(value):
+                value = ""
+            return value
+        except Exception as exc:
+            logger.warning("[WechatDesktop] failed to copy share URL: %s", exc)
+            return ""
+        finally:
+            if browser_hwnd:
+                if not self._close_share_browser(browser_hwnd, main_hwnd):
+                    logger.warning(
+                        "[WechatDesktop] verified share browser could not be closed"
+                    )
+            else:
+                self._recover_foreground_after_dependency_failure(
+                    "share browser detection failure", main_hwnd
+                )
 
     def _copy_control_file_paths(self, control) -> list[str]:
         """Copy a file bubble and return CF_HDROP paths, restoring the clipboard."""

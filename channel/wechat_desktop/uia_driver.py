@@ -10,6 +10,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -83,9 +84,13 @@ class WechatUiaDriver(WechatDesktopBackend):
         config: dict,
         client: Optional[WechatUiaClient] = None,
         shell_hook: Optional[WindowsShellHook] = None,
+        web_fetcher=None,
+        knowledge_extractor=None,
     ):
         self.config = config
         self.client = client or WechatUiaClient(config)
+        self._web_fetcher = web_fetcher
+        self._knowledge_extractor = knowledge_extractor
         # Driver state is serialized independently from the UIA client's
         # operation lock. Client methods therefore release UIA between bounded
         # reads instead of one scan monopolizing it end-to-end.
@@ -663,7 +668,7 @@ class WechatUiaDriver(WechatDesktopBackend):
                     strategy="wechat_reference_image_viewer",
                 ),
             )
-        elif reference_type == "file" and bool(
+        elif message.reference is not None and bool(
             self.config.get("resolve_message_references", True)
         ):
             resolver = getattr(self.client, "resolve_message_reference", None)
@@ -671,15 +676,13 @@ class WechatUiaDriver(WechatDesktopBackend):
                 resolve_count += 1
                 message = resolver(message)
         elif message.reference is not None:
-            # Text references already contain their usable preview in the
-            # flattened UIA Name; locating the original adds risk and no value.
             message = replace(
                 message,
                 reference=replace(
                     message.reference,
-                    resolved=True,
-                    degraded=False,
-                    strategy="uia_reference_preview",
+                    resolved=False,
+                    degraded=True,
+                    strategy="uia_reference_preview_only",
                 ),
             )
 
@@ -848,6 +851,13 @@ class WechatUiaDriver(WechatDesktopBackend):
                     "resolved": message.reference.resolved,
                     "degraded": message.reference.degraded,
                     "strategy": message.reference.strategy,
+                    "original_content": message.reference.original_content,
+                    "url": message.reference.url,
+                    "platform": message.reference.platform,
+                    "fetched_content": message.reference.fetched_content,
+                    "fetch_status": message.reference.fetch_status,
+                    "knowledge_content": message.reference.knowledge_content,
+                    "knowledge_status": message.reference.knowledge_status,
                     "depth": 1,
                 }
                 if message.reference is not None
@@ -1254,13 +1264,120 @@ class WechatUiaDriver(WechatDesktopBackend):
         )
 
     def materialize_event(
-        self, event: WechatDesktopEvent
+        self, event: WechatDesktopEvent, *, before_share_fetch=None
     ) -> tuple[WechatDesktopEvent, int]:
         # UIA priority must always be acquired before shared driver state.
         # Reply validation follows the same order, preventing lock inversion.
         with self._uia_priority.lease(reply=False):
             with self._operation_lock:
-                return self._materialize_event_locked(event)
+                materialized, resolve_count = self._materialize_event_locked(event)
+        # Network fetches must never retain a UIA priority lease or the driver
+        # state lock. A slow site cannot block WeChat scanning or sending.
+        return (
+            self._fetch_share_reference(
+                materialized, before_share_fetch=before_share_fetch
+            ),
+            resolve_count,
+        )
+
+    def _fetch_share_reference(
+        self, event: WechatDesktopEvent, *, before_share_fetch=None
+    ) -> WechatDesktopEvent:
+        reference = event.reference
+        if str(reference.get("content_type") or "").lower() != "share_card":
+            return event
+        url = str(reference.get("url") or "").strip()
+        if not url:
+            reference["fetch_status"] = "link_unavailable"
+            reference["fetched_content"] = ""
+            reference["knowledge_status"] = "link_unavailable"
+            reference["knowledge_content"] = ""
+            return event
+
+        from agent.tools.utils.url_safety import validate_url_safe
+
+        try:
+            validate_url_safe(url)
+        except ValueError as exc:
+            logger.warning("[WechatDesktop] unsafe share URL rejected: %s", exc)
+            reference["fetch_status"] = "error"
+            reference["fetched_content"] = ""
+            reference["knowledge_status"] = "error"
+            reference["knowledge_content"] = ""
+            return event
+
+        if before_share_fetch is not None:
+            try:
+                before_share_fetch()
+            except Exception as exc:
+                logger.warning("[WechatDesktop] share fetch notice failed: %s", exc)
+
+        def run_web_fetch():
+            fetcher = self._web_fetcher
+            if fetcher is None:
+                from agent.tools.web_fetch.web_fetch import WebFetch
+
+                fetcher = WebFetch(
+                    {"cwd": str(Path(__file__).resolve().parents[2])}
+                )
+                self._web_fetcher = fetcher
+            return fetcher.execute({"url": url})
+
+        def run_knowledge_acquisition():
+            extractor = self._knowledge_extractor
+            if extractor is None:
+                from channel.wechat_desktop.knowledge_acquisition import (
+                    KnowledgeAcquisitionExtractor,
+                )
+
+                extractor = KnowledgeAcquisitionExtractor(self.config)
+                self._knowledge_extractor = extractor
+            execute = getattr(extractor, "extract", extractor)
+            return execute(url)
+
+        knowledge_enabled = bool(
+            self.config.get("knowledge_acquisition_enabled", False)
+        )
+        jobs = {"web_fetch": run_web_fetch}
+        if knowledge_enabled:
+            jobs["knowledge_acquisition"] = run_knowledge_acquisition
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = {
+                name: executor.submit(operation)
+                for name, operation in jobs.items()
+            }
+            for name, future in futures.items():
+                try:
+                    results[name] = ("success", future.result())
+                except Exception as exc:
+                    logger.warning(
+                        "[WechatDesktop] share %s failed: %s", name, exc
+                    )
+                    results[name] = ("error", "")
+
+        web_status, web_result = results["web_fetch"]
+        if (
+            web_status == "success"
+            and getattr(web_result, "status", "") == "success"
+        ):
+            reference["fetch_status"] = "success"
+            reference["fetched_content"] = str(web_result.result or "")
+        else:
+            reference["fetch_status"] = "error"
+            reference["fetched_content"] = str(
+                getattr(web_result, "result", "") or ""
+            )
+
+        if knowledge_enabled:
+            knowledge_status, knowledge_result = results["knowledge_acquisition"]
+            reference["knowledge_status"] = knowledge_status
+            reference["knowledge_content"] = str(knowledge_result or "")
+        else:
+            reference["knowledge_status"] = "disabled"
+            reference["knowledge_content"] = ""
+        return event
 
     def _materialize_event_locked(
         self, event: WechatDesktopEvent
@@ -1312,6 +1429,13 @@ class WechatUiaDriver(WechatDesktopBackend):
                 "resolved": reference.resolved,
                 "degraded": reference.degraded,
                 "strategy": reference.strategy,
+                "original_content": reference.original_content,
+                "url": reference.url,
+                "platform": reference.platform,
+                "fetched_content": reference.fetched_content,
+                "fetch_status": reference.fetch_status,
+                "knowledge_content": reference.knowledge_content,
+                "knowledge_status": reference.knowledge_status,
                 "depth": 1,
             }
             if reference.file_path:

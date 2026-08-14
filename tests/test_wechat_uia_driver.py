@@ -3726,7 +3726,7 @@ def test_control_events_bypass_private_aggregation():
     assert routed == [("control", cancel), ("control", steer)]
 
 
-def test_standalone_image_is_observed_while_file_is_materialized():
+def test_standalone_image_and_share_card_are_observed_while_file_is_materialized():
     channel = _bare_wechat_channel()
     routed = []
     processed = []
@@ -3748,11 +3748,15 @@ def test_standalone_image_is_observed_while_file_is_materialized():
     file_event = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "file", "report.pdf"
     )
+    share = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "share_card", "[链接]标题"
+    )
     text = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "说明"
     )
 
     channel._route_reply_event(image)
+    channel._route_reply_event(share)
     channel._route_reply_event(file_event)
     channel._route_reply_event(text)
 
@@ -3760,9 +3764,10 @@ def test_standalone_image_is_observed_while_file_is_materialized():
         ("materialize", [file_event]),
         ("private", text),
     ]
-    assert processed == [image.event_id]
+    assert processed == [image.event_id, share.event_id]
     assert finished == [
         ([image.event_id], "observed"),
+        ([share.event_id], "observed"),
     ]
 
 
@@ -4282,11 +4287,25 @@ def test_cached_file_is_reused_by_quoted_filename(tmp_path):
     assert client.file_fetches == ["文件\nreport.pdf\n8 KB"]
 
 
-def test_text_reference_uses_uia_preview_without_locating_original():
+def test_text_reference_locates_original_before_resolving():
     client = FakeClient()
-    client.resolve_message_reference = lambda _message: (_ for _ in ()).throw(
-        AssertionError("text reference must not locate original")
-    )
+    calls = []
+
+    def resolve_reference(message):
+        calls.append(message.reference.content)
+        return replace(
+            message,
+            reference=replace(
+                message.reference,
+                content="这是定位后的完整原文",
+                original_content="这是定位后的完整原文",
+                resolved=True,
+                degraded=False,
+                strategy="wechat_locate_original",
+            ),
+        )
+
+    client.resolve_message_reference = resolve_reference
     client.fetch_referenced_message_image = lambda _message: (
         _ for _ in ()
     ).throw(AssertionError("text reference must not open image viewer"))
@@ -4307,10 +4326,194 @@ def test_text_reference_uses_uia_preview_without_locating_original():
         "conversation", quoted
     )
 
-    assert resolve_count == 0
-    assert resolved.reference.content == "这是被引用的文本预览"
+    assert calls == ["这是被引用的文本预览"]
+    assert resolve_count == 1
+    assert resolved.reference.content == "这是定位后的完整原文"
     assert resolved.reference.resolved is True
-    assert resolved.reference.strategy == "uia_reference_preview"
+    assert resolved.reference.strategy == "wechat_locate_original"
+
+
+def test_share_card_requires_link_marker_and_matching_title():
+    content = (
+        "[链接]我Chovy，你做薯片给我做好了呀\n"
+        "UP主：印度老吃家\n播放：255.3万\n哔哩哔哩"
+    )
+
+    assert WechatUiaClient._message_type("mmui::ChatTextItemView", content) == (
+        "share_card"
+    )
+    assert WechatUiaClient._share_card_matches_preview(
+        content, "我Chovy，你做薯片给我做好了呀"
+    )
+    assert not WechatUiaClient._share_card_matches_preview(
+        content, "另一个普通文本标题"
+    )
+    assert WechatUiaClient._message_type(
+        "mmui::ChatTextItemView", "普通文本\n哔哩哔哩"
+    ) == "text"
+
+
+def test_located_original_rejects_duplicate_preview_matches():
+    first = GeometryControl(
+        (100, 200, 500, 260), "重复原文", "mmui::ChatTextItemView"
+    )
+    second = GeometryControl(
+        (100, 300, 500, 360), "重复原文", "mmui::ChatTextItemView"
+    )
+    message_list = GeometryControl(
+        (0, 0, 700, 700), children=[first, second]
+    )
+
+    assert (
+        WechatUiaClient._pick_located_original_control(
+            message_list, "text", "重复原文"
+        )
+        is None
+    )
+
+
+def test_share_reference_fetches_url_after_uia_materialization():
+    calls = []
+    fetcher = SimpleNamespace(
+        execute=lambda args: calls.append(args)
+        or SimpleNamespace(status="success", result="Title: B站视频\nContent: 页面正文")
+    )
+    driver = WechatUiaDriver(
+        {}, client=FakeClient(), shell_hook=FakeHook(), web_fetcher=fetcher
+    )
+    event = WechatDesktopEvent(
+        "message",
+        "conversation",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "这个视频讲了啥",
+        reference={
+            "content_type": "share_card",
+            "content": "B站视频",
+            "url": "https://www.bilibili.com/video/BV1test",
+        },
+    )
+
+    result = driver._fetch_share_reference(event)
+
+    assert calls == [{"url": "https://www.bilibili.com/video/BV1test"}]
+    assert result.reference["fetch_status"] == "success"
+    assert "页面正文" in result.reference["fetched_content"]
+
+
+def test_share_reference_without_url_never_calls_web_fetch():
+    fetcher = SimpleNamespace(
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("web_fetch must not run without a copied URL")
+        )
+    )
+    driver = WechatUiaDriver(
+        {}, client=FakeClient(), shell_hook=FakeHook(), web_fetcher=fetcher
+    )
+    event = WechatDesktopEvent(
+        "message",
+        "conversation",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "看看",
+        reference={"content_type": "share_card", "content": "标题", "url": ""},
+    )
+
+    driver._fetch_share_reference(event)
+
+    assert event.reference["fetch_status"] == "link_unavailable"
+
+
+def test_share_browser_flow_clicks_quote_right_clicks_more_and_closes(monkeypatch):
+    client = WechatUiaClient({})
+    reference_node = GeometryControl(
+        (900, 540, 1620, 670),
+        "这个视频讲了啥引用 颜料盒 的消息 : 分享标题",
+        "mmui::ChatTextItemView",
+    )
+    root = GeometryControl((0, 0, 1800, 1000), children=[reference_node])
+    more = GeometryControl((1500, 50, 1540, 90), "更多", "mmui::XButton")
+    close = GeometryControl((1560, 50, 1600, 90), "关闭", "mmui::XButton")
+    more.ControlTypeName = "ButtonControl"
+    close.ControlTypeName = "ButtonControl"
+    calls = []
+
+    @contextmanager
+    def fake_root():
+        yield root
+
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "_uia_root", fake_root)
+    monkeypatch.setattr(client, "_find_message_control", lambda *_args: reference_node)
+    monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
+    monkeypatch.setattr(client, "_left_click_point", lambda point: calls.append(("open", point)))
+    monkeypatch.setattr(client, "_find_opened_share_browser", lambda *_args: 200)
+    monkeypatch.setattr(
+        client,
+        "_verified_share_browser_controls",
+        lambda *_args: (more, close),
+    )
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(client, "_right_click_point", lambda point: calls.append(("more", point)))
+    monkeypatch.setattr(client, "_click_copy_link_menu", lambda hwnd: calls.append(("copy", hwnd)) or True)
+
+    def clipboard(action):
+        action()
+        return "https://www.bilibili.com/video/BV1test"
+
+    monkeypatch.setattr(client, "_clipboard_unicode_after", clipboard)
+    monkeypatch.setattr(client, "_close_share_browser", lambda *args: calls.append(("close", args)) or True)
+    message = UiaChatMessage(
+        "Alice",
+        "这个视频讲了啥",
+        bounds=(900, 540, 1620, 670),
+        reference=UiaReferencedMessage(
+            "颜料盒", "分享标题", message_type="share_card"
+        ),
+    )
+
+    assert client.fetch_referenced_share_url(message) == (
+        "https://www.bilibili.com/video/BV1test"
+    )
+    assert calls == [
+        ("open", (1080, 638)),
+        ("more", (1520, 70)),
+        ("copy", 200),
+        ("close", (200, 100)),
+    ]
+
+
+def test_share_context_contains_fetch_result():
+    event = WechatDesktopEvent(
+        "message",
+        "conversation",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "这个视频讲了啥",
+        reference={
+            "sender_name": "颜料盒",
+            "content_type": "share_card",
+            "content": "分享标题",
+            "platform": "哔哩哔哩",
+            "url": "https://www.bilibili.com/video/BV1test",
+            "fetch_status": "success",
+            "fetched_content": "页面正文",
+        },
+    )
+
+    heading, lines = _render_event_context_lines(event)
+
+    assert heading == "[被引用的内容]"
+    rendered = "\n".join(lines)
+    assert "[第三方分享卡片] 分享标题" in rendered
+    assert "页面正文" in rendered
 
 
 def test_image_reference_opens_current_quote_region_without_locating_original(

@@ -59,6 +59,13 @@ class UiaReferencedMessage:
     resolved: bool = False
     degraded: bool = False
     strategy: str = ""
+    original_content: str = ""
+    url: str = ""
+    platform: str = ""
+    fetched_content: str = ""
+    fetch_status: str = ""
+    knowledge_content: str = ""
+    knowledge_status: str = ""
 
 
 @dataclass(frozen=True)
