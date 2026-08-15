@@ -190,6 +190,76 @@ def test_auto_reply_text_removes_drafting_wrappers(value, expected):
     assert _normalize_auto_reply_text(value) == expected
 
 
+def test_store_reuses_connection_per_thread(tmp_path):
+    """Each thread should get exactly one long-lived connection (not a new one per call)."""
+    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
+    ids_main = set()
+    for _ in range(5):
+        ids_main.add(id(store._get_connection()))
+    # All calls from the same thread must return the identical connection object.
+    assert len(ids_main) == 1
+
+
+def test_store_connection_is_thread_local(tmp_path):
+    """Different threads must not share a connection."""
+    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
+    import threading
+    conn_ids = {}
+
+    def capture(name):
+        conn_ids[name] = id(store._get_connection())
+
+    t = threading.Thread(target=capture, args=("other",))
+    capture("main")
+    t.start()
+    t.join()
+
+    assert "main" in conn_ids and "other" in conn_ids
+    assert conn_ids["main"] != conn_ids["other"]
+
+
+def test_startup_migrations_run_only_once(tmp_path):
+    """run_startup_migrations should be a no-op after the first run."""
+    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
+    # Seed one outgoing record that needs normalizing.
+    store.append_conversation_history(
+        "alice", "Alice", "我", "outgoing", "text",
+        "建议回复：好的", "private",
+    )
+    result1 = store.run_startup_migrations(normalizer=_normalize_auto_reply_text)
+    assert result1["normalized"] == 1
+
+    # Second call must skip migrations entirely.
+    store.append_conversation_history(
+        "alice", "Alice", "我", "outgoing", "text",
+        "建议回复：再说", "private",
+    )
+    result2 = store.run_startup_migrations(normalizer=_normalize_auto_reply_text)
+    assert result2["normalized"] == 0
+    assert result2["deduplicated"] == 0
+
+
+def test_startup_migrations_idempotent_across_new_store_instance(tmp_path):
+    """Migrations must not re-run when a new WechatDesktopStore opens the same DB."""
+    db_path = str(tmp_path / "wechat.sqlite3")
+    store1 = WechatDesktopStore(db_path)
+    store1.append_conversation_history(
+        "alice", "Alice", "我", "outgoing", "text",
+        "建议回复：好的", "private",
+    )
+    result1 = store1.run_startup_migrations(normalizer=_normalize_auto_reply_text)
+    assert result1["normalized"] == 1
+
+    # Reopen DB in a new instance — migration must not re-run.
+    store2 = WechatDesktopStore(db_path)
+    store2.append_conversation_history(
+        "alice", "Alice", "我", "outgoing", "text",
+        "建议回复：再说", "private",
+    )
+    result2 = store2.run_startup_migrations(normalizer=_normalize_auto_reply_text)
+    assert result2["normalized"] == 0
+
+
 
 
 

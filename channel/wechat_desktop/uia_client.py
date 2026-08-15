@@ -12,7 +12,7 @@ import struct
 import threading
 import time
 import unicodedata
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -148,6 +148,15 @@ class WechatUiaClient:
     def __init__(self, config: Optional[dict] = None):
         self.config = dict(config or {})
         self.operation_lock = threading.RLock()
+        # Serializes concurrent senders (reply FIFO vs. agent-initiated sends)
+        # so humanized pacing waits happen outside any UIA lock: a waiting
+        # sender must never block conversation scanning or attachment reads.
+        self._send_lock = threading.RLock()
+        # Optional per-section UIA priority context installed by the driver.
+        # Each bounded send section (one chunk's focus/locate/paste/verify)
+        # runs inside ``uia_section()`` so scans yield during UI work but can
+        # run freely while a sender sleeps between chunks.
+        self.uia_section = nullcontext
         self._owner_cache: Optional[OwnerInfo] = None
         self._owner_lookup_retry_after = 0.0
         self._stop_event = threading.Event()
@@ -3225,7 +3234,14 @@ class WechatUiaClient:
             min(int(self.config.get("uia_text_chunk_chars", 500)), 2000),
         )
         chunks = self._split_message_text(text, chunk_limit)
-        with self.operation_lock:
+        # ``_send_lock`` only serializes competing senders. Humanized pacing
+        # (send interval + per-conversation cooldown) waits under it but
+        # OUTSIDE ``uia_section``/``operation_lock``, so conversation scanning
+        # and attachment reads keep running while this sender sleeps. Each
+        # chunk then performs its bounded UI work (focus, locate, paste,
+        # verify) inside an exclusive UIA section; the per-chunk
+        # focus/locate/title checks make interleaved scans safe.
+        with self._send_lock:
             logger.info(
                 "[WechatDesktop] sending text: target=%s chars=%s chunks=%s "
                 "chunk_lengths=%s content_hash=%s",
@@ -3240,41 +3256,50 @@ class WechatUiaClient:
                 try:
                     if not expedited:
                         self._wait_for_send_slot(who)
-                    self.focus_window()
-                    if not self.locate_conversation(who, runtime_id, row_index):
-                        raise RuntimeError(f"Conversation is not visible: {who}")
-                    # Defense in depth: never paste into a detail pane that
-                    # still shows a different chat title (failed session switch).
-                    active = self.get_title()
-                    if not conversation_titles_match(active.title, who):
-                        raise RuntimeError(
-                            f"Active chat is {active.title!r}, expected {who!r}"
-                        )
-                    before = self.get_chat_history(limit=5)
-                    with self._clipboard(unicode_text=chunk):
-                        try:
-                            self._paste_and_send(expected_text=chunk)
-                        except RuntimeError as exc:
-                            if "did not clear the reply input" not in str(exc):
-                                raise
-                            # The UIA ValuePattern can lag behind a successful
-                            # click. Verify first so the fallback cannot send a
-                            # duplicate, then reacquire the input before Enter.
-                            result = self._verify_send(
-                                who, before, text=chunk
+                    with self.uia_section(), self.operation_lock:
+                        self.focus_window()
+                        if not self.locate_conversation(
+                            who, runtime_id, row_index
+                        ):
+                            raise RuntimeError(
+                                f"Conversation is not visible: {who}"
                             )
-                            if not result.get("verified"):
-                                if not self._send_existing_input_with_enter(chunk):
+                        # Defense in depth: never paste into a detail pane that
+                        # still shows a different chat title (failed session
+                        # switch).
+                        active = self.get_title()
+                        if not conversation_titles_match(active.title, who):
+                            raise RuntimeError(
+                                f"Active chat is {active.title!r}, expected {who!r}"
+                            )
+                        before = self.get_chat_history(limit=5)
+                        with self._clipboard(unicode_text=chunk):
+                            try:
+                                self._paste_and_send(expected_text=chunk)
+                            except RuntimeError as exc:
+                                if "did not clear the reply input" not in str(exc):
                                     raise
+                                # The UIA ValuePattern can lag behind a
+                                # successful click. Verify first so the
+                                # fallback cannot send a duplicate, then
+                                # reacquire the input before Enter.
                                 result = self._verify_send(
                                     who, before, text=chunk
                                 )
                                 if not result.get("verified"):
-                                    raise exc
-                        else:
-                            result = self._verify_send(
-                                who, before, text=chunk
-                            )
+                                    if not self._send_existing_input_with_enter(
+                                        chunk
+                                    ):
+                                        raise
+                                    result = self._verify_send(
+                                        who, before, text=chunk
+                                    )
+                                    if not result.get("verified"):
+                                        raise exc
+                            else:
+                                result = self._verify_send(
+                                    who, before, text=chunk
+                                )
                     results.append(result)
                     if not expedited:
                         now = time.monotonic()
@@ -3286,6 +3311,15 @@ class WechatUiaClient:
                             chunk,
                             str(result.get("runtime_id") or ""),
                         )
+                    else:
+                        # Sent-but-unverified: the UI action completed but the
+                        # outgoing bubble was not confirmed in time. We do NOT
+                        # retry (to avoid duplicates), so treat the message as
+                        # "probably sent" and suppress the echo.  Register the
+                        # text without a runtime_id so is_known_outgoing_message
+                        # can still match on content and prevent a self-reply
+                        # loop if the bubble appears on the next scan.
+                        self.remember_outgoing_message(who, chunk)
                 except Exception as exc:
                     raise RuntimeError(
                         f"WeChat text chunk {index}/{len(chunks)} failed: {exc}"
@@ -3308,15 +3342,17 @@ class WechatUiaClient:
         paths = [str(Path(path).resolve()) for path in files]
         if not paths or any(not Path(path).is_file() for path in paths):
             raise ValueError("one or more files do not exist")
-        with self.operation_lock:
+        with self._send_lock:
+            # Pacing waits stay outside the UIA section (see send_message).
             self._wait_for_send_slot(who)
-            self.focus_window()
-            if not self.locate_conversation(who, runtime_id, row_index):
-                raise RuntimeError(f"Conversation is not visible: {who}")
-            before = self.get_chat_history(limit=5)
-            with self._clipboard(files=paths):
-                self._paste_and_send()
-            result = self._verify_send(who, before, expected_type="file")
+            with self.uia_section(), self.operation_lock:
+                self.focus_window()
+                if not self.locate_conversation(who, runtime_id, row_index):
+                    raise RuntimeError(f"Conversation is not visible: {who}")
+                before = self.get_chat_history(limit=5)
+                with self._clipboard(files=paths):
+                    self._paste_and_send()
+                result = self._verify_send(who, before, expected_type="file")
             now = time.monotonic()
             self._last_send_at = now
             self._last_conversation_send[str(who)] = now

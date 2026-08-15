@@ -466,6 +466,161 @@ def test_expedited_send_skips_pacing_and_does_not_delay_next_reply(monkeypatch):
     assert client._last_conversation_send == {}
 
 
+def test_send_pacing_waits_outside_the_uia_section(monkeypatch):
+    """Humanized pacing must never hold the UIA lease that blocks scanning."""
+    client = WechatUiaClient({"uia_text_chunk_chars": 100})
+    timeline = []
+    section_depth = 0
+
+    @contextmanager
+    def tracking_section():
+        nonlocal section_depth
+        section_depth += 1
+        timeline.append(("section_enter", section_depth))
+        try:
+            yield
+        finally:
+            section_depth -= 1
+            timeline.append(("section_exit", section_depth))
+
+    client.uia_section = tracking_section
+
+    def wait_for_slot(_who):
+        timeline.append(("pacing_wait", section_depth))
+
+    @contextmanager
+    def fake_clipboard(unicode_text=None, files=None):
+        yield
+
+    monkeypatch.setattr(client, "_wait_for_send_slot", wait_for_slot)
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(
+        client, "get_title", lambda: HeaderInfo("target", "private", 1)
+    )
+    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "_clipboard", fake_clipboard)
+    monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
+    monkeypatch.setattr(
+        client,
+        "_verify_send",
+        lambda *_args, **_kwargs: {"success": True, "verified": True},
+    )
+
+    result = client.send_message("target", "X" * 240)
+
+    assert result["success"] is True
+    pacing_entries = [entry for entry in timeline if entry[0] == "pacing_wait"]
+    section_enters = [entry for entry in timeline if entry[0] == "section_enter"]
+    # Three chunks: each pacing wait happens with no UIA section held, and
+    # each chunk's UI work runs inside exactly one section.
+    assert len(pacing_entries) == 3
+    assert all(depth == 0 for _, depth in pacing_entries)
+    assert len(section_enters) == 3
+    assert all(depth == 1 for _, depth in section_enters)
+
+
+def test_send_file_pacing_waits_outside_the_uia_section(monkeypatch, tmp_path):
+    client = WechatUiaClient({})
+    timeline = []
+    section_depth = 0
+
+    @contextmanager
+    def tracking_section():
+        nonlocal section_depth
+        section_depth += 1
+        try:
+            yield
+        finally:
+            section_depth -= 1
+
+    client.uia_section = tracking_section
+    monkeypatch.setattr(
+        client,
+        "_wait_for_send_slot",
+        lambda _who: timeline.append(("pacing_wait", section_depth)),
+    )
+
+    @contextmanager
+    def fake_clipboard(unicode_text=None, files=None):
+        yield
+
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "_clipboard", fake_clipboard)
+    monkeypatch.setattr(
+        client,
+        "_paste_and_send",
+        lambda: timeline.append(("paste", section_depth)),
+    )
+    monkeypatch.setattr(
+        client,
+        "_verify_send",
+        lambda *_args, **_kwargs: {"success": True, "verified": True},
+    )
+    media = tmp_path / "photo.png"
+    media.write_bytes(b"data")
+
+    result = client.send_file("Alice", [str(media)])
+
+    assert result["verified"] is True
+    assert timeline == [("pacing_wait", 0), ("paste", 1)]
+
+
+def test_unverified_send_registers_text_to_suppress_echo(monkeypatch):
+    """Text sent but unverified must still register to prevent self-reply loops."""
+    client = WechatUiaClient({"uia_text_chunk_chars": 500})
+
+    @contextmanager
+    def fake_clipboard(unicode_text=None, files=None):
+        yield
+
+    monkeypatch.setattr(client, "focus_window", lambda: None)
+    monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(
+        client, "get_title", lambda: HeaderInfo("Alice", "private", 1)
+    )
+    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "_clipboard", fake_clipboard)
+    monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
+    monkeypatch.setattr(
+        client,
+        "_verify_send",
+        lambda *_args, **_kwargs: {"success": True, "verified": False},
+    )
+    # Do NOT monkeypatch remember_outgoing_message — we need the real cache written.
+
+    result = client.send_message("Alice", "hello")
+
+    assert result["verified"] is False
+    # Unverified send must still populate the outgoing cache so that
+    # is_known_outgoing_message can suppress the echo on the next scan.
+    echo_message = UiaChatMessage("Alice", "hello", direction="unknown")
+    assert client.is_known_outgoing_message("Alice", echo_message) is True
+
+
+def test_select_reply_target_skips_outgoing_bubbles_in_private_chat(monkeypatch):
+    """OCR-confirmed outgoing direction acts as backstop against self-reply loops."""
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1)]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    # Message history: two incoming, then one outgoing (OCR labeled it).
+    # The outgoing bubble is not in known_outgoing_message cache (e.g., after restart).
+    client.histories["Alice"] = [
+        UiaChatMessage("Alice", "how are you?", direction="incoming", runtime_id="1"),
+        UiaChatMessage("Alice", "please reply", direction="incoming", runtime_id="2"),
+        UiaChatMessage("Me", "I'm fine", direction="outgoing", runtime_id="3"),
+    ]
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+
+    _, events = driver.observe_events()
+
+    # Should select "please reply" (last incoming), not "I'm fine" (outgoing).
+    assert len(events) == 1
+    assert events[0].content == "please reply"
+
+
 class GeometryControl:
     def __init__(
         self,

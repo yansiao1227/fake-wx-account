@@ -11,22 +11,56 @@ from typing import Dict, Iterable, List, Optional
 
 from channel.wechat_desktop.models import WechatDesktopEvent
 
+# Schema version used to gate one-time startup migrations.
+# Bump this whenever a new migration is added to _run_startup_migrations().
+_SCHEMA_MIGRATION_VERSION = 2
+
 
 class WechatDesktopStore:
-    """Persistent event ledger, audit trail, and rate limiter."""
+    """Persistent event ledger, audit trail, and rate limiter.
+
+    Connection strategy
+    -------------------
+    Each thread keeps one long-lived SQLite connection in ``_tls`` (thread-
+    local storage).  WAL mode and foreign-key enforcement are set once per
+    connection rather than on every operation.  The ``_lock`` (RLock) still
+    serialises writes from the caller's perspective so that the single-writer
+    WAL constraint is never violated from within this process.
+
+    Startup migrations
+    ------------------
+    ``normalize_outgoing_history`` and ``deduplicate_conversation_history``
+    used to run unconditionally at channel startup, doing full-table scans
+    regardless of history size.  They now run **at most once** per database
+    file: the ``state`` table records the last completed migration version,
+    and ``_run_startup_migrations`` is a no-op when the version is current.
+    """
 
     def __init__(self, path: str):
         self.path = path
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._tls = threading.local()
         self._init_schema()
 
-    def _connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+    # ------------------------------------------------------------------
+    # Connection management
+    # ------------------------------------------------------------------
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """Return this thread's long-lived connection, creating it if needed."""
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._tls.conn = conn
+        return conn
+
+    def _connect(self) -> sqlite3.Connection:
+        """Alias kept for internal callers that use ``with self._connect() as db``."""
+        return self._get_connection()
 
     def _init_schema(self):
         with self._lock, self._connect() as db:
@@ -85,6 +119,54 @@ class WechatDesktopStore:
                     WHERE source_event_id != '';
                 """
             )
+
+    # ------------------------------------------------------------------
+    # Startup migrations (run at most once per DB file per version)
+    # ------------------------------------------------------------------
+
+    def run_startup_migrations(self, normalizer=None) -> dict:
+        """Run one-time data migrations guarded by a version stamp in ``state``.
+
+        Returns a dict with counts of changes made (all zeros when already
+        up-to-date so the caller can decide whether to log anything).
+        """
+        result = {"normalized": 0, "deduplicated": 0}
+        version_key = "schema_migration_version"
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT value FROM state WHERE key=?", (version_key,)
+            ).fetchone()
+            current_version = int(json.loads(row["value"])) if row else 0
+
+        if current_version >= _SCHEMA_MIGRATION_VERSION:
+            return result
+
+        # Migration 1: normalise outgoing drafting wrappers.
+        if current_version < 1 and normalizer is not None:
+            result["normalized"] = self.normalize_outgoing_history(normalizer)
+
+        # Migration 2: remove near-duplicate baseline imports.
+        if current_version < 2:
+            result["deduplicated"] = self.deduplicate_conversation_history()
+
+        with self._lock, self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO state(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE
+                    SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (
+                    version_key,
+                    json.dumps(_SCHEMA_MIGRATION_VERSION),
+                    time.time(),
+                ),
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    # Event ledger
+    # ------------------------------------------------------------------
 
     def record_event(self, event: WechatDesktopEvent) -> bool:
         with self._lock, self._connect() as db:

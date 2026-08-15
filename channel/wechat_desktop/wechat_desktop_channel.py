@@ -344,19 +344,18 @@ class WechatDesktopChannel(ChatChannel):
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
         self._policy = WechatDesktopPolicy(self.config, self._store)
-        normalized_history = self._store.normalize_outgoing_history(
-            _normalize_auto_reply_text
+        migration_result = self._store.run_startup_migrations(
+            normalizer=_normalize_auto_reply_text
         )
-        if normalized_history:
+        if migration_result.get("normalized"):
             logger.info(
                 "[WechatDesktop] normalized %s stored outgoing messages",
-                normalized_history,
+                migration_result["normalized"],
             )
-        deduplicated_history = self._store.deduplicate_conversation_history()
-        if deduplicated_history:
+        if migration_result.get("deduplicated"):
             logger.info(
                 "[WechatDesktop] removed %s duplicate stored messages",
-                deduplicated_history,
+                migration_result["deduplicated"],
             )
         self._bootstrapped = False
         self._last_cleanup_at = 0.0

@@ -470,19 +470,34 @@ class WechatUiaDriver(WechatDesktopBackend):
         conversation_id: str = "",
         conversation_name: str = "",
     ) -> tuple[int, Optional[UiaChatMessage]]:
-        """Classify visible nodes newest-first without using message direction."""
+        """Return the newest visible message that should trigger a reply.
+
+        Skips, in order:
+        1. Interim tool-notice bubbles registered by this channel.
+        2. Messages known to be our own outgoing text (verified or
+           sent-but-unverified, both registered by send_message).
+        3. For private chats: messages whose OCR direction is unambiguously
+           ``outgoing`` — a backstop that catches bubbles that appeared after
+           an unverified send and were not yet registered in the outgoing
+           cache (e.g. because the channel restarted between send and scan).
+           ``direction == "unknown"`` is kept so that OCR failures never
+           silently suppress real incoming messages.
+        4. For group chats: messages that do not mention the bot owner.
+        """
         if not messages:
             return -1, None
+        is_known_outgoing = getattr(self.client, "is_known_outgoing_message", None)
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             if self._is_interim_message(conversation_id, message):
                 continue
-            is_known_outgoing = getattr(
-                self.client, "is_known_outgoing_message", None
-            )
-            if is_known_outgoing and is_known_outgoing(
-                conversation_name, message
-            ):
+            if is_known_outgoing and is_known_outgoing(conversation_name, message):
+                continue
+            # Backstop for private chats: skip bubbles that OCR confidently
+            # determined are outgoing even when the cache has no record of them.
+            # direction=="unknown" is intentionally not skipped — an OCR miss
+            # must not suppress a real incoming message.
+            if not is_group and message.direction == "outgoing":
                 continue
             if not is_group or self._mentions_owner(message.content, owner):
                 return index, message

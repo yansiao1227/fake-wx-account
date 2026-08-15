@@ -168,19 +168,28 @@ class WechatSendOperations:
         self._selector_resolver = selector_resolver
         self._reply_session = reply_session
         self._observation_reader = observation_reader
+        # The client performs its own bounded UI work under this per-section
+        # reply-priority lease. Acquiring it per send section (instead of
+        # wrapping the whole send here) keeps humanized pacing waits from
+        # blocking scans: the lease is only held while UIA is actually used.
+        if hasattr(client, "uia_section"):
+            client.uia_section = reply_session
 
     def send_text(self, conversation: str, text: str, *, expedited: bool = False) -> dict:
-        """发送文本；进度提示可通过 ``expedited`` 跳过拟人化节流。"""
+        """发送文本；进度提示可通过 ``expedited`` 跳过拟人化节流。
 
-        with self._reply_session():
-            selector = self._selector_resolver(conversation)
-            kwargs = {
-                "runtime_id": selector.runtime_id,
-                "row_index": selector.row_index,
-            }
-            if expedited:
-                kwargs["expedited"] = True
-            result = self._client.send_message(selector.title, text, **kwargs)
+        不在这里整体持有回复租约：客户端按有界 UI 段自行获取
+        （``client.uia_section``），拟人化发送间隔在租约之外等待。
+        """
+
+        selector = self._selector_resolver(conversation)
+        kwargs = {
+            "runtime_id": selector.runtime_id,
+            "row_index": selector.row_index,
+        }
+        if expedited:
+            kwargs["expedited"] = True
+        result = self._client.send_message(selector.title, text, **kwargs)
         return build_delivery_result(result, self._observation_reader())
 
     def send_image(self, conversation: str, image_path: str) -> dict:
@@ -189,12 +198,11 @@ class WechatSendOperations:
         path = str(resolve_local_media_path(image_path))
         if not Path(path).is_file():
             raise FileNotFoundError(f"image file does not exist: {path}")
-        with self._reply_session():
-            selector = self._selector_resolver(conversation)
-            result = self._client.send_file(
-                selector.title,
-                [path],
-                runtime_id=selector.runtime_id,
-                row_index=selector.row_index,
-            )
+        selector = self._selector_resolver(conversation)
+        result = self._client.send_file(
+            selector.title,
+            [path],
+            runtime_id=selector.runtime_id,
+            row_index=selector.row_index,
+        )
         return build_delivery_result(result, self._observation_reader())
