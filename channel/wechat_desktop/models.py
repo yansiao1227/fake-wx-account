@@ -62,6 +62,8 @@ class UiaReferencedMessage:
     original_content: str = ""
     url: str = ""
     platform: str = ""
+    browser_content: str = ""
+    browser_status: str = ""
     fetched_content: str = ""
     fetch_status: str = ""
     knowledge_content: str = ""

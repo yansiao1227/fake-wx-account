@@ -1799,8 +1799,9 @@ class WechatUiaClient:
                     file_path = self.fetch_message_file(original)
                 title, platform = self._share_card_metadata(original.content)
                 share_url = ""
+                browser_content = ""
                 if original.message_type == "share_card" and original.bounds:
-                    share_url = self.fetch_share_url_from_point(
+                    browser_content, share_url = self.fetch_share_page_from_point(
                         self._share_card_activation_point(original.bounds)
                     )
                 resolved_reference = UiaReferencedMessage(
@@ -1813,20 +1814,25 @@ class WechatUiaClient:
                     message_type=original.message_type,
                     file_path=file_path,
                     resolved=(
-                        original.message_type != "share_card" or bool(share_url)
+                        original.message_type != "share_card"
+                        or bool(browser_content or share_url)
                     ),
                     degraded=(
                         original.message_type in {"image", "file"}
                         and not file_path
                     ),
                     strategy=(
-                        "wechat_share_browser_copy_link"
+                        "wechat_share_browser_direct_read"
+                        if browser_content
+                        else "wechat_share_browser_copy_link"
                         if share_url
                         else "wechat_locate_original"
                     ),
                     original_content=original.content,
                     url=share_url,
                     platform=platform,
+                    browser_content=browser_content,
+                    browser_status=("success" if browser_content else "unavailable"),
                 )
                 resolved_message = replace(message, reference=resolved_reference)
         except Exception as exc:
@@ -1856,7 +1862,10 @@ class WechatUiaClient:
             resolved_message.reference is not None
             and resolved_message.reference.message_type == "share_card"
         ):
-            if resolved_message.reference.url:
+            if (
+                resolved_message.reference.browser_content
+                or resolved_message.reference.url
+            ):
                 return resolved_message
             if not restored:
                 return replace(
@@ -1867,15 +1876,23 @@ class WechatUiaClient:
                         strategy="wechat_locate_original_return_failed",
                     ),
                 )
-            url = self.fetch_referenced_share_url(resolved_message)
+            browser_content, url = self.fetch_referenced_share_page(
+                resolved_message
+            )
             return replace(
                 resolved_message,
                 reference=replace(
                     resolved_message.reference,
                     url=url,
-                    resolved=bool(url),
-                    degraded=not bool(url),
-                    strategy="wechat_share_browser_copy_link",
+                    browser_content=browser_content,
+                    browser_status=("success" if browser_content else "unavailable"),
+                    resolved=bool(browser_content or url),
+                    degraded=not bool(browser_content or url),
+                    strategy=(
+                        "wechat_share_browser_direct_read"
+                        if browser_content
+                        else "wechat_share_browser_copy_link"
+                    ),
                 ),
             )
         return resolved_message
@@ -2031,12 +2048,13 @@ class WechatUiaClient:
             return True
 
         win32gui.EnumWindows(callback, None)
-        # COM/UIA must not run inside EnumWindows' native callback.
-        candidates = []
-        for value in native_candidates:
-            more, close = self._verified_share_browser_controls(value, main_hwnd)
-            if more is not None and close is not None:
-                candidates.append(value)
+        # Direct page reading only needs a verified WeChatAppEx window. Menu
+        # and close controls are optional and are resolved later for fallback.
+        candidates = [
+            value
+            for value in native_candidates
+            if self._is_verified_share_browser_window(value, main_hwnd)
+        ]
         if foreground in candidates:
             return foreground
         return candidates[0] if len(candidates) == 1 else 0
@@ -2143,29 +2161,62 @@ class WechatUiaClient:
             return False
 
     def _close_share_browser(self, browser_hwnd: int, main_hwnd: int) -> bool:
+        import win32con
         import win32gui
 
-        _more, close = self._verified_share_browser_controls(
-            browser_hwnd, main_hwnd
+        # The HWND has already passed the strict WeChatAppEx verification.
+        # Do not enumerate the dynamic WebView UIA tree again just to find its
+        # titlebar: on feed pages that scan can block for tens of seconds.
+        timeout = max(
+            0.25,
+            min(
+                float(
+                    self.config.get(
+                        "uia_share_browser_close_timeout_seconds", 2
+                    )
+                ),
+                5.0,
+            ),
         )
-        if close is None:
-            return False
-        if not self._click_control_point(close):
-            return False
-        self._paced_wait(
-            "uia_share_browser_close_settle_ms_min",
-            "uia_share_browser_close_settle_ms_max",
-            250,
-            500,
-        )
-        closed = not (
-            win32gui.IsWindow(browser_hwnd)
-            and win32gui.IsWindowVisible(browser_hwnd)
-        )
-        return bool(closed and self._restore_main_window_after_viewer(main_hwnd))
+        deadline = time.monotonic() + timeout
+        closed = False
+        for attempt in range(2):
+            win32gui.PostMessage(browser_hwnd, win32con.WM_CLOSE, 0, 0)
+            while time.monotonic() < deadline:
+                if not (
+                    win32gui.IsWindow(browser_hwnd)
+                    and win32gui.IsWindowVisible(browser_hwnd)
+                ):
+                    closed = True
+                    break
+                if self._stop_event.wait(0.1):
+                    break
+            if closed:
+                break
+        restored = bool(closed and self._restore_main_window_after_viewer(main_hwnd))
+        if restored:
+            logger.info(
+                "[WechatDesktop][share-browser] closed hwnd=%s", browser_hwnd
+            )
+        return restored
 
     def fetch_referenced_share_url(self, message: UiaChatMessage) -> str:
         """Open a verified share-card quote and copy its browser URL."""
+
+        _content, url = self._fetch_referenced_share(message, direct_read=False)
+        return url
+
+    def fetch_referenced_share_page(
+        self, message: UiaChatMessage
+    ) -> tuple[str, str]:
+        """Read a quoted share card in WeChat, falling back to its URL."""
+
+        return self._fetch_referenced_share(message, direct_read=True)
+
+    def _fetch_referenced_share(
+        self, message: UiaChatMessage, *, direct_read: bool
+    ) -> tuple[str, str]:
+        """Open a verified share-card quote and return page text plus fallback URL."""
 
         reference = message.reference
         if (
@@ -2173,30 +2224,297 @@ class WechatUiaClient:
             or reference.message_type != "share_card"
             or not message.bounds
         ):
-            return ""
+            return "", ""
         try:
             self.focus_window()
             with self.operation_lock, self._uia_root() as root:
                 control = self._find_message_control(root, message)
                 click_bounds = _bounds(control) if control is not None else message.bounds
                 if not click_bounds:
-                    return ""
+                    return "", ""
                 point = self._reference_image_activation_point(click_bounds)
-            return self.fetch_share_url_from_point(point)
+            return self._fetch_share_from_point(point, direct_read=direct_read)
         except Exception as exc:
             logger.warning(
                 "[WechatDesktop] failed to prepare share quote activation: %s",
                 exc,
             )
+            return "", ""
+
+    def _read_share_browser_content(self, browser_hwnd: int) -> str:
+        """Read the rendered document from WeChat UIA, then use clipboard fallback."""
+
+        value = self._wait_for_share_browser_content(browser_hwnd)
+        if value:
+            return value
+        logger.info(
+            "[WechatDesktop][share-browser] UIA document text unavailable "
+            "after load wait hwnd=%s; trying clipboard fallback",
+            browser_hwnd,
+        )
+
+        try:
+            import win32api
+            import win32con
+            import win32gui
+
+            left, top, right, bottom = (
+                int(value) for value in win32gui.GetWindowRect(browser_hwnd)
+            )
+            if right <= left or bottom <= top:
+                return ""
+            win32gui.SetForegroundWindow(browser_hwnd)
+            # Focus below the browser chrome so Ctrl+A targets the rendered page.
+            content_point = (
+                int((left + right) / 2),
+                int(top + (bottom - top) * 0.45),
+            )
+            self._left_click_point(content_point)
+            self._paced_wait(
+                "uia_share_browser_direct_read_settle_ms_min",
+                "uia_share_browser_direct_read_settle_ms_max",
+                300,
+                600,
+            )
+
+            def copy_page():
+                self._press_shortcut(win32api, win32con, ord("A"))
+                self._press_shortcut(win32api, win32con, ord("C"))
+                self._paced_wait(
+                    "uia_share_browser_clipboard_settle_ms_min",
+                    "uia_share_browser_clipboard_settle_ms_max",
+                    200,
+                    450,
+                )
+
+            value = self._normalize_share_browser_content(
+                self._clipboard_unicode_after(copy_page)
+            )
+            if value:
+                logger.info(
+                    "[WechatDesktop][share-browser] direct read success "
+                    "hwnd=%s source=clipboard chars=%s lines=%s",
+                    browser_hwnd,
+                    len(value),
+                    value.count("\n") + 1,
+                )
+            return value
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop][share-browser] clipboard read failed "
+                "hwnd=%s error=%s",
+                browser_hwnd,
+                exc,
+            )
             return ""
+
+    def _read_share_browser_uia_content_once(self, browser_hwnd: int) -> str:
+        """Return the currently exposed UIA document without a deep tree walk."""
+
+        try:
+            import uiautomation as auto
+
+            maximum = max(
+                1,
+                int(
+                    self.config.get(
+                        "uia_share_browser_direct_read_max_chars", 50000
+                    )
+                ),
+            )
+            with auto.UIAutomationInitializerInThread():
+                root = auto.ControlFromHandle(browser_hwnd)
+                document = None
+                for control in [root, *self._walk(root, 128)]:
+                    if "document" in _text(
+                        getattr(control, "ControlTypeName", "")
+                    ).casefold():
+                        document = control
+                        break
+                if document is None:
+                    return ""
+
+                # Chromium/WebView documents expose their whole accessible text
+                # through TextPattern.  Reading that range is both faster and
+                # more predictable than recursively expanding a dynamic page's
+                # thousands of UIA descendants on every poll.
+                try:
+                    pattern = document.GetTextPattern()
+                    if pattern is not None:
+                        value = self._normalize_share_browser_content(
+                            pattern.DocumentRange.GetText(maximum)
+                        )
+                        if value:
+                            return value
+                except Exception:
+                    pass
+
+                # Some WeChat builds omit TextPattern. Keep a small compatibility
+                # fallback, bounded tightly so a live feed cannot stall a probe.
+                names = []
+                title = _text(getattr(document, "Name", ""))
+                if title:
+                    names.append(title)
+                for control in self._walk(document, 256):
+                    control_type = _text(
+                        getattr(control, "ControlTypeName", "")
+                    ).casefold()
+                    if "text" not in control_type:
+                        continue
+                    name = _text(getattr(control, "Name", ""))
+                    if name and (not names or names[-1] != name):
+                        names.append(name)
+                return self._normalize_share_browser_content("\n".join(names))
+        except Exception as exc:
+            logger.warning(
+                "[WechatDesktop][share-browser] UIA document probe failed "
+                "hwnd=%s error=%s",
+                browser_hwnd,
+                exc,
+            )
+            return ""
+
+    def _wait_for_share_browser_content(self, browser_hwnd: int) -> str:
+        """Poll until a usable UIA document remains stable for several probes."""
+
+        timeout = max(
+            0.0,
+            min(
+                float(self.config.get("uia_share_browser_load_timeout_seconds", 6)),
+                30.0,
+            ),
+        )
+        poll_ms = max(
+            50,
+            min(int(self.config.get("uia_share_browser_load_poll_ms", 250)), 2000),
+        )
+        minimum_wait = max(
+            0.0,
+            min(
+                int(self.config.get("uia_share_browser_load_min_wait_ms", 800)),
+                10000,
+            )
+            / 1000.0,
+        )
+        stable_required = max(
+            1,
+            min(
+                int(self.config.get("uia_share_browser_content_stable_polls", 2)),
+                10,
+            ),
+        )
+        ready_chars = max(
+            int(self.config.get("uia_share_browser_direct_read_min_chars", 20)),
+            int(self.config.get("uia_share_browser_direct_read_ready_chars", 80)),
+        )
+        started = time.monotonic()
+        deadline = started + timeout
+        probes = 0
+        stable_count = 0
+        previous = ""
+        best = ""
+        logger.info(
+            "[WechatDesktop][share-browser] waiting for page content "
+            "hwnd=%s timeout_ms=%s poll_ms=%s stable_polls=%s",
+            browser_hwnd,
+            int(timeout * 1000),
+            poll_ms,
+            stable_required,
+        )
+        while True:
+            probes += 1
+            value = self._read_share_browser_uia_content_once(browser_hwnd)
+            if len(value) > len(best):
+                best = value
+                logger.info(
+                    "[WechatDesktop][share-browser] page content progress "
+                    "hwnd=%s probe=%s chars=%s elapsed_ms=%s",
+                    browser_hwnd,
+                    probes,
+                    len(value),
+                    int((time.monotonic() - started) * 1000),
+                )
+            if len(value) >= ready_chars:
+                stable_count = stable_count + 1 if value == previous else 1
+            else:
+                stable_count = 0
+            elapsed = time.monotonic() - started
+            if (
+                stable_count >= stable_required
+                and elapsed >= minimum_wait
+            ):
+                logger.info(
+                    "[WechatDesktop][share-browser] direct read success "
+                    "hwnd=%s source=uia_document chars=%s lines=%s "
+                    "probes=%s elapsed_ms=%s",
+                    browser_hwnd,
+                    len(value),
+                    value.count("\n") + 1,
+                    probes,
+                    int(elapsed * 1000),
+                )
+                return value
+            previous = value
+            if time.monotonic() >= deadline:
+                logger.info(
+                    "[WechatDesktop][share-browser] page content wait timed out "
+                    "hwnd=%s probes=%s best_chars=%s ready_chars=%s elapsed_ms=%s",
+                    browser_hwnd,
+                    probes,
+                    len(best),
+                    ready_chars,
+                    int((time.monotonic() - started) * 1000),
+                )
+                return best if len(best) >= ready_chars else ""
+            if self._stop_event.wait(poll_ms / 1000.0):
+                raise RuntimeError("WeChat UI Automation is stopping")
+
+    def _normalize_share_browser_content(self, value: str) -> str:
+        value = str(value or "").replace("\x00", "").replace("\r\n", "\n").strip()
+        value = re.sub(r"[\t ]{3,}", "  ", value)
+        value = re.sub(r"\n{4,}", "\n\n\n", value)
+        minimum = max(
+            1,
+            int(self.config.get("uia_share_browser_direct_read_min_chars", 20)),
+        )
+        is_url_only = bool(
+            re.fullmatch(r"https?://[^\s]+", value, re.IGNORECASE)
+            and self._is_safe_public_url(value)
+        )
+        if len(value) < minimum or is_url_only:
+            return ""
+        maximum = max(
+            minimum,
+            int(self.config.get("uia_share_browser_direct_read_max_chars", 50000)),
+        )
+        return value[:maximum]
 
     def fetch_share_url_from_point(self, point: tuple[int, int]) -> str:
         """Open a share card at a verified message point and copy its URL."""
+
+        _content, url = self._fetch_share_from_point(point, direct_read=False)
+        return url
+
+    def fetch_share_page_from_point(
+        self, point: tuple[int, int]
+    ) -> tuple[str, str]:
+        """Read a share card in WeChat, copying its URL only as fallback."""
+
+        return self._fetch_share_from_point(point, direct_read=True)
+
+    def _fetch_share_from_point(
+        self, point: tuple[int, int], *, direct_read: bool
+    ) -> tuple[str, str]:
+        """Open one verified share browser and return rendered text or fallback URL."""
 
         main_hwnd = self.get_owner_window_handle()
         visible_before = self._visible_top_level_window_handles()
         browser_hwnd = 0
         try:
+            logger.info(
+                "[WechatDesktop][share-browser] opening card direct_read=%s",
+                direct_read,
+            )
             self._left_click_point(point)
             self._paced_wait(
                 "uia_share_browser_open_settle_ms_min",
@@ -2208,13 +2526,32 @@ class WechatUiaClient:
                 main_hwnd, visible_before
             )
             if not browser_hwnd:
-                return ""
+                logger.warning(
+                    "[WechatDesktop][share-browser] opened window was not detected"
+                )
+                return "", ""
+            logger.info(
+                "[WechatDesktop][share-browser] verified hwnd=%s direct_read=%s",
+                browser_hwnd,
+                direct_read,
+            )
+            if direct_read and bool(
+                self.config.get("uia_share_browser_direct_read_enabled", True)
+            ):
+                content = self._read_share_browser_content(browser_hwnd)
+                if content:
+                    return content, ""
+                logger.info(
+                    "[WechatDesktop][share-browser] direct read unavailable "
+                    "hwnd=%s; falling back to copy link",
+                    browser_hwnd,
+                )
             more, _close = self._verified_share_browser_controls(
                 browser_hwnd, main_hwnd
             )
             more_bounds = _bounds(more) if more is not None else None
             if not more_bounds:
-                return ""
+                return "", ""
             more_point = (
                 int((more_bounds[0] + more_bounds[2]) / 2),
                 int((more_bounds[1] + more_bounds[3]) / 2),
@@ -2240,10 +2577,15 @@ class WechatUiaClient:
             value = self._clipboard_unicode_after(copy_action)
             if not self._is_safe_public_url(value):
                 value = ""
-            return value
+            logger.info(
+                "[WechatDesktop][share-browser] copy-link fallback %s hwnd=%s",
+                "success" if value else "failed",
+                browser_hwnd,
+            )
+            return "", value
         except Exception as exc:
             logger.warning("[WechatDesktop] failed to copy share URL: %s", exc)
-            return ""
+            return "", ""
         finally:
             if browser_hwnd:
                 if not self._close_share_browser(browser_hwnd, main_hwnd):

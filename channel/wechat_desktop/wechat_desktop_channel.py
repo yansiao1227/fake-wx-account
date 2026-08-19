@@ -113,6 +113,9 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
         if reference_type == "share_card":
             url = str(reference.get("url") or "").strip()
             platform = str(reference.get("platform") or "").strip()
+            browser_content = str(
+                reference.get("browser_content") or ""
+            ).strip()
             fetched = str(reference.get("fetched_content") or "").strip()
             fetch_status = str(reference.get("fetch_status") or "").strip()
             knowledge = str(reference.get("knowledge_content") or "").strip()
@@ -124,17 +127,20 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
                 parts.append(f"平台：{platform}")
             if url:
                 parts.append(f"链接：{url}")
-            if fetched:
+            if browser_content:
+                parts.append(f"微信内置浏览器页面正文：\n{browser_content}")
+            elif fetched:
                 parts.append(f"WebFetch 网页结果：\n{fetched}")
             elif fetch_status:
                 parts.append("WebFetch 网页结果不可用。")
-            if knowledge:
-                parts.append(
-                    f"knowledge-acquisition 平台解析结果：\n{knowledge}"
-                )
-            elif knowledge_status and knowledge_status != "disabled":
-                parts.append("knowledge-acquisition 平台解析结果不可用。")
-            if not fetched and not knowledge:
+            if not browser_content:
+                if knowledge:
+                    parts.append(
+                        f"knowledge-acquisition 平台解析结果：\n{knowledge}"
+                    )
+                elif knowledge_status and knowledge_status != "disabled":
+                    parts.append("knowledge-acquisition 平台解析结果不可用。")
+            if not browser_content and not fetched and not knowledge:
                 parts.append("两路内容均不可用；不要根据标题猜测页面内容。")
             reference_content = "\n".join(parts)
         elif reference_type == "image" and reference_path:
@@ -244,10 +250,20 @@ def _preflight_tool_notice_data(event: WechatDesktopEvent) -> dict | None:
     if event.reference:
         reference_type = str(event.reference.get("content_type") or "").lower()
         reference_path = str(event.reference.get("file_path") or "")
+        if reference_type == "share_card":
+            return {
+                "tool_name": "微信内置浏览器",
+                "notice_template_key": "share_browser_notice_templates",
+            }
         if reference_type in {"image", "file"}:
             if not reference_path:
                 return None
             content_type, path = reference_type, reference_path
+    if content_type == "share_card":
+        return {
+            "tool_name": "微信内置浏览器",
+            "notice_template_key": "share_browser_notice_templates",
+        }
     if content_type == "image":
         return {"tool_name": "vision", "arguments": {"path": path}}
     if content_type != "file":
@@ -1582,7 +1598,7 @@ class WechatDesktopChannel(ChatChannel):
             return False
 
     def _send_share_content_fetch_notice(self, item: ReplyQueueItem) -> bool:
-        """在已确认分享链接、即将双路提取时发送专用趣味提示。"""
+        """浏览器提示未发送时，在网络回退前补发一次趣味提示。"""
         if not bool(self.config.get("agent_tool_notice_enabled", True)):
             return False
         context = {

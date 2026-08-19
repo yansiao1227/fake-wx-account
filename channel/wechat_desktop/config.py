@@ -74,6 +74,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
         "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
     ],
+    "share_browser_notice_templates": [
+        "我钻进微信内置浏览器翻翻这张卡片，马上把重点捞回来 🧭",
+        "微信内置浏览器的小窗已经推开，我去页面里巡一圈，稍等片刻 👀",
+        "卡片先别跑，我让微信内置浏览器现场开箱，看看里面藏了什么 📦",
+    ],
     "share_content_fetch_notice_templates": [
         "网页侦察兵和平台解析器已经兵分两路，正在给这张卡片做拆解 🕵️",
         "链接拿到了，`web_fetch` 和知识提取器正组队搬运内容 🌐",
@@ -96,8 +101,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_send_images": True,
     "analyze_incoming_images": False,
     "resolve_message_references": True,
-    # 引用分享卡片后抄链接：点开内置浏览器、展开菜单、写入剪贴板、关闭回主窗
-    # 各步的随机等待（毫秒）。过小容易点空，机器慢或菜单弹不出时再加大。
+    # 引用分享卡片优先直接读取微信内置浏览器正文；读不到时才复制链接并走网络解析。
+    # 各步的随机等待（毫秒）。过小容易点空，机器慢或页面未加载时再加大。
+    "uia_share_browser_direct_read_enabled": True,
+    "uia_share_browser_direct_read_settle_ms_min": 300,
+    "uia_share_browser_direct_read_settle_ms_max": 600,
+    "uia_share_browser_direct_read_min_chars": 20,
+    # 微信 WebView 没有 Playwright 的 DOMContentLoaded 事件可等，因此参考 browser
+    # tool 的“短暂等待初始渲染”策略，轮询 UIA Document，正文连续稳定后才读取。
+    "uia_share_browser_load_timeout_seconds": 6,
+    "uia_share_browser_load_poll_ms": 250,
+    "uia_share_browser_load_min_wait_ms": 800,
+    "uia_share_browser_content_stable_polls": 2,
+    "uia_share_browser_direct_read_ready_chars": 80,
+    "uia_share_browser_direct_read_max_chars": 50000,
     "uia_share_browser_open_settle_ms_min": 600,
     "uia_share_browser_open_settle_ms_max": 1200,
     "uia_share_browser_menu_settle_ms_min": 250,
@@ -106,7 +123,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "uia_share_browser_clipboard_settle_ms_max": 450,
     "uia_share_browser_close_settle_ms_min": 250,
     "uia_share_browser_close_settle_ms_max": 500,
-    # 分享卡片双路解析里的平台提取器（knowledge-acquisition skill，与 web_fetch 并行）。
+    "uia_share_browser_close_timeout_seconds": 2,
+    # 回复期间微信 UI 重建/滚动后，同一消息可能短暂消失再出现；按其 UIA runtime
+    # 身份抑制重复入队。新气泡会获得新的 runtime id，不影响用户重复追问。
+    "uia_recent_target_suppression_seconds": 300,
+    # 直接读取内置浏览器失败后的双路回退解析。
+    # 平台提取器（knowledge-acquisition skill）与 web_fetch 并行。
     # 关则只跑 web_fetch；skill_path 为空时按仓库 skills 目录约定查找。
     # 视频字幕：skill 只拉 ≤60 秒 B 站官方字幕，通道会再补拉官方/AI 字幕（不限时长）。
     "knowledge_acquisition_enabled": True,

@@ -105,12 +105,16 @@ class WechatUiaDriver(WechatDesktopBackend):
         self._rows = {}
         self._conversation_selectors = {}
         self._emitted_targets: dict[str, str] = {}
+        self._recent_emitted_identities: dict[
+            str, OrderedDict[tuple[str, str], float]
+        ] = {}
         self._message_snapshots: dict[str, list[UiaChatMessage]] = {}
         self._known_groups = {str(x) for x in config.get("auto_reply_groups", [])}
         self._known_group_keys: set[str] = set()
         self._reply_in_flight = threading.Event()
         self._reply_conversation = ""
         self._reply_conversation_id = ""
+        self._reply_baseline_identities: set[tuple[str, str]] = set()
         self._last_reply_monitor_at = 0.0
         self._interim_texts: dict[str, set[str]] = {}
         self._attachment_cache_lock = threading.RLock()
@@ -169,6 +173,13 @@ class WechatUiaDriver(WechatDesktopBackend):
         with self._operation_lock:
             self._reply_conversation = str(conversation or "")
             self._reply_conversation_id = str(conversation_id or "")
+            self._reply_baseline_identities = {
+                identity
+                for message in self._message_snapshots.get(
+                    self._reply_conversation_id, []
+                )
+                if (identity := self._recent_target_identity(message)) is not None
+            }
             self._last_reply_monitor_at = 0.0
             self._reply_in_flight.set()
 
@@ -177,6 +188,7 @@ class WechatUiaDriver(WechatDesktopBackend):
             conversation_id = self._reply_conversation_id
             self._reply_conversation = ""
             self._reply_conversation_id = ""
+            self._reply_baseline_identities.clear()
             self._last_reply_monitor_at = 0.0
             self._reply_in_flight.clear()
             if conversation_id:
@@ -342,6 +354,56 @@ class WechatUiaDriver(WechatDesktopBackend):
         )
         return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
+    def _recent_target_identity(
+        self, message: UiaChatMessage
+    ) -> Optional[tuple[str, str]]:
+        runtime_id = str(message.runtime_id or "").strip()
+        if not runtime_id:
+            return None
+        return runtime_id, self._content_signature(message)
+
+    def _was_recently_emitted(
+        self, conversation_id: str, message: UiaChatMessage
+    ) -> bool:
+        identity = self._recent_target_identity(message)
+        if identity is None:
+            return False
+        now = time.monotonic()
+        window = max(
+            5.0,
+            min(
+                float(
+                    self.config.get(
+                        "uia_recent_target_suppression_seconds", 300
+                    )
+                ),
+                3600.0,
+            ),
+        )
+        recent = self._recent_emitted_identities.setdefault(
+            conversation_id, OrderedDict()
+        )
+        while recent:
+            _old_identity, created_at = next(iter(recent.items()))
+            if created_at >= now - window:
+                break
+            recent.popitem(last=False)
+        return identity in recent
+
+    def _remember_emitted_target(
+        self, conversation_id: str, message: UiaChatMessage
+    ) -> None:
+        identity = self._recent_target_identity(message)
+        if identity is None:
+            return
+        recent = self._recent_emitted_identities.setdefault(
+            conversation_id, OrderedDict()
+        )
+        recent.pop(identity, None)
+        recent[identity] = time.monotonic()
+        while len(recent) > 100:
+            recent.popitem(last=False)
+
     @staticmethod
     def _message_signature(message: UiaChatMessage) -> tuple[str, str]:
         return message.message_type, str(message.content or "")
@@ -489,6 +551,13 @@ class WechatUiaDriver(WechatDesktopBackend):
         is_known_outgoing = getattr(self.client, "is_known_outgoing_message", None)
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
+            if (
+                self.reply_in_flight
+                and conversation_id == self._reply_conversation_id
+                and self._recent_target_identity(message)
+                in self._reply_baseline_identities
+            ):
+                continue
             if self._is_interim_message(conversation_id, message):
                 continue
             if is_known_outgoing and is_known_outgoing(conversation_name, message):
@@ -869,6 +938,8 @@ class WechatUiaDriver(WechatDesktopBackend):
                     "original_content": message.reference.original_content,
                     "url": message.reference.url,
                     "platform": message.reference.platform,
+                    "browser_content": message.reference.browser_content,
+                    "browser_status": message.reference.browser_status,
                     "fetched_content": message.reference.fetched_content,
                     "fetch_status": message.reference.fetch_status,
                     "knowledge_content": message.reference.knowledge_content,
@@ -1157,8 +1228,15 @@ class WechatUiaDriver(WechatDesktopBackend):
                     with self._operation_lock:
                         already_emitted = (
                             self._emitted_targets.get(row_key) == target_key
+                            or self._was_recently_emitted(row_key, message)
                         )
                     if already_emitted:
+                        self._trace(
+                            "06-target",
+                            "conversation=%s selected=False reason=recent_target_identity runtime=%s",
+                            name,
+                            message.runtime_id or "<empty>",
+                        )
                         continue
                     history = self._history_snapshot(
                         messages, target_index, is_group, row_key
@@ -1178,6 +1256,7 @@ class WechatUiaDriver(WechatDesktopBackend):
                     if event is not None:
                         with self._operation_lock:
                             self._emitted_targets[row_key] = target_key
+                            self._remember_emitted_target(row_key, message)
                         events.append(event)
                 return self._observation(
                     visible_conversations=len(rows),
@@ -1272,6 +1351,7 @@ class WechatUiaDriver(WechatDesktopBackend):
             )
             if replacement_event is not None:
                 self._emitted_targets[event.conversation_id] = target_key
+                self._remember_emitted_target(event.conversation_id, target)
         return ReplyTargetValidation(
             False,
             "a newer reply target replaced this message",
@@ -1300,6 +1380,14 @@ class WechatUiaDriver(WechatDesktopBackend):
     ) -> WechatDesktopEvent:
         reference = event.reference
         if str(reference.get("content_type") or "").lower() != "share_card":
+            return event
+        browser_content = str(reference.get("browser_content") or "").strip()
+        if browser_content:
+            reference["browser_status"] = "success"
+            reference["fetch_status"] = "direct_browser"
+            reference["fetched_content"] = ""
+            reference["knowledge_status"] = "direct_browser"
+            reference["knowledge_content"] = ""
             return event
         url = str(reference.get("url") or "").strip()
         if not url:
@@ -1447,6 +1535,8 @@ class WechatUiaDriver(WechatDesktopBackend):
                 "original_content": reference.original_content,
                 "url": reference.url,
                 "platform": reference.platform,
+                "browser_content": reference.browser_content,
+                "browser_status": reference.browser_status,
                 "fetched_content": reference.fetched_content,
                 "fetch_status": reference.fetch_status,
                 "knowledge_content": reference.knowledge_content,

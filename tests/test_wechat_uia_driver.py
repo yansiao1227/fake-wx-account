@@ -3422,6 +3422,19 @@ def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
         "inspect",
         reference={"content_type": "file", "file_path": r"C:\tmp\quoted.pdf"},
     )
+    share_reference = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "讲了什么",
+        reference={"content_type": "share_card", "content": "分享标题"},
+    )
+    standalone_share = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", "share_card", "分享标题"
+    )
     text_event = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "hello"
     )
@@ -3438,6 +3451,12 @@ def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     assert _tool_notice_subject(
         _preflight_tool_notice_data(pdf_reference)
     ) == ("skill", "pdf-reader")
+    share_notice = _preflight_tool_notice_data(share_reference)
+    assert _tool_notice_subject(share_notice) == ("tool", "微信内置浏览器")
+    assert share_notice["notice_template_key"] == "share_browser_notice_templates"
+    assert _tool_notice_subject(
+        _preflight_tool_notice_data(standalone_share)
+    ) == ("tool", "微信内置浏览器")
     assert _preflight_tool_notice_data(text_event) is None
 
 
@@ -3579,6 +3598,49 @@ def test_message_snapshot_distinguishes_new_identical_message():
 
     assert next_snapshot[0].stable_id == first[0].stable_id
     assert next_snapshot[1].stable_id != first[0].stable_id
+
+
+def test_recent_runtime_identity_prevents_reemit_after_target_temporarily_disappears():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1, signature="first")]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [
+        incoming("一条临时可见的旧消息", "old-runtime"),
+        incoming("讲了啥", "question-runtime"),
+    ]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+
+    _, first_events = driver.observe_events()
+    driver.begin_reply_cycle("Alice", first_events[0].conversation_id)
+    client.histories["Alice"] = [incoming("一条临时可见的旧消息", "old-runtime")]
+    _, transient_events = driver.observe_events()
+    client.histories["Alice"] = [incoming("讲了啥", "question-runtime")]
+    _, reappeared_events = driver.observe_events()
+
+    assert transient_events == []
+    assert reappeared_events == []
+
+
+def test_same_text_with_new_runtime_identity_is_a_new_message():
+    client = FakeClient()
+    client.rows = [row("Alice", unread=1, signature="first")]
+    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
+    client.histories["Alice"] = [incoming("讲了啥", "first-runtime")]
+    driver = WechatUiaDriver(
+        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
+    )
+
+    _, first_events = driver.observe_events()
+    driver.begin_reply_cycle("Alice", first_events[0].conversation_id)
+    client.histories["Alice"] = [
+        incoming("讲了啥", "first-runtime"),
+        incoming("讲了啥", "second-runtime"),
+    ]
+    _, second_events = driver.observe_events()
+
+    assert [event.content for event in second_events] == ["讲了啥"]
 
 
 def test_group_reply_monitor_does_not_reemit_target_when_visible_index_shifts():
@@ -4276,6 +4338,62 @@ def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
     ]
 
 
+def test_share_browser_notice_is_displayed_only_once_before_materialization():
+    channel = _bare_wechat_channel()
+    channel._stop_event = threading.Event()
+    channel._reply_queue = WechatReplyQueue()
+    event = WechatDesktopEvent(
+        "message",
+        "a",
+        "Alice",
+        "a",
+        "Alice",
+        "text",
+        "讲了什么",
+        reference={"content_type": "share_card", "content": "分享标题"},
+    )
+    setattr(event, "_deferred_materialization_events", [event])
+    assert channel._reply_queue.enqueue(event)
+    original_finish = channel._reply_queue.finish
+
+    def finish(item, terminal):
+        original_finish(item, terminal)
+        channel._stop_event.set()
+
+    channel._reply_queue.finish = finish
+    notices = []
+    channel._service = SimpleNamespace(update_status=lambda **_kwargs: None)
+    channel._store = SimpleNamespace(
+        mark_event_processed=lambda _event_id: None,
+        audit=lambda *_args, **_kwargs: None,
+    )
+    channel._driver = SimpleNamespace(
+        begin_reply_cycle=lambda *_args: None,
+        end_reply_cycle=lambda: None,
+    )
+    channel._mark_lifecycle = lambda *_args, **_kwargs: None
+    channel._finish_lifecycle = lambda *_args, **_kwargs: None
+    channel._send_deferred_attachment_notice = (
+        lambda _item: notices.append("微信内置浏览器") or True
+    )
+    channel._send_share_content_fetch_notice = (
+        lambda _item: notices.append("网络回退") or True
+    )
+
+    def materialize(events, *, before_share_fetch=None):
+        before_share_fetch()
+        before_share_fetch()
+        return events[-1]
+
+    channel._materialize_batch = materialize
+    channel._dispatch_message = lambda *_args: False
+
+    channel._consume_reply_queue()
+
+    assert notices == ["微信内置浏览器"]
+    assert getattr(event, "_preflight_attachment_notice_sent") is True
+
+
 def test_reply_timeout_sends_final_failure_notice():
     channel = _bare_wechat_channel()
     channel._stop_event = threading.Event()
@@ -4558,6 +4676,49 @@ def test_share_reference_fetches_url_after_uia_materialization():
     assert "页面正文" in result.reference["fetched_content"]
 
 
+def test_share_reference_uses_wechat_browser_content_without_network_fetch():
+    fetcher = SimpleNamespace(
+        execute=lambda _args: (_ for _ in ()).throw(
+            AssertionError("direct WeChat browser content must bypass web_fetch")
+        )
+    )
+    extractor = SimpleNamespace(
+        extract=lambda _url: (_ for _ in ()).throw(
+            AssertionError(
+                "direct WeChat browser content must bypass knowledge acquisition"
+            )
+        )
+    )
+    driver = WechatUiaDriver(
+        {"knowledge_acquisition_enabled": True},
+        client=FakeClient(),
+        shell_hook=FakeHook(),
+        web_fetcher=fetcher,
+        knowledge_extractor=extractor,
+    )
+    event = WechatDesktopEvent(
+        "message",
+        "conversation",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "总结一下",
+        reference={
+            "content_type": "share_card",
+            "content": "分享标题",
+            "browser_content": "这是微信内置浏览器直接读取到的页面正文。",
+            "browser_status": "success",
+        },
+    )
+
+    result = driver._fetch_share_reference(event)
+
+    assert result.reference["fetch_status"] == "direct_browser"
+    assert result.reference["knowledge_status"] == "direct_browser"
+    assert result.reference["fetched_content"] == ""
+
+
 def test_share_reference_without_url_never_calls_web_fetch():
     fetcher = SimpleNamespace(
         execute=lambda _args: (_ for _ in ()).throw(
@@ -4643,6 +4804,121 @@ def test_share_browser_flow_clicks_quote_right_clicks_more_and_closes(monkeypatc
     ]
 
 
+def test_share_browser_direct_read_skips_copy_link_and_closes(monkeypatch):
+    client = WechatUiaClient({})
+    calls = []
+    monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
+    monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
+    monkeypatch.setattr(
+        client, "_left_click_point", lambda point: calls.append(("open", point))
+    )
+    monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(client, "_find_opened_share_browser", lambda *_args: 200)
+    monkeypatch.setattr(
+        client,
+        "_read_share_browser_content",
+        lambda hwnd: calls.append(("read", hwnd)) or "页面标题\n页面正文内容",
+    )
+    monkeypatch.setattr(
+        client,
+        "_verified_share_browser_controls",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("successful direct read must not open the copy-link menu")
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "_close_share_browser",
+        lambda *args: calls.append(("close", args)) or True,
+    )
+
+    content, url = client.fetch_share_page_from_point((400, 500))
+
+    assert content == "页面标题\n页面正文内容"
+    assert url == ""
+    assert calls == [
+        ("open", (400, 500)),
+        ("read", 200),
+        ("close", (200, 100)),
+    ]
+
+
+def test_share_browser_reads_uia_document_without_clipboard(monkeypatch):
+    import uiautomation as auto
+
+    title = GeometryControl((0, 0, 800, 40), "文章标题")
+    title.ControlTypeName = "TextControl"
+    paragraph = GeometryControl((0, 40, 800, 200), "这是文章正文，足够长，可以直接读取。")
+    paragraph.ControlTypeName = "TextControl"
+    document = GeometryControl(
+        (0, 0, 800, 600), "文章标题", children=[title, paragraph]
+    )
+    document.ControlTypeName = "DocumentControl"
+    root = GeometryControl((0, 0, 800, 700), children=[document])
+    client = WechatUiaClient(
+        {
+            "uia_share_browser_load_timeout_seconds": 0,
+            "uia_share_browser_load_min_wait_ms": 0,
+            "uia_share_browser_content_stable_polls": 1,
+            "uia_share_browser_direct_read_ready_chars": 20,
+        }
+    )
+    monkeypatch.setattr(auto, "ControlFromHandle", lambda _hwnd: root)
+    monkeypatch.setattr(
+        client,
+        "_clipboard_unicode_after",
+        lambda _action: (_ for _ in ()).throw(
+            AssertionError("UIA document success must not touch the clipboard")
+        ),
+    )
+
+    content = client._read_share_browser_content(200)
+
+    assert "文章标题" in content
+    assert "这是文章正文" in content
+
+
+def test_share_browser_waits_until_uia_content_is_stable(monkeypatch):
+    client = WechatUiaClient(
+        {
+            "uia_share_browser_load_timeout_seconds": 2,
+            "uia_share_browser_load_poll_ms": 100,
+            "uia_share_browser_load_min_wait_ms": 0,
+            "uia_share_browser_content_stable_polls": 2,
+            "uia_share_browser_direct_read_ready_chars": 20,
+        }
+    )
+    clock = [0.0]
+    probes = iter(
+        [
+            "",
+            "页面正在加载",
+            "页面标题\n这是加载完成后的完整正文内容。",
+            "页面标题\n这是加载完成后的完整正文内容。",
+        ]
+    )
+    calls = []
+
+    def read_once(_hwnd):
+        calls.append(clock[0])
+        return next(probes)
+
+    def wait(seconds):
+        clock[0] += seconds
+        return False
+
+    monkeypatch.setattr(client, "_read_share_browser_uia_content_once", read_once)
+    monkeypatch.setattr(client, "_stop_event", SimpleNamespace(wait=wait))
+    monkeypatch.setattr(
+        "channel.wechat_desktop.uia_client.time.monotonic", lambda: clock[0]
+    )
+
+    content = client._wait_for_share_browser_content(200)
+
+    assert content == "页面标题\n这是加载完成后的完整正文内容。"
+    assert len(calls) == 4
+
+
 def test_share_context_contains_fetch_result():
     event = WechatDesktopEvent(
         "message",
@@ -4669,6 +4945,34 @@ def test_share_context_contains_fetch_result():
     rendered = "\n".join(lines)
     assert "[第三方分享卡片] 分享标题" in rendered
     assert "页面正文" in rendered
+
+
+def test_share_context_prefers_wechat_browser_content():
+    event = WechatDesktopEvent(
+        "message",
+        "conversation",
+        "Alice",
+        "alice",
+        "Alice",
+        "text",
+        "总结一下",
+        reference={
+            "sender_name": "Bob",
+            "content_type": "share_card",
+            "content": "分享标题",
+            "browser_content": "微信浏览器直接读取的正文",
+            "fetch_status": "direct_browser",
+            "knowledge_status": "direct_browser",
+        },
+    )
+
+    _heading, lines = _render_event_context_lines(event)
+
+    rendered = "\n".join(lines)
+    assert "微信内置浏览器页面正文" in rendered
+    assert "微信浏览器直接读取的正文" in rendered
+    assert "WebFetch 网页结果不可用" not in rendered
+    assert "knowledge-acquisition 平台解析结果不可用" not in rendered
 
 
 def test_image_reference_opens_current_quote_region_without_locating_original(
