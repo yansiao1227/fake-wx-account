@@ -466,7 +466,10 @@ class Agent:
                     logger.info("[Agent] Cleared Agent message history after executor recovery")
             raise
         finally:
-            self._close_browser_tools()
+            # BrowserTool/BrowseService owns its lifecycle.  Do not close it
+            # at the end of every reply: the service keeps the browser alive
+            # across turns and releases it after its configured idle timeout.
+            pass
 
         # Sync executor's messages back to agent (thread-safe).
         # If the executor trimmed context, its message list is shorter than
@@ -488,7 +491,12 @@ class Agent:
 
 
     def _close_browser_tools(self):
-        """Close browser windows spawned during this run."""
+        """Explicitly close browser tools when the owning agent is disposed.
+
+        This is intentionally not called from ``run_stream``.  BrowserService
+        has its own idle-timeout lifecycle so a desktop WeChat conversation can
+        reuse the browser between replies.
+        """
         for tool in list(self.tools or []):
             if getattr(tool, "name", "") != "browser":
                 continue
