@@ -213,9 +213,26 @@ class BrowserTool(BaseTool):
             "reply `/install-browser`" if summary.get("is_desktop")
             else "run `cow install-browser` in a terminal"
         )
+        reason = ((summary.get("engine") or {}).get("reason") or "").strip()
+        if not summary.get("has_playwright"):
+            detail = (
+                "the Playwright Python package is missing, so the installed Chrome/Edge "
+                "cannot be driven yet"
+            )
+        elif summary.get("has_system_chrome"):
+            detail = (
+                "a system Chrome/Edge was found, but the browser tool still cannot start "
+                f"({reason or 'engine not ready'})"
+            )
+        else:
+            detail = (
+                "no Google Chrome/Edge and no downloaded Chromium were found "
+                f"({reason or 'no browser engine'})"
+            )
         return ToolResult.fail(
-            f"Browser tool not ready. Ask the user to {install_hint} (installs a browser engine; "
-            "skipped automatically if Google Chrome is already installed). "
+            f"Browser tool not ready: {detail}. Ask the user to {install_hint} "
+            "(installs Playwright and, if needed, a browser engine; Chromium download is "
+            "skipped automatically when Google Chrome is already installed). "
             "Do not retry until the user confirms."
         )
 

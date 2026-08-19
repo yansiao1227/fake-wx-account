@@ -465,6 +465,8 @@ class Agent:
                     self.messages.clear()
                     logger.info("[Agent] Cleared Agent message history after executor recovery")
             raise
+        finally:
+            self._close_browser_tools()
 
         # Sync executor's messages back to agent (thread-safe).
         # If the executor trimmed context, its message list is shorter than
@@ -483,6 +485,20 @@ class Agent:
         self._execute_post_process_tools()
 
         return response
+
+
+    def _close_browser_tools(self):
+        """Close browser windows spawned during this run."""
+        for tool in list(self.tools or []):
+            if getattr(tool, "name", "") != "browser":
+                continue
+            closer = getattr(tool, "close", None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except Exception as e:
+                logger.debug(f"[Agent] browser close failed: {e}")
 
     def clear_history(self):
         """Clear conversation history and captured actions"""

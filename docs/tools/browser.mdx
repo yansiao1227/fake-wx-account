@@ -128,6 +128,8 @@ Both use the persistent login below and behave identically.
 
 Works out of the box. Login state is saved under `~/.cow/browser_profile`. No configuration needed.
 
+Login state is saved in this isolated directory and reused on later runs. The spawned browser window is closed automatically when the Agent run finishes.
+
 To disable persistence and start with a clean environment every time:
 
 ```json

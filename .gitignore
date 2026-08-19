@@ -1,24 +1,46 @@
+# OS and IDE files
 .DS_Store
-.idea
-.vscode
-.venv
-.vs
+.idea/
+.vscode/
+.vs/
+.cursor/
+
+# Python environments and generated files
+.venv/
+venv*/
 __pycache__/
-venv*
 *.pyc
-python
+*.egg-info/
+.pytest_cache/
+.pytest_tmp/
+
+# Local configuration, state, and runtime output
 config.json
-QR.png
-nohup.out
-tmp
-plugins.json
-*.log
-logs/
-workspace
 config.yaml
+client_config.json
+plugins.json
 user_datas.pkl
 web_search_usage.db
+*.log
+logs/
+nohup.out
+.cow.pid
+QR.png
+python
+tmp/
+local/
+ref/
+workspace/
 chatgpt_tool_hub/
+**/.dev.vars
+
+# JavaScript and tool build output
+node_modules/
+dist/
+build/
+.wrangler/
+
+# Plugins: ignore all plugin contents except the bundled plugins below.
 plugins/**/
 !plugins/bdunit
 !plugins/dungeon
@@ -27,29 +49,13 @@ plugins/**/
 !plugins/tool
 !plugins/banwords
 !plugins/banwords/**/
-plugins/banwords/__pycache__
-plugins/banwords/lib/__pycache__
 !plugins/hello
 !plugins/role
 !plugins/keyword
 !plugins/linkai
 !plugins/cow_cli
-client_config.json
-ref/
-**/.dev.vars
-.cursor/
-local/
-node_modules/
 
-# cow cli
-dist/
-build/
-*.egg-info/
-.cow.pid
-
-# Desktop backend packaging: keep the source files (spec/requirements/script)
-# tracked even though the generic build/ rule above ignores them, but never
-# track the build outputs or local venv.
+# Desktop backend packaging: keep source metadata, ignore build outputs.
 !desktop/build/
 desktop/build/*
 !desktop/build/cowagent-backend.spec
@@ -58,8 +64,5 @@ desktop/build/*
 !desktop/build/entitlements.mac.plist
 !desktop/build/notarize-dmg.sh
 
-# Icon authoring scratch dir: intermediate assets used to produce the final
-# icons. Only the finished icons under desktop/resources/ should be committed.
+# Icon authoring scratch files.
 desktop/resources/.icon-work/
-
-.wrangler/
