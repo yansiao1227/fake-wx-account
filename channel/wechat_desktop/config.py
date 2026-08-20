@@ -33,6 +33,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 全局两次发送间隔（毫秒，随机区间）
     "uia_send_interval_ms_min": 1000,
     "uia_send_interval_ms_max": 2000,
+    # 每条气泡粘贴上限。更长的回复会按句号/换行切开后连续发送。
+    "uia_text_chunk_chars": 2000,
     "uia_conversation_cooldown_seconds": 5,
     "outgoing_echo_suppression_seconds": 300,
     "uia_owner_lookup_timeout_seconds": 2.0,

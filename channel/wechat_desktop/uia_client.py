@@ -3573,7 +3573,7 @@ class WechatUiaClient:
             raise ValueError("text is empty")
         chunk_limit = max(
             100,
-            min(int(self.config.get("uia_text_chunk_chars", 500)), 2000),
+            min(int(self.config.get("uia_text_chunk_chars", 500)), 4000),
         )
         chunks = self._split_message_text(text, chunk_limit)
         # ``_send_lock`` only serializes competing senders. Humanized pacing
