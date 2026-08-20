@@ -118,10 +118,6 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
             ).strip()
             fetched = str(reference.get("fetched_content") or "").strip()
             fetch_status = str(reference.get("fetch_status") or "").strip()
-            knowledge = str(reference.get("knowledge_content") or "").strip()
-            knowledge_status = str(
-                reference.get("knowledge_status") or ""
-            ).strip()
             parts = [f"[第三方分享卡片] {reference_content or '标题不可用'}"]
             if platform:
                 parts.append(f"平台：{platform}")
@@ -133,15 +129,8 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
                 parts.append(f"WebFetch 网页结果：\n{fetched}")
             elif fetch_status:
                 parts.append("WebFetch 网页结果不可用。")
-            if not browser_content:
-                if knowledge:
-                    parts.append(
-                        f"knowledge-acquisition 平台解析结果：\n{knowledge}"
-                    )
-                elif knowledge_status and knowledge_status != "disabled":
-                    parts.append("knowledge-acquisition 平台解析结果不可用。")
-            if not browser_content and not fetched and not knowledge:
-                parts.append("两路内容均不可用；不要根据标题猜测页面内容。")
+            if not browser_content and not fetched:
+                parts.append("页面正文不可用；不要根据标题猜测页面内容。")
             reference_content = "\n".join(parts)
         elif reference_type == "image" and reference_path:
             reference_content = f"[图片: {reference_path}]"
@@ -1612,7 +1601,7 @@ class WechatDesktopChannel(ChatChannel):
             return self._send_agent_tool_notice(
                 context,
                 {
-                    "tool_name": "web_fetch + knowledge-acquisition",
+                    "tool_name": "web_fetch",
                     "notice_template_key": "share_content_fetch_notice_templates",
                 },
             )

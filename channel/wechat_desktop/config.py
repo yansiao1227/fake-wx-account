@@ -80,9 +80,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "卡片先别跑，我让微信内置浏览器现场开箱，看看里面藏了什么 📦",
     ],
     "share_content_fetch_notice_templates": [
-        "网页侦察兵和平台解析器已经兵分两路，正在给这张卡片做拆解 🕵️",
-        "链接拿到了，`web_fetch` 和知识提取器正组队搬运内容 🌐",
-        "卡片已经翻面，两路解析小分队同时出发，稍等我带情报回来 🚚",
+        "内置浏览器没读到正文，我改用 `web_fetch` 去拆这张卡片 🕵️",
+        "链接拿到了，`web_fetch` 正在把页面内容搬回来 🌐",
+        "卡片已经翻面，我去网上把正文捞回来，稍等片刻 🚚",
     ],
     "agent_failure_notice_enabled": True,
     "agent_failure_notice_templates": [
@@ -127,16 +127,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 回复期间微信 UI 重建/滚动后，同一消息可能短暂消失再出现；按其 UIA runtime
     # 身份抑制重复入队。新气泡会获得新的 runtime id，不影响用户重复追问。
     "uia_recent_target_suppression_seconds": 300,
-    # 直接读取内置浏览器失败后的双路回退解析。
-    # 平台提取器（knowledge-acquisition skill）与 web_fetch 并行。
-    # 关则只跑 web_fetch；skill_path 为空时按仓库 skills 目录约定查找。
-    # 视频字幕：skill 只拉 ≤60 秒 B 站官方字幕，通道会再补拉官方/AI 字幕（不限时长）。
-    "knowledge_acquisition_enabled": True,
-    "knowledge_acquisition_skill_path": "",
-    "knowledge_acquisition_node_executable": "node",
-    "knowledge_acquisition_timeout_seconds": 45,
-    "knowledge_acquisition_max_content_chars": 50000,
-    "knowledge_acquisition_fetch_subtitles": True,
+    # 直接读取内置浏览器失败后，回退到 web_fetch 拉取网页正文。
     "uia_image_viewer_enabled": True,
     "uia_image_viewer_before_close_ms_min": 300,
     "uia_image_viewer_before_close_ms_max": 500,

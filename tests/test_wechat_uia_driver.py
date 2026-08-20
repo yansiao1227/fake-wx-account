@@ -4682,19 +4682,11 @@ def test_share_reference_uses_wechat_browser_content_without_network_fetch():
             AssertionError("direct WeChat browser content must bypass web_fetch")
         )
     )
-    extractor = SimpleNamespace(
-        extract=lambda _url: (_ for _ in ()).throw(
-            AssertionError(
-                "direct WeChat browser content must bypass knowledge acquisition"
-            )
-        )
-    )
     driver = WechatUiaDriver(
-        {"knowledge_acquisition_enabled": True},
+        {},
         client=FakeClient(),
         shell_hook=FakeHook(),
         web_fetcher=fetcher,
-        knowledge_extractor=extractor,
     )
     event = WechatDesktopEvent(
         "message",
@@ -4715,7 +4707,6 @@ def test_share_reference_uses_wechat_browser_content_without_network_fetch():
     result = driver._fetch_share_reference(event)
 
     assert result.reference["fetch_status"] == "direct_browser"
-    assert result.reference["knowledge_status"] == "direct_browser"
     assert result.reference["fetched_content"] == ""
 
 
@@ -4962,7 +4953,6 @@ def test_share_context_prefers_wechat_browser_content():
             "content": "分享标题",
             "browser_content": "微信浏览器直接读取的正文",
             "fetch_status": "direct_browser",
-            "knowledge_status": "direct_browser",
         },
     )
 
@@ -4972,7 +4962,6 @@ def test_share_context_prefers_wechat_browser_content():
     assert "微信内置浏览器页面正文" in rendered
     assert "微信浏览器直接读取的正文" in rendered
     assert "WebFetch 网页结果不可用" not in rendered
-    assert "knowledge-acquisition 平台解析结果不可用" not in rendered
 
 
 def test_image_reference_opens_current_quote_region_without_locating_original(

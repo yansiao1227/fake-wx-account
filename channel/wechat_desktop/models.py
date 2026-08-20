@@ -66,8 +66,6 @@ class UiaReferencedMessage:
     browser_status: str = ""
     fetched_content: str = ""
     fetch_status: str = ""
-    knowledge_content: str = ""
-    knowledge_status: str = ""
 
 
 @dataclass(frozen=True)
