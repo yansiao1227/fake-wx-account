@@ -9,18 +9,16 @@ class WechatDesktopTool(BaseTool):
 
     name = "wechat_desktop"
     description = (
-        "Send a message through the normal Windows WeChat desktop client using "
-        "the dedicated wechat_desktop policy executor. Use this tool instead "
-        "of generic computer clicks for outbound WeChat messages. Allowlisted "
-        "text may send immediately; other actions are queued "
-        "for approval in the Web console."
+        "Send text through the dedicated wechat_desktop policy executor, or "
+        "report desktop WeChat status. For reading chat history, use the "
+        "separate wechat_history tool."
     )
     params = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["status", "send_text"],
+                "enum": ["status", "read_history", "send_text"],
             },
             "conversation": {
                 "type": "string",
@@ -37,6 +35,13 @@ class WechatDesktopTool(BaseTool):
                 "default": False,
                 "description": "Set true only when conversation is a group.",
             },
+            "limit": {
+                "type": "integer",
+                "default": 20,
+                "minimum": 1,
+                "maximum": 50,
+                "description": "Recent message count when action=read_history.",
+            },
         },
         "required": ["action"],
     }
@@ -48,6 +53,21 @@ class WechatDesktopTool(BaseTool):
             return ToolResult.success(
                 json.dumps(service.status(), ensure_ascii=False)
             )
+        if action == "read_history":
+            raw_limit = params.get("limit", 20)
+            try:
+                limit = int(raw_limit)
+            except (TypeError, ValueError):
+                return ToolResult.fail("limit must be an integer")
+            if limit < 1:
+                return ToolResult.fail("limit must be at least 1")
+            result = service.execute_agent_action(
+                "read_history", limit=min(limit, 50)
+            )
+            payload = json.dumps(result, ensure_ascii=False)
+            if result.get("status") == "error":
+                return ToolResult.fail(payload)
+            return ToolResult.success(payload)
         if action != "send_text":
             return ToolResult.fail(f"unsupported action: {action}")
 

@@ -36,7 +36,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 每条气泡粘贴上限。更长的回复会按句号/换行切开后连续发送。
     "uia_text_chunk_chars": 2000,
     "uia_conversation_cooldown_seconds": 5,
-    "outgoing_echo_suppression_seconds": 300,
+    # 已发送消息回声抑制：UIA runtime ID 长期保留，纯文本匹配仅作短时兜底。
+    "outgoing_echo_suppression_seconds": 1800,
+    "outgoing_echo_text_suppression_seconds": 120,
     "uia_owner_lookup_timeout_seconds": 2.0,
     "uia_owner_failure_cache_seconds": 60.0,
 
@@ -51,6 +53,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shell_hook_debounce_ms": 250,
     "reply_monitor_interval_seconds": 1.0,
     "active_conversation_burst_limit": 5,
+
+    # 当前会话聊天记录窗口读取。仅通过 UIA 读取，不写入本地会话历史库。
+    "wechat_history_read_enabled": True,
+    "wechat_history_max_messages": 50,
+    "wechat_history_open_timeout_seconds": 4.0,
+    "wechat_history_total_timeout_seconds": 8.0,
+    "wechat_history_scroll_settle_ms_min": 250,
+    "wechat_history_scroll_settle_ms_max": 500,
+    "wechat_history_max_scrolls": 12,
+    "wechat_history_no_progress_limit": 2,
+    "wechat_history_close_timeout_seconds": 2.0,
 
     # 自动回复准入策略。shadow_mode=True 时只观察，不向微信发送内容。
     "auto_reply_private_all": True,

@@ -83,6 +83,45 @@ class UiaChatMessage:
     reference: Optional[UiaReferencedMessage] = None
 
 
+@dataclass(frozen=True)
+class WechatHistoryMessage:
+    """微信独立聊天记录窗口中的一条只读消息快照。"""
+
+    sender_name: str
+    direction: str
+    content_type: str
+    content: str
+    time_text: str = ""
+    timestamp: Optional[str] = None
+    stable_id: str = ""
+    source: str = "wechat_history_dialog"
+    degraded: bool = False
+
+
+@dataclass(frozen=True)
+class WechatHistoryReadResult:
+    """一次当前会话聊天记录读取的结构化结果。"""
+
+    conversation_title: str
+    conversation_type: str
+    messages: List[WechatHistoryMessage]
+    requested_limit: int
+    returned_count: int
+    has_more: Optional[bool] = None
+    source: str = "wechat_history_dialog"
+    history_window_opened: bool = True
+    degraded: bool = False
+    warnings: Tuple[str, ...] = ()
+
+
+class WechatHistoryReadError(RuntimeError):
+    """携带稳定错误码的聊天记录读取异常。"""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = str(code or "uia_error")
+
+
 @dataclass
 class WechatDesktopEvent:
     """微信后端交给通道层的统一事件模型。"""

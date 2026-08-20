@@ -4,6 +4,7 @@ import json
 import pytest
 
 from agent.tools.wechat_desktop.wechat_desktop_tool import WechatDesktopTool
+from agent.tools.wechat_desktop.wechat_history_tool import WechatHistoryTool
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.policy import WechatDesktopPolicy
 from channel.wechat_desktop.service import reset_wechat_desktop_service_for_tests
@@ -395,6 +396,66 @@ def test_wechat_desktop_tool_routes_send_through_channel_executor(
             },
         )
     ]
+
+
+def test_wechat_desktop_tool_routes_current_history_read(tmp_path, monkeypatch):
+    service = reset_wechat_desktop_service_for_tests(
+        str(tmp_path / "wechat-history-tool.sqlite3")
+    )
+    calls = []
+    service.set_agent_executor(
+        lambda action, **params: calls.append((action, params))
+        or {
+            "status": "success",
+            "conversation": {"title": "颜料盒", "type": "private"},
+            "messages": [],
+            "requested_limit": params["limit"],
+            "returned_count": 0,
+        }
+    )
+    monkeypatch.setattr(
+        "agent.tools.wechat_desktop.wechat_desktop_tool.get_wechat_desktop_service",
+        lambda: service,
+    )
+
+    result = WechatDesktopTool().execute(
+        {"action": "read_history", "limit": 99}
+    )
+
+    assert result.status == "success"
+    assert json.loads(result.result)["requested_limit"] == 50
+    assert calls == [("read_history", {"limit": 50})]
+
+
+def test_wechat_desktop_tool_rejects_invalid_history_limit():
+    result = WechatDesktopTool().execute(
+        {"action": "read_history", "limit": 0}
+    )
+
+    assert result.status == "error"
+    assert "at least 1" in result.result
+
+
+def test_wechat_history_tool_is_separate_and_routes_recent_history(
+    tmp_path, monkeypatch
+):
+    service = reset_wechat_desktop_service_for_tests(
+        str(tmp_path / "wechat-history-dedicated.sqlite3")
+    )
+    calls = []
+    service.set_agent_executor(
+        lambda action, **params: calls.append((action, params))
+        or {"status": "success", "messages": [], "returned_count": 0}
+    )
+    monkeypatch.setattr(
+        "agent.tools.wechat_desktop.wechat_history_tool.get_wechat_desktop_service",
+        lambda: service,
+    )
+
+    result = WechatHistoryTool().execute({"limit": 50})
+
+    assert result.status == "success"
+    assert calls == [("read_history", {"limit": 50})]
 
 
 

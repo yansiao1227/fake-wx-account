@@ -21,6 +21,8 @@ from channel.wechat_desktop.models import (
     UiaChatMessage,
     UiaReferencedMessage,
     WechatDesktopEvent,
+    WechatHistoryMessage,
+    WechatHistoryReadResult,
 )
 from channel.wechat_desktop.operations import resolve_local_media_path
 from channel.wechat_desktop.shell_hook import WindowsShellHook
@@ -600,6 +602,32 @@ def test_unverified_send_registers_text_to_suppress_echo(monkeypatch):
     assert client.is_known_outgoing_message("Alice", echo_message) is True
 
 
+def test_outgoing_echo_uses_short_text_and_long_runtime_windows(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    client = WechatUiaClient(
+        {
+            "outgoing_echo_suppression_seconds": 1800,
+            "outgoing_echo_text_suppression_seconds": 120,
+        }
+    )
+    client.remember_outgoing_message("Alice", "收到", "bot-runtime")
+
+    clock[0] += 121
+
+    same_text_from_user = UiaChatMessage(
+        "Alice", "收到", direction="unknown", runtime_id="user-runtime"
+    )
+    rebuilt_outgoing = UiaChatMessage(
+        "", "内容可能变化", direction="unknown", runtime_id="bot-runtime"
+    )
+    assert client.is_known_outgoing_message("Alice", same_text_from_user) is False
+    assert client.is_known_outgoing_message("Alice", rebuilt_outgoing) is True
+
+    clock[0] += 1680
+    assert client.is_known_outgoing_message("Alice", rebuilt_outgoing) is False
+
+
 def test_select_reply_target_skips_outgoing_bubbles_in_private_chat(monkeypatch):
     """OCR-confirmed outgoing direction acts as backstop against self-reply loops."""
     client = FakeClient()
@@ -653,6 +681,103 @@ class ClickableGeometryControl(GeometryControl):
         self.click_count += 1
         if self.on_click:
             self.on_click()
+
+
+def _history_row(name, class_name="mmui::ChatTextItemView", runtime_id=(42, 1)):
+    row_control = GeometryControl((0, 0, 700, 80), name, class_name)
+    row_control.ControlTypeName = "ListItemControl"
+    row_control.GetRuntimeId = lambda: runtime_id
+    return row_control
+
+
+def test_history_row_parser_extracts_content_and_timestamp():
+    row_control = _history_row("你好 2026年8月20日 14:13")
+
+    message = WechatUiaClient._parse_history_row(row_control)
+
+    assert message.content == "你好"
+    assert message.time_text == "2026年8月20日 14:13"
+    assert message.timestamp.startswith("2026-08-20T14:13:00")
+    assert message.direction == "unknown"
+    assert message.sender_name == "unknown"
+    assert message.degraded is False
+
+
+def test_history_row_parser_marks_missing_time_as_degraded():
+    message = WechatUiaClient._parse_history_row(_history_row("只有正文"))
+
+    assert message.content == "只有正文"
+    assert message.timestamp is None
+    assert message.degraded is True
+
+
+def test_history_row_parser_ignores_non_message_controls():
+    control = GeometryControl((0, 0, 100, 30), "日期", "mmui::XButton")
+    control.ControlTypeName = "TabItemControl"
+
+    assert WechatUiaClient._parse_history_row(control) is None
+
+
+def test_history_rows_do_not_use_recycled_runtime_ids_for_identity():
+    first = _history_row(
+        "较新的消息 2026年8月20日 14:13", runtime_id=(42, 7)
+    )
+    older = _history_row(
+        "更早的消息 2026年8月20日 13:50", runtime_id=(42, 7)
+    )
+    history_list = GeometryControl(
+        (0, 0, 700, 500), children=[first, older]
+    )
+
+    rows = WechatUiaClient._read_history_rows(history_list)
+
+    assert len({identity for identity, _message in rows}) == 2
+
+
+def test_history_scroll_uses_verified_list_wheel_down_when_no_scroll_pattern():
+    calls = []
+
+    class HistoryList:
+        def GetScrollPattern(self):
+            return None
+
+        def WheelDown(self, **kwargs):
+            calls.append(kwargs)
+
+    assert WechatUiaClient._scroll_history_table_older(HistoryList()) is True
+    assert calls == [
+        {"wheelTimes": 8, "interval": 0.05, "waitTime": 0.1}
+    ]
+
+
+def test_driver_reads_history_under_reply_priority_lease(monkeypatch):
+    client = FakeClient()
+    expected = WechatHistoryReadResult(
+        conversation_title="颜料盒",
+        conversation_type="private",
+        messages=[
+            WechatHistoryMessage(
+                sender_name="unknown",
+                direction="unknown",
+                content_type="text",
+                content="历史消息",
+            )
+        ],
+        requested_limit=5,
+        returned_count=1,
+    )
+    client.read_current_chat_history = lambda limit: expected
+    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    states = []
+
+    def read(limit):
+        states.append(driver._reply_ui_pending.is_set())
+        return expected
+
+    client.read_current_chat_history = read
+
+    assert driver.read_current_chat_history(5) == expected
+    assert states == [True]
 
 
 def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):

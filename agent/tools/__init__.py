@@ -137,6 +137,19 @@ def _import_wechat_desktop_tool():
 
 WechatDesktopTool = _import_wechat_desktop_tool()
 
+
+def _import_wechat_history_tool():
+    from common.log import logger
+    try:
+        from agent.tools.wechat_desktop.wechat_history_tool import WechatHistoryTool
+        return WechatHistoryTool
+    except Exception as e:
+        logger.error(f"[Tools] WechatHistoryTool failed to load: {e}")
+        return None
+
+
+WechatHistoryTool = _import_wechat_history_tool()
+
 # MCP Tools (no extra dependencies, loaded on demand)
 def _import_mcp_tools():
     """导入 MCP 工具模块（无额外依赖，按需加载）"""
@@ -175,6 +188,7 @@ __all__ = [
     'Vision',
     'BrowserTool',
     'WechatDesktopTool',
+    'WechatHistoryTool',
     'McpTool',
 ]
 

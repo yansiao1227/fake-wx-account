@@ -14,6 +14,7 @@ import time
 import unicodedata
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 from urllib.parse import urlparse
@@ -28,6 +29,9 @@ from channel.wechat_desktop.models import (
     UNKNOWN_SENDER_NAME,
     UiaChatMessage,
     UiaReferencedMessage,
+    WechatHistoryMessage,
+    WechatHistoryReadError,
+    WechatHistoryReadResult,
 )
 from channel.wechat_desktop.operations import (
     conversation_titles_match,
@@ -37,7 +41,13 @@ from channel.wechat_desktop.operations import (
 SESSION_PREFIX = "session_item_"
 MESSAGE_LIST_ID = "chat_message_list"
 INPUT_ID = "chat_input_field"
+HISTORY_LIST_ID = "chat_log_message_list"
+HISTORY_WINDOW_CLASS = "mmui::SearchMsgUniqueChatWindow"
 MENTION_MARKERS = ("[有人@我]", "有人@我", "[Someone mentioned me]")
+HISTORY_TIME_RE = re.compile(
+    r"(?P<time>(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日\s*"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2}))\s*$"
+)
 
 
 def _text(value) -> str:
@@ -253,21 +263,38 @@ class WechatUiaClient:
     ) -> bool:
         key = _text(conversation)
         records = self._known_outgoing_messages.get(key, [])
-        window = max(
+        runtime_window = max(
             5.0,
             min(
                 float(self.config.get("outgoing_echo_suppression_seconds", 300)),
                 3600.0,
             ),
         )
-        cutoff = time.monotonic() - window
+        text_window = max(
+            0.0,
+            min(
+                float(
+                    self.config.get(
+                        "outgoing_echo_text_suppression_seconds", 120
+                    )
+                ),
+                runtime_window,
+            ),
+        )
+        now = time.monotonic()
+        cutoff = now - runtime_window
         records[:] = [record for record in records if record[2] >= cutoff]
         runtime = _text(message.runtime_id)
         content = _text(message.content)
         return any(
             (runtime and record_runtime and runtime == record_runtime)
-            or (content and record_text and content == record_text)
-            for record_text, record_runtime, _created_at in records
+            or (
+                content
+                and record_text
+                and content == record_text
+                and now - created_at <= text_window
+            )
+            for record_text, record_runtime, created_at in records
         )
 
     @staticmethod
@@ -929,6 +956,389 @@ class WechatUiaClient:
             "group" if count > 1 else ("private" if title else "unknown"),
             count,
         )
+
+    @classmethod
+    def _find_chat_history_button(cls, root):
+        candidates = []
+        for control in cls._walk(root):
+            name = _text(getattr(control, "Name", ""))
+            control_type = _text(getattr(control, "ControlTypeName", ""))
+            class_name = _text(getattr(control, "ClassName", ""))
+            if name != "聊天记录" or control_type != "ButtonControl":
+                continue
+            candidates.append((class_name == "mmui::XOutlineButton", control))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1] if candidates else None
+
+    @staticmethod
+    def _history_window_is_open(history_hwnd: int) -> bool:
+        try:
+            import win32gui
+
+            return bool(
+                history_hwnd
+                and win32gui.IsWindow(history_hwnd)
+                and win32gui.IsWindowVisible(history_hwnd)
+                and not win32gui.IsIconic(history_hwnd)
+            )
+        except Exception:
+            return False
+
+    @staticmethod
+    def _history_window_native_candidates(main_hwnd: int, process_id: int) -> list[int]:
+        import win32gui
+        import win32process
+
+        candidates: list[int] = []
+
+        def callback(hwnd, _):
+            native_hwnd = int(hwnd or 0)
+            if not native_hwnd or native_hwnd == int(main_hwnd):
+                return True
+            if not win32gui.IsWindowVisible(native_hwnd):
+                return True
+            _, candidate_pid = win32process.GetWindowThreadProcessId(native_hwnd)
+            if int(candidate_pid) != int(process_id):
+                return True
+            native_class = _text(win32gui.GetClassName(native_hwnd))
+            title = _text(win32gui.GetWindowText(native_hwnd))
+            if native_class.startswith("Qt") and "聊天记录" in title:
+                candidates.append(native_hwnd)
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        return candidates
+
+    @classmethod
+    def _verified_history_root(cls, history_hwnd: int):
+        import uiautomation as auto
+
+        root = auto.ControlFromHandle(history_hwnd)
+        if _text(getattr(root, "ClassName", "")) != HISTORY_WINDOW_CLASS:
+            return None
+        history_list = next(
+            (
+                control
+                for control in cls._walk(root)
+                if _text(getattr(control, "AutomationId", "")) == HISTORY_LIST_ID
+                and _text(getattr(control, "ControlTypeName", "")) == "ListControl"
+            ),
+            None,
+        )
+        return (root, history_list) if history_list is not None else None
+
+    def _find_history_window(
+        self, main_hwnd: int, process_id: int
+    ) -> tuple[int, object, object] | None:
+        try:
+            import uiautomation as auto
+        except ImportError as exc:
+            raise WechatHistoryReadError(
+                "uia_error", "uiautomation is not installed"
+            ) from exc
+
+        native_candidates = self._history_window_native_candidates(
+            main_hwnd, process_id
+        )
+        verified = []
+        with auto.UIAutomationInitializerInThread():
+            for hwnd in native_candidates:
+                controls = self._verified_history_root(hwnd)
+                if controls is not None:
+                    verified.append((hwnd, controls[0], controls[1]))
+        if len(verified) == 1:
+            return verified[0]
+        return None
+
+    @staticmethod
+    def _parse_history_row_text(value: str) -> tuple[str, str, Optional[str], bool]:
+        raw = _text(value)
+        match = HISTORY_TIME_RE.search(raw)
+        if not match:
+            return raw, "", None, True
+        content = raw[: match.start()].rstrip()
+        time_text = match.group("time")
+        try:
+            parsed = datetime(
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+                int(match.group("hour")),
+                int(match.group("minute")),
+            ).astimezone()
+            timestamp = parsed.isoformat()
+            return content, time_text, timestamp, False
+        except ValueError:
+            return content, time_text, None, True
+
+    @classmethod
+    def _parse_history_row(cls, row) -> Optional[WechatHistoryMessage]:
+        class_name = _text(getattr(row, "ClassName", ""))
+        control_type = _text(getattr(row, "ControlTypeName", ""))
+        raw = _text(getattr(row, "Name", ""))
+        if (
+            control_type != "ListItemControl"
+            or "Chat" not in class_name
+            or "ItemView" not in class_name
+            or not raw
+        ):
+            return None
+        content, time_text, timestamp, degraded = cls._parse_history_row_text(raw)
+        if not content:
+            return None
+        message_type = cls._message_type(class_name, content)
+        digest = hashlib.sha256(
+            "\0".join(
+                (class_name, message_type, content, time_text)
+            ).encode("utf-8")
+        ).hexdigest()
+        return WechatHistoryMessage(
+            sender_name=UNKNOWN_SENDER_NAME,
+            direction="unknown",
+            content_type=message_type,
+            content=content,
+            time_text=time_text,
+            timestamp=timestamp,
+            stable_id=f"sha256:{digest}",
+            degraded=degraded,
+        )
+
+    @classmethod
+    def _read_history_rows(
+        cls, history_list
+    ) -> list[tuple[str, WechatHistoryMessage]]:
+        messages = []
+        try:
+            rows = history_list.GetChildren()
+        except Exception:
+            rows = []
+        for row in rows:
+            message = cls._parse_history_row(row)
+            if message is not None:
+                # RecyclerListView reuses the same UIA RuntimeId slots after
+                # scrolling. Message content/type/time is the stable identity
+                # across viewports; using RuntimeId here would make newly
+                # loaded older rows look like the original screen.
+                messages.append((message.stable_id, message))
+        return messages
+
+    @classmethod
+    def _scroll_history_table_older(cls, history_list) -> bool:
+        try:
+            pattern = history_list.GetScrollPattern()
+            if pattern is not None and getattr(
+                pattern, "VerticallyScrollable", False
+            ):
+                import uiautomation as auto
+
+                pattern.Scroll(
+                    auto.ScrollAmount.NoAmount,
+                    auto.ScrollAmount.LargeIncrement,
+                    waitTime=0.1,
+                )
+                return True
+        except Exception:
+            pass
+
+        try:
+            # WeChat 4.1.9.30 does not expose ScrollPattern on
+            # chat_log_message_list, but the control's WheelDown helper sends
+            # real wheel input to the verified history list bounds. In this
+            # window the newest messages are at the top, so WheelDown loads
+            # older rows.
+            history_list.WheelDown(
+                wheelTimes=8,
+                interval=0.05,
+                waitTime=0.1,
+            )
+            return True
+        except Exception:
+            return False
+
+    def _close_history_window(self, history_hwnd: int, main_hwnd: int) -> bool:
+        import win32con
+        import win32gui
+
+        if not history_hwnd or history_hwnd == main_hwnd:
+            return False
+        timeout = max(
+            0.25,
+            min(
+                float(self.config.get("wechat_history_close_timeout_seconds", 2.0)),
+                5.0,
+            ),
+        )
+        win32gui.PostMessage(history_hwnd, win32con.WM_CLOSE, 0, 0)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._history_window_is_open(history_hwnd):
+                return self._restore_main_window_after_viewer(main_hwnd)
+            time.sleep(0.05)
+        return False
+
+    def read_current_chat_history(
+        self, limit: int = 20
+    ) -> WechatHistoryReadResult:
+        """打开独立聊天记录窗口并读取当前会话最近的消息。"""
+
+        if not bool(self.config.get("wechat_history_read_enabled", True)):
+            raise WechatHistoryReadError(
+                "history_read_disabled", "WeChat history reading is disabled."
+            )
+        max_messages = max(
+            1, min(int(self.config.get("wechat_history_max_messages", 50)), 200)
+        )
+        requested_limit = max(1, min(int(limit), max_messages))
+        main_hwnd = 0
+        history_hwnd = 0
+        close_failed = False
+        warnings = []
+        header = HeaderInfo("", "unknown", 1)
+        try:
+            self.focus_window()
+            main_hwnd, process_id = self._window()
+            header = self.get_title()
+            if not header.title:
+                raise WechatHistoryReadError(
+                    "current_conversation_unavailable",
+                    "No active WeChat conversation is open.",
+                )
+            with self.operation_lock, self._uia_root() as root:
+                _active_title, message_list = self._read_active_chat_state(root)
+                if message_list is None or not conversation_titles_match(
+                    _active_title, header.title
+                ):
+                    raise WechatHistoryReadError(
+                        "current_conversation_unavailable",
+                        "The current WeChat conversation is unavailable.",
+                    )
+                button = self._find_chat_history_button(root)
+                if button is None:
+                    raise WechatHistoryReadError(
+                        "history_button_unavailable",
+                        "WeChat chat history button is unavailable.",
+                    )
+                self._click_and_restore(button)
+
+            open_timeout = max(
+                0.5,
+                min(
+                    float(
+                        self.config.get("wechat_history_open_timeout_seconds", 4.0)
+                    ),
+                    10.0,
+                ),
+            )
+            opened = None
+            deadline = time.monotonic() + open_timeout
+            while time.monotonic() < deadline and opened is None:
+                opened = self._find_history_window(main_hwnd, process_id)
+                if opened is None:
+                    time.sleep(0.1)
+            if opened is None:
+                raise WechatHistoryReadError(
+                    "history_window_unavailable",
+                    "WeChat chat history window could not be opened.",
+                )
+            history_hwnd, _history_root, history_list = opened
+
+            total_timeout = max(
+                open_timeout,
+                min(
+                    float(
+                        self.config.get("wechat_history_total_timeout_seconds", 8.0)
+                    ),
+                    30.0,
+                ),
+            )
+            read_deadline = time.monotonic() + total_timeout
+            max_scrolls = max(
+                0, min(int(self.config.get("wechat_history_max_scrolls", 12)), 100)
+            )
+            no_progress_limit = max(
+                1,
+                min(
+                    int(self.config.get("wechat_history_no_progress_limit", 2)), 10
+                ),
+            )
+            messages: dict[str, WechatHistoryMessage] = {}
+            no_progress = 0
+            exhausted = False
+            reached_limit = False
+            for scroll_index in range(max_scrolls + 1):
+                before = len(messages)
+                for identity, message in self._read_history_rows(history_list):
+                    messages.setdefault(identity, message)
+                if len(messages) >= requested_limit:
+                    reached_limit = True
+                    break
+                if len(messages) == before:
+                    no_progress += 1
+                else:
+                    no_progress = 0
+                if no_progress >= no_progress_limit:
+                    exhausted = True
+                    break
+                if scroll_index >= max_scrolls or time.monotonic() >= read_deadline:
+                    break
+                if not self._scroll_history_table_older(history_list):
+                    exhausted = True
+                    break
+                self._paced_wait(
+                    "wechat_history_scroll_settle_ms_min",
+                    "wechat_history_scroll_settle_ms_max",
+                    250,
+                    500,
+                )
+                refreshed = self._find_history_window(main_hwnd, process_id)
+                if refreshed is None or int(refreshed[0]) != int(history_hwnd):
+                    raise WechatHistoryReadError(
+                        "history_window_unavailable",
+                        "WeChat chat history window disappeared while reading.",
+                    )
+                _history_root, history_list = refreshed[1], refreshed[2]
+
+            result_messages = list(messages.values())
+            indexed_messages = list(enumerate(result_messages))
+            indexed_messages.sort(
+                key=lambda item: (
+                    item[1].timestamp is None,
+                    item[1].timestamp or "",
+                    -item[0],
+                )
+            )
+            result_messages = [message for _index, message in indexed_messages]
+            result_messages = result_messages[-requested_limit:]
+            degraded = any(message.degraded for message in result_messages)
+            if degraded:
+                warnings.append(
+                    "Some history rows did not expose a complete parseable timestamp."
+                )
+            has_more = None
+            if exhausted:
+                has_more = False
+            elif reached_limit:
+                has_more = True
+            return WechatHistoryReadResult(
+                conversation_title=header.title,
+                conversation_type=header.header_type,
+                messages=result_messages,
+                requested_limit=requested_limit,
+                returned_count=len(result_messages),
+                has_more=has_more,
+                degraded=degraded,
+                warnings=tuple(warnings),
+            )
+        finally:
+            if history_hwnd:
+                close_failed = not self._close_history_window(
+                    history_hwnd, main_hwnd
+                )
+            if close_failed:
+                logger.warning(
+                    "[WechatDesktop][history] verified history window could not be closed: hwnd=%s",
+                    history_hwnd,
+                )
 
     @staticmethod
     def _message_type(class_name: str, content: str) -> str:

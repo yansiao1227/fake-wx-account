@@ -9,7 +9,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from channel.wechat_desktop.models import ReplyTargetValidation, WechatDesktopEvent
+from channel.wechat_desktop.models import (
+    ReplyTargetValidation,
+    WechatDesktopEvent,
+    WechatHistoryReadResult,
+)
 
 
 class WechatDesktopBackend(ABC):
@@ -43,6 +47,10 @@ class WechatDesktopBackend(ABC):
         self, event: WechatDesktopEvent, *, before_share_fetch=None
     ) -> tuple[WechatDesktopEvent, int]:
         """按需下载或截图事件中的附件。"""
+
+    @abstractmethod
+    def read_current_chat_history(self, limit: int = 20) -> WechatHistoryReadResult:
+        """读取微信当前已打开会话的最近聊天记录。"""
 
     @abstractmethod
     def begin_reply_cycle(self, conversation: str, conversation_id: str = ""):

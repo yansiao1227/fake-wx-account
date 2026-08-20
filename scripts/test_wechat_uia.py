@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -308,6 +309,11 @@ def main() -> int:
         help="open chat history, dump its UIA windows to tmp, then close it",
     )
     parser.add_argument(
+        "--read-current-history",
+        action="store_true",
+        help="open and read recent rows from the current chat history window",
+    )
+    parser.add_argument(
         "--history-member-filter",
         action="store_true",
         help="open the group-member filter before dumping chat history UIA",
@@ -469,6 +475,10 @@ def main() -> int:
                 ),
                 "content_included": True,
             }
+        if args.read_current_history:
+            report["current_history"] = asdict(
+                client.read_current_chat_history(args.limit)
+            )
     except Exception as exc:
         report["error"] = str(exc)
         print(json.dumps(report, ensure_ascii=False, indent=2))

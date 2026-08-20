@@ -22,6 +22,7 @@ from channel.wechat_desktop.models import (
     UNKNOWN_SENDER_NAME,
     UiaChatMessage,
     WechatDesktopEvent,
+    WechatHistoryReadResult,
 )
 from channel.wechat_desktop.backend import WechatDesktopBackend
 from channel.wechat_desktop.operations import (
@@ -1497,6 +1498,25 @@ class WechatUiaDriver(WechatDesktopBackend):
                 event.conversation_id,
             )
         return event, resolve_count
+
+    def read_current_chat_history(
+        self, limit: int = 20
+    ) -> WechatHistoryReadResult:
+        """在回复优先级租约内读取当前会话的独立聊天记录窗口。"""
+
+        self._trace("history_open", "requested_limit=%s", limit)
+        with self._reply_uia():
+            result = self.client.read_current_chat_history(limit)
+        self._trace(
+            "history_rows_read",
+            "conversation=%s returned=%s requested=%s degraded=%s",
+            result.conversation_title,
+            result.returned_count,
+            result.requested_limit,
+            result.degraded,
+        )
+        self._trace("history_close", "conversation=%s", result.conversation_title)
+        return result
 
     def send_text(self, conversation: str, text: str) -> dict:
         """通过独立发送组件发送普通回复。"""

@@ -25,6 +25,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
 from bridge.context import Context, ContextType
@@ -35,6 +36,7 @@ from channel.wechat_desktop.config import DEFAULT_CONFIG, load_wechat_desktop_co
 from channel.wechat_desktop.daily_hot_scheduler import DailyHotScheduler
 from channel.wechat_desktop.fifo_queue import ReplyQueueItem, WechatReplyQueue
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.models import WechatHistoryReadError
 from channel.wechat_desktop.policy import WechatDesktopPolicy
 from channel.wechat_desktop.service import get_wechat_desktop_service
 from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
@@ -2683,12 +2685,12 @@ class WechatDesktopChannel(ChatChannel):
         )
 
     def _execute_agent_action(self, action: str, **params) -> dict:
-        """供 Agent 主动发送微信文字的受限入口。
+        """供 Agent 读取当前会话历史或主动发送文字的受限入口。
 
-        当前仅支持 ``send_text``。该路径同样遵守暂停、黑名单、白名单和限流规则，
-        并要求后端验证发送结果；它不绕过桌面通道的安全策略。
+        读取为只读操作，不触发会话切换或持久化；发送路径继续遵守暂停、
+        黑名单、白名单和限流规则，并要求后端验证发送结果。
         """
-        if action != "send_text":
+        if action not in {"read_history", "send_text"}:
             return {
                 "status": "error",
                 "message": f"unsupported wechat_desktop action: {action}",
@@ -2698,6 +2700,62 @@ class WechatDesktopChannel(ChatChannel):
                 "status": "error",
                 "message": "desktop takeover is paused",
             }
+
+        if action == "read_history":
+            max_messages = max(
+                1,
+                min(
+                    int(self.config.get("wechat_history_max_messages", 50)),
+                    200,
+                ),
+            )
+            try:
+                raw_limit = int(params.get("limit", 20))
+            except (TypeError, ValueError):
+                return {
+                    "status": "error",
+                    "code": "invalid_limit",
+                    "message": "limit must be an integer",
+                }
+            if raw_limit < 1:
+                return {
+                    "status": "error",
+                    "code": "invalid_limit",
+                    "message": "limit must be at least 1",
+                }
+            try:
+                result = self._driver.read_current_chat_history(
+                    min(raw_limit, max_messages)
+                )
+                payload = asdict(result)
+                return {
+                    "status": "success",
+                    "conversation": {
+                        "title": result.conversation_title,
+                        "type": result.conversation_type,
+                    },
+                    **{
+                        key: value
+                        for key, value in payload.items()
+                        if key
+                        not in {"conversation_title", "conversation_type"}
+                    },
+                }
+            except WechatHistoryReadError as exc:
+                return {
+                    "status": "error",
+                    "code": exc.code,
+                    "message": str(exc),
+                }
+            except Exception as exc:
+                file_logger.exception(
+                    "[WechatDesktop][history] current conversation read failed"
+                )
+                return {
+                    "status": "error",
+                    "code": "uia_error",
+                    "message": str(exc),
+                }
 
         conversation = str(params.get("conversation", "") or "").strip()
         text = str(params.get("text", "") or "").strip()
