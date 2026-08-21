@@ -106,7 +106,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
     ],
     "auto_reply_contacts": [],
-    "auto_reply_groups": ["小小地下联络站"],
+    "auto_reply_groups": ["小小地下联络站","水世界26.08.22"],
     "group_reply_mode": "at_only",
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",

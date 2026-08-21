@@ -570,6 +570,56 @@ class WechatUiaDriver(WechatDesktopBackend):
                 return index, message
         return -1, None
 
+    def _select_reply_targets(
+        self,
+        messages: list[UiaChatMessage],
+        is_group: bool,
+        owner: str,
+        conversation_id: str = "",
+        conversation_name: str = "",
+    ) -> list[tuple[int, UiaChatMessage]]:
+        """Return every visible, not-yet-emitted reply target in message order.
+
+        Group bursts must not collapse to the newest mention.  The legacy
+        single-target selector remains available for validation/replacement;
+        event discovery uses this exhaustive form so messages observed while a
+        reply is being sent can be appended to the FIFO individually.
+        """
+        if not is_group:
+            target_index, target = self._select_reply_target(
+                messages, is_group, owner, conversation_id, conversation_name
+            )
+            return [(target_index, target)] if target is not None else []
+        if not messages:
+            return []
+        is_known_outgoing = getattr(self.client, "is_known_outgoing_message", None)
+        selected: list[tuple[int, UiaChatMessage]] = []
+        for index, message in enumerate(messages):
+            if (
+                self.reply_in_flight
+                and conversation_id == self._reply_conversation_id
+                and self._recent_target_identity(message)
+                in self._reply_baseline_identities
+            ):
+                continue
+            if self._is_interim_message(conversation_id, message):
+                continue
+            if is_known_outgoing and is_known_outgoing(conversation_name, message):
+                continue
+            if not is_group and message.direction == "outgoing":
+                continue
+            if is_group and not self._mentions_owner(message.content, owner):
+                continue
+            target_key = self._target_key(message, index)
+            with self._operation_lock:
+                already_emitted = (
+                    self._emitted_targets.get(conversation_id) == target_key
+                    or self._was_recently_emitted(conversation_id, message)
+                )
+            if not already_emitted:
+                selected.append((index, message))
+        return selected
+
     def _exclude_private_outgoing_messages(
         self,
         messages: list[UiaChatMessage],
@@ -1061,12 +1111,6 @@ class WechatUiaDriver(WechatDesktopBackend):
                 events: list[WechatDesktopEvent] = []
                 ordinal = 0
                 for row_key, row in candidates:
-                    if self._reply_ui_pending.is_set():
-                        self._trace(
-                            "02-yield",
-                            "reply UI pending; remaining candidates deferred",
-                        )
-                        break
                     name = row.conversation_title
                     active_reply_conversation = self._is_reply_conversation(
                         row_key, row
@@ -1191,10 +1235,10 @@ class WechatUiaDriver(WechatDesktopBackend):
                         owner_source,
                         owner or "<empty>",
                     )
-                    target_index, message = self._select_reply_target(
+                    targets = self._select_reply_targets(
                         messages, is_group, owner, row_key, name
                     )
-                    if message is None:
+                    if not targets:
                         reason = (
                             "owner_name_unavailable"
                             if is_group and not owner
@@ -1212,48 +1256,36 @@ class WechatUiaDriver(WechatDesktopBackend):
                         with self._operation_lock:
                             self._emitted_targets.pop(row_key, None)
                         continue
-                    self._trace(
-                        "06-target",
-                        "conversation=%s selected=True index=%s type=%s chars=%s",
-                        name,
-                        target_index,
-                        message.message_type,
-                        len(str(message.content or "")),
-                    )
-                    target_key = self._target_key(message, target_index)
-                    with self._operation_lock:
-                        already_emitted = (
-                            self._emitted_targets.get(row_key) == target_key
-                            or self._was_recently_emitted(row_key, message)
-                        )
-                    if already_emitted:
+                    for target_index, message in targets:
                         self._trace(
                             "06-target",
-                            "conversation=%s selected=False reason=recent_target_identity runtime=%s",
+                            "conversation=%s selected=True index=%s type=%s chars=%s",
                             name,
-                            message.runtime_id or "<empty>",
+                            target_index,
+                            message.message_type,
+                            len(str(message.content or "")),
                         )
-                        continue
-                    history = self._history_snapshot(
-                        messages, target_index, is_group, row_key
-                    )
-                    ordinal += 1
-                    event = self._event(
-                        row_key,
-                        name,
-                        message,
-                        history,
-                        is_group,
-                        bool(is_group),
-                        ordinal,
-                        target_key,
-                        row.not_read_number,
-                    )
-                    if event is not None:
-                        with self._operation_lock:
-                            self._emitted_targets[row_key] = target_key
-                            self._remember_emitted_target(row_key, message)
-                        events.append(event)
+                        target_key = self._target_key(message, target_index)
+                        history = self._history_snapshot(
+                            messages, target_index, is_group, row_key
+                        )
+                        ordinal += 1
+                        event = self._event(
+                            row_key,
+                            name,
+                            message,
+                            history,
+                            is_group,
+                            bool(is_group),
+                            ordinal,
+                            target_key,
+                            row.not_read_number,
+                        )
+                        if event is not None:
+                            with self._operation_lock:
+                                self._emitted_targets[row_key] = target_key
+                                self._remember_emitted_target(row_key, message)
+                            events.append(event)
                 return self._observation(
                     visible_conversations=len(rows),
                     unread_conversations=sum(row.not_read_number > 0 for row in rows),

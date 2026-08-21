@@ -2649,7 +2649,7 @@ def test_session_preview_without_sender_prefix_is_not_marked_as_incoming_sender(
     assert parsed.preview_has_sender_prefix is False
 
 
-def test_group_selects_only_latest_mention_and_uses_other_bubbles_as_history():
+def test_group_emits_all_visible_mentions_in_message_order():
     client = FakeClient()
     client.rows = [row("项目群", unread=3, mention=True, preview_prefix=True)]
     client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
@@ -2666,12 +2666,12 @@ def test_group_selects_only_latest_mention_and_uses_other_bubbles_as_history():
 
     _, events = driver.observe_events()
 
-    assert [event.content for event in events] == ["@小牛 第二条"]
-    assert events[0].is_at is True
+    assert [event.content for event in events] == ["@小牛 第一条", "@小牛 第二条"]
+    assert all(event.is_at for event in events)
     assert client.owner_calls >= 1
     assert [item["content"] for item in events[0].history] == [
-        "@小牛 第一条",
         "这是后续普通消息",
+        "@小牛 第二条",
     ]
 
 
