@@ -107,7 +107,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
     "auto_reply_contacts": [],
     # 自动回复群白名单。与每日热点目标列表相互独立，互不影响。
-    "auto_reply_groups": ["小小地下联络站","水世界26.08.22"],
+    "auto_reply_groups": ["小小地下联络站","2026国庆出游计划"],
     "group_reply_mode": "at_only",
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",
@@ -167,7 +167,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "daily_hot_broadcast_tab": "livelihood",
     "daily_hot_broadcast_message_prefix": "📰 今日热点",
     # 每日热点目标群。只看本数组，不复用 auto_reply_groups / auto_reply_groups_all。
-    "daily_hot_broadcast_groups": ["小小地下联络站","水世界26.08.22"],
+    "daily_hot_broadcast_groups": ["小小地下联络站"],
     
     # False：正式发送；True：只观察不发
     "shadow_mode": False,
