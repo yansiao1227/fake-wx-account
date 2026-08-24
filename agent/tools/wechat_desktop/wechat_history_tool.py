@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from agent.tools.base_tool import BaseTool, ToolResult
-from channel.wechat_desktop.service import get_wechat_desktop_service
+from channel.wechat_desktop.storage.service import get_wechat_desktop_service
 
 
 class WechatHistoryTool(BaseTool):

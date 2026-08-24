@@ -49,13 +49,13 @@ CowAgent 的完整能力、架构、通用部署方式和使用文档请查看�
 
 | 层级 | 位置 | 内容 |
 | --- | --- | --- |
-| 全局 / Agent | 根目录 `config.json`（模板：`config-template.json`） | 模型与厂商、`channel_type`、Agent 运行时、Web 控制台、跨通道 `tools` / `skills` 等 |
-| 微信通道 | **`channel/wechat_desktop/config.py` 的 `DEFAULT_CONFIG`** | UIA 节拍、白名单、`shadow_mode`、限流、进度/失败通知模板、每日热点等 |
+| 全局 / Agent | 根目录 `config.json`（模板：`config-template.json`） | 仅通用项：模型与厂商、`channel_type`、Agent 运行时、Web 控制台、跨通道 `tools` / `skills` 等 |
+| 微信通道 | **`channel/wechat_desktop/config.py` 的 `DEFAULT_CONFIG`** | 全部微信业务：UIA 节拍、白名单、`shadow_mode`、限流、进度/失败通知模板、每日热点等 |
 | 密钥 | `~/.cow/.env`（本机常见路径：`C:\Users\<用户>\.cow\.env`） | `QIANFAN_API_KEY`、`OPENAI_API_KEY` 等；**不要**把生产密钥提交进仓库 |
 
 说明：
 
-- 根目录 JSON **默认不必**再写 `wechat_desktop` 段；若写了，仅作浅合并覆盖。
+- 根目录 JSON **不要**写 `wechat_desktop` 段，也不要把白名单等业务键提升到最外层。
 - 新增或修改微信通道行为时，只改 `channel/wechat_desktop/config.py`。
 - 全局通道启用示例：
 
@@ -183,18 +183,13 @@ D:\Miniconda\envs\cowagent-wechat\python.exe scripts\clear_daily_hot_state.py
 
 ## 模型失败重试与诊断
 
-全局 `config.json` / `config-template.json` 中可配置：
+模型 API 重试次数与间隔写在 `channel/wechat_desktop/config.py`（相对上游 CowAgent 的外层新增项，不放根 `config.json`）：
 
-```json
-{
-  "model_api_max_retries": 3,
-  "model_api_retry_base_seconds": 2.0,
-  "model_api_retry_max_seconds": 10.0,
-  "model_api_retry_jitter_seconds": 0.5,
-  "model_api_failure_messages": [
-    "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。"
-  ]
-}
+```python
+"model_api_max_retries": 3,
+"model_api_retry_base_seconds": 2.0,
+"model_api_retry_max_seconds": 10.0,
+"model_api_retry_jitter_seconds": 0.5,
 ```
 
 - `model_api_max_retries` 表示首次请求之后的重试次数（默认最多约 4 次总尝试）。
@@ -204,7 +199,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe scripts\clear_daily_hot_state.py
 D:\Miniconda\envs\cowagent-wechat\python.exe scripts\replay_openai_failed_request.py
 ```
 
-微信侧失败安抚话术模板见通道配置中的 `agent_failure_notice_templates`。
+发给微信用户的失败安抚话术只写在 `channel/wechat_desktop/config.py` 的 `agent_failure_notice_templates`。
 
 ## 已完成的阶段目标
 

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from channel.wechat_desktop.baidu_hot import (
+from channel.wechat_desktop.daily_hot.baidu_hot import (
     build_daily_hot_message,
     fallback_summary_from_materials,
     format_top_item_message,
@@ -18,21 +18,21 @@ from channel.wechat_desktop.baidu_hot import (
     summarize_hot_with_commentary,
 )
 from channel.wechat_desktop.config import DEFAULT_CONFIG, load_wechat_desktop_config
-from channel.wechat_desktop.daily_hot_scheduler import (
+from channel.wechat_desktop.daily_hot.scheduler import (
     DailyHotScheduler,
     is_due,
     parse_hhmm,
 )
-from channel.wechat_desktop.fifo_queue import WechatReplyQueue
+from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.models import ConversationInfo
-from channel.wechat_desktop.operations import (
+from channel.wechat_desktop.uia.operations import (
     conversation_titles_match,
     resolve_conversation_selector,
     strip_member_count_suffix,
 )
-from channel.wechat_desktop.policy import WechatDesktopPolicy
-from channel.wechat_desktop.service import reset_wechat_desktop_service_for_tests
-from channel.wechat_desktop.store import WechatDesktopStore
+from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
+from channel.wechat_desktop.storage.service import reset_wechat_desktop_service_for_tests
+from channel.wechat_desktop.storage.store import WechatDesktopStore
 
 
 def test_parse_hhmm_and_is_due():
@@ -95,21 +95,59 @@ def test_load_wechat_desktop_config_defaults_and_override():
     assert loaded["auto_reply_groups"] == DEFAULT_CONFIG["auto_reply_groups"]
 
 
+def test_global_config_drops_wechat_desktop_keys():
+    from config import Config, _drop_wechat_desktop_keys_from_global
+
+    loaded = Config(
+        {
+            "model": "keep-me",
+            "shadow_mode": True,
+            "auto_reply_groups": ["误放在外层的群"],
+            "wechat_desktop": {"shadow_mode": True},
+        }
+    )
+    dropped = _drop_wechat_desktop_keys_from_global(loaded)
+    assert "shadow_mode" in dropped
+    assert "auto_reply_groups" in dropped
+    assert "wechat_desktop" in dropped
+    assert "shadow_mode" not in loaded
+    assert "auto_reply_groups" not in loaded
+    assert "wechat_desktop" not in loaded
+    assert loaded.get("model") == "keep-me"
+
+
+def test_load_wechat_desktop_config_ignores_json_section(monkeypatch):
+    import channel.wechat_desktop.config as desktop_config
+
+    class DummyConf(dict):
+        def get(self, key, default=None):
+            if key == "wechat_desktop":
+                return {"shadow_mode": True, "daily_hot_broadcast_enabled": False}
+            return super().get(key, default)
+
+    monkeypatch.setattr(desktop_config, "conf", lambda: DummyConf())
+    loaded = load_wechat_desktop_config()
+    assert loaded["shadow_mode"] is DEFAULT_CONFIG["shadow_mode"]
+    assert loaded["daily_hot_broadcast_enabled"] is DEFAULT_CONFIG[
+        "daily_hot_broadcast_enabled"
+    ]
+
+
 def test_resolve_qianfan_api_key_prefers_env_over_config():
     import os
 
-    import channel.wechat_desktop.baidu_hot as baidu_hot
+    import channel.wechat_desktop.daily_hot.baidu_hot as baidu_hot
 
     baidu_hot._COW_ENV_LOADED = True
     old = os.environ.get("QIANFAN_API_KEY")
     try:
         os.environ["QIANFAN_API_KEY"] = "from-env"
-        with patch("channel.wechat_desktop.baidu_hot.conf") as conf_mock:
+        with patch("channel.wechat_desktop.daily_hot.baidu_hot.conf") as conf_mock:
             conf_mock.return_value.get.return_value = "from-config"
             assert resolve_qianfan_api_key() == "from-env"
 
         os.environ.pop("QIANFAN_API_KEY", None)
-        with patch("channel.wechat_desktop.baidu_hot.conf") as conf_mock:
+        with patch("channel.wechat_desktop.daily_hot.baidu_hot.conf") as conf_mock:
             conf_mock.return_value.get.return_value = "from-config"
             assert resolve_qianfan_api_key() == "from-config"
     finally:
@@ -121,7 +159,7 @@ def test_resolve_qianfan_api_key_prefers_env_over_config():
 
 def test_fetch_trending_requires_api_key():
     with patch(
-        "channel.wechat_desktop.baidu_hot.resolve_qianfan_api_key",
+        "channel.wechat_desktop.daily_hot.baidu_hot.resolve_qianfan_api_key",
         return_value="",
     ):
         result = fetch_trending("livelihood", 1)
@@ -154,10 +192,10 @@ def test_fetch_trending_parses_payload():
     response.raise_for_status.return_value = None
     response.json.return_value = payload
     with patch(
-        "channel.wechat_desktop.baidu_hot.resolve_qianfan_api_key",
+        "channel.wechat_desktop.daily_hot.baidu_hot.resolve_qianfan_api_key",
         return_value="test-key",
     ), patch(
-        "channel.wechat_desktop.baidu_hot.requests.get",
+        "channel.wechat_desktop.daily_hot.baidu_hot.requests.get",
         return_value=response,
     ) as get_mock:
         result = fetch_trending("livelihood", 1)
@@ -183,10 +221,10 @@ def test_fetch_hot_detail_parses_references():
         ]
     }
     with patch(
-        "channel.wechat_desktop.baidu_hot.resolve_qianfan_api_key",
+        "channel.wechat_desktop.daily_hot.baidu_hot.resolve_qianfan_api_key",
         return_value="test-key",
     ), patch(
-        "channel.wechat_desktop.baidu_hot.requests.post",
+        "channel.wechat_desktop.daily_hot.baidu_hot.requests.post",
         return_value=response,
     ) as post_mock:
         result = fetch_hot_detail("示例热点", count=3)
@@ -212,14 +250,14 @@ def test_summarize_hot_with_commentary_success():
         ]
     }
     with patch(
-        "channel.wechat_desktop.baidu_hot.resolve_chat_endpoint",
+        "channel.wechat_desktop.daily_hot.baidu_hot.resolve_chat_endpoint",
         return_value={
             "api_base": "https://api.example.com/v1",
             "api_key": "sk-test",
             "model": "demo-model",
         },
     ), patch(
-        "channel.wechat_desktop.baidu_hot.requests.post",
+        "channel.wechat_desktop.daily_hot.baidu_hot.requests.post",
         return_value=response,
     ):
         result = summarize_hot_with_commentary("空调热点", "资料A\n资料B")
@@ -241,7 +279,7 @@ def test_fallback_summary_from_materials():
 
 def test_build_daily_hot_message_success():
     with patch(
-        "channel.wechat_desktop.baidu_hot.fetch_trending",
+        "channel.wechat_desktop.daily_hot.baidu_hot.fetch_trending",
         return_value={
             "ok": True,
             "tab": "livelihood",
@@ -257,7 +295,7 @@ def test_build_daily_hot_message_success():
             ],
         },
     ), patch(
-        "channel.wechat_desktop.baidu_hot.fetch_hot_detail",
+        "channel.wechat_desktop.daily_hot.baidu_hot.fetch_hot_detail",
         return_value={
             "ok": True,
             "references": [
@@ -271,7 +309,7 @@ def test_build_daily_hot_message_success():
             ],
         },
     ), patch(
-        "channel.wechat_desktop.baidu_hot.summarize_hot_with_commentary",
+        "channel.wechat_desktop.daily_hot.baidu_hot.summarize_hot_with_commentary",
         return_value={
             "ok": True,
             "text": "官方出来划重点了：短时外出调高温度就行，别傻乎乎全天空转。\n我的看法：省电秘籍最终还是得看场景，标题党可以散了。",
@@ -288,7 +326,7 @@ def test_build_daily_hot_message_success():
 
 def test_build_daily_hot_message_falls_back_when_llm_fails():
     with patch(
-        "channel.wechat_desktop.baidu_hot.fetch_trending",
+        "channel.wechat_desktop.daily_hot.baidu_hot.fetch_trending",
         return_value={
             "ok": True,
             "tab": "livelihood",
@@ -302,13 +340,13 @@ def test_build_daily_hot_message_falls_back_when_llm_fails():
             ],
         },
     ), patch(
-        "channel.wechat_desktop.baidu_hot.fetch_hot_detail",
+        "channel.wechat_desktop.daily_hot.baidu_hot.fetch_hot_detail",
         return_value={
             "ok": True,
             "references": [{"title": "报道", "content": "详细经过在此。"}],
         },
     ), patch(
-        "channel.wechat_desktop.baidu_hot.summarize_hot_with_commentary",
+        "channel.wechat_desktop.daily_hot.baidu_hot.summarize_hot_with_commentary",
         return_value={"ok": False, "error": "llm down", "text": ""},
     ):
         payload = build_daily_hot_message(prefix="热点")
@@ -441,13 +479,13 @@ class _FakeDriver:
         return {"success": True, "verified": True}
 
     def _resolve_selector(self, conversation):
-        from channel.wechat_desktop.operations import WechatConversationSelector
+        from channel.wechat_desktop.uia.operations import WechatConversationSelector
 
         return WechatConversationSelector(str(conversation or ""))
 
 
 def _channel_impl():
-    from channel.wechat_desktop.wechat_desktop_channel import WechatDesktopChannel
+    from channel.wechat_desktop.pipeline.channel import WechatDesktopChannel
 
     # ``@singleton`` wraps the class; recover the original type for unit tests.
     return WechatDesktopChannel.__closure__[0].cell_contents
@@ -563,7 +601,7 @@ def test_enqueue_daily_hot_broadcast_resolves_session_id(tmp_path):
     class _ResolverDriver(_FakeDriver):
         def _resolve_selector(self, conversation):
             if conversation == "小小地下联络站":
-                from channel.wechat_desktop.operations import WechatConversationSelector
+                from channel.wechat_desktop.uia.operations import WechatConversationSelector
 
                 return WechatConversationSelector(
                     title="小小地下联络站",

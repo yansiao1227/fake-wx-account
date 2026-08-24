@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from channel.wechat_desktop.uia_client import (
+from channel.wechat_desktop.uia.client import (
     SESSION_PREFIX,
     WechatUiaClient,
     _bounds,

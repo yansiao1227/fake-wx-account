@@ -52,24 +52,41 @@ def _bounded_float(value, default: float, minimum: float, maximum: float) -> flo
         return default
 
 
+def _channel_retry_config() -> dict:
+    """本 fork 的重试项写在 wechat_desktop 通道配置，不放根 config.py。"""
+    try:
+        from channel.wechat_desktop.config import load_wechat_desktop_config
+
+        return load_wechat_desktop_config()
+    except Exception:
+        return {}
+
+
+def _retry_setting(config, channel: dict, key: str, default):
+    if key in config:
+        return config[key]
+    return channel.get(key, default)
+
+
 def get_model_api_retry_policy() -> ModelApiRetryPolicy:
     """Load retry settings dynamically so configuration reloads take effect."""
     config = conf()
+    channel = _channel_retry_config()
     base_seconds = _bounded_float(
-        config.get("model_api_retry_base_seconds", 2.0),
+        _retry_setting(config, channel, "model_api_retry_base_seconds", 2.0),
         2.0,
         0.0,
         60.0,
     )
     max_seconds = _bounded_float(
-        config.get("model_api_retry_max_seconds", 10.0),
+        _retry_setting(config, channel, "model_api_retry_max_seconds", 10.0),
         10.0,
         base_seconds,
         300.0,
     )
     return ModelApiRetryPolicy(
         max_retries=_bounded_int(
-            config.get("model_api_max_retries", 3),
+            _retry_setting(config, channel, "model_api_max_retries", 3),
             3,
             0,
             10,
@@ -77,7 +94,7 @@ def get_model_api_retry_policy() -> ModelApiRetryPolicy:
         base_seconds=base_seconds,
         max_seconds=max_seconds,
         jitter_seconds=_bounded_float(
-            config.get("model_api_retry_jitter_seconds", 0.5),
+            _retry_setting(config, channel, "model_api_retry_jitter_seconds", 0.5),
             0.5,
             0.0,
             10.0,

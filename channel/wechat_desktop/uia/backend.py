@@ -98,6 +98,6 @@ def create_wechat_desktop_backend(
         raise ValueError(f"Unsupported WeChat desktop backend: {backend_name}")
 
     # 延迟导入可避免后端模块反向依赖接口时产生循环引用。
-    from channel.wechat_desktop.uia_driver import WechatUiaDriver
+    from channel.wechat_desktop.uia.driver import WechatUiaDriver
 
     return WechatUiaDriver(config, client=client, shell_hook=shell_hook)

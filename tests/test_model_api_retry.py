@@ -18,6 +18,17 @@ from models.model_api_retry import (
 )
 
 
+def test_model_api_retry_policy_defaults_come_from_channel_config(monkeypatch):
+    from channel.wechat_desktop.config import DEFAULT_CONFIG
+
+    monkeypatch.setattr(retry_module, "conf", lambda: {})
+    policy = get_model_api_retry_policy()
+    assert policy.max_retries == int(DEFAULT_CONFIG["model_api_max_retries"])
+    assert policy.base_seconds == float(DEFAULT_CONFIG["model_api_retry_base_seconds"])
+    assert policy.max_seconds == float(DEFAULT_CONFIG["model_api_retry_max_seconds"])
+    assert policy.jitter_seconds == float(DEFAULT_CONFIG["model_api_retry_jitter_seconds"])
+
+
 def test_model_api_retry_policy_is_configurable_and_bounded(monkeypatch):
     monkeypatch.setattr(
         retry_module,

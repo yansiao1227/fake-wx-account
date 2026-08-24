@@ -20,7 +20,7 @@ def create_channel(channel_type) -> Channel:
         ch = WeixinChannel()
         channel_type = const.WEIXIN
     elif channel_type == const.WECHAT_DESKTOP:
-        from channel.wechat_desktop.wechat_desktop_channel import WechatDesktopChannel
+        from channel.wechat_desktop.pipeline.channel import WechatDesktopChannel
         ch = WechatDesktopChannel()
     else:
         raise RuntimeError

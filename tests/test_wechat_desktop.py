@@ -5,12 +5,11 @@ import pytest
 
 from agent.tools.wechat_desktop.wechat_desktop_tool import WechatDesktopTool
 from agent.tools.wechat_desktop.wechat_history_tool import WechatHistoryTool
-from channel.wechat_desktop.models import WechatDesktopEvent
-from channel.wechat_desktop.policy import WechatDesktopPolicy
-from channel.wechat_desktop.service import reset_wechat_desktop_service_for_tests
-from channel.wechat_desktop.store import WechatDesktopStore
-from channel.wechat_desktop.wechat_desktop_channel import _normalize_auto_reply_text
-from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
+from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage
+from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
+from channel.wechat_desktop.storage.service import reset_wechat_desktop_service_for_tests
+from channel.wechat_desktop.storage.store import WechatDesktopStore
+from channel.wechat_desktop.pipeline.channel import _normalize_auto_reply_text
 
 
 
@@ -491,7 +490,7 @@ def test_wechat_message_maps_group_fields():
 
 def test_web_status_handler_has_no_approval_state(monkeypatch, tmp_path):
     from channel.web import web_channel
-    import channel.wechat_desktop.service as service_module
+    import channel.wechat_desktop.storage.service as service_module
 
     service = reset_wechat_desktop_service_for_tests(str(tmp_path / "wechat.sqlite3"))
     monkeypatch.setattr(service_module, "get_wechat_desktop_service", lambda: service)

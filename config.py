@@ -11,9 +11,11 @@ import sys
 from common.log import logger
 from common import i18n
 
-# All available config keys are listed in this dict (use lowercase keys).
-# The values here are placeholders only; the program does NOT read them.
-# They merely document the expected format — put real values in config.json.
+# 根目录 config.py 只加载 config.json 并提供 conf()。
+# available_setting 只登记跨通道通用字段（模型、Agent、channel_type、Web、tools 等），
+# 取值是占位说明，程序不把这里当业务默认值源。
+# 禁止在这里新增 wechat_desktop 白名单、shadow_mode、UIA 节拍、每日热点等通道业务项；
+# 那些字段只写 channel/wechat_desktop/config.py。
 available_setting = {
     # global UI language for CLI, startup logs, error messages, agent prompts
     # and channel replies. Options: "auto" (detect from system locale, default),
@@ -83,15 +85,6 @@ available_setting = {
     "presence_penalty": 0,
     "request_timeout": 180,  # chatgpt request timeout; the openai api defaults to 600, hard questions usually need longer
     "timeout": 120,  # chatgpt retry timeout; will auto-retry within this window
-    "model_api_max_retries": 3,  # retries after the initial model API request
-    "model_api_retry_base_seconds": 2.0,
-    "model_api_retry_max_seconds": 10.0,
-    "model_api_retry_jitter_seconds": 0.5,
-    "model_api_failure_messages": [
-        "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
-        "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
-        "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
-    ],
     # Baidu Wenxin (ERNIE) params
     "baidu_wenxin_model": "eb-instant",  # defaults to the ERNIE-Bot-turbo model
     "baidu_wenxin_api_key": "",  # Baidu api key
@@ -341,6 +334,21 @@ def drag_sensitive(config):
     return config
 
 
+def _drop_wechat_desktop_keys_from_global(loaded) -> list[str]:
+    """从外层配置中删除 wechat_desktop 业务键，避免与通道内 config.py 重复。"""
+    from channel.wechat_desktop.config import DEFAULT_CONFIG
+
+    dropped = []
+    if "wechat_desktop" in loaded:
+        del loaded["wechat_desktop"]
+        dropped.append("wechat_desktop")
+    for key in list(loaded.keys()):
+        if key in DEFAULT_CONFIG:
+            del loaded[key]
+            dropped.append(key)
+    return dropped
+
+
 def load_config():
     global config
 
@@ -405,6 +413,14 @@ def load_config():
                     config[name] = True
                 else:
                     config[name] = value
+
+    dropped_channel_keys = _drop_wechat_desktop_keys_from_global(config)
+    if dropped_channel_keys:
+        logger.warning(
+            "[INIT] 已从 config.json 删除 wechat_desktop 业务配置: %s；"
+            "请写到 channel/wechat_desktop/config.py",
+            ", ".join(dropped_channel_keys),
+        )
 
     if config.get("debug", False):
         logger.setLevel(logging.DEBUG)

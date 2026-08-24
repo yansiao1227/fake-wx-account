@@ -15,8 +15,8 @@ python -m pip install -r requirements-windows.txt
 
 启动并登录且只登录一个桌面微信实例，然后配置：
 
-通道配置写在 `channel/wechat_desktop/config.py`（唯一源），根目录 `config.json`
-**不必**再写 `wechat_desktop` 段。启用通道时全局只需：
+通道业务配置写在 `channel/wechat_desktop/config.py`（唯一源）。根目录 `config.json`
+只放模型、Agent、`channel_type` 等通用项，**不要**写 `wechat_desktop` 段。启用通道时全局只需：
 
 ```json
 {

@@ -3850,7 +3850,7 @@ class ChannelsHandler:
                     ch_info["login_status"] = self._get_weixin_login_status()
                 if ch_name == "wechat_desktop" and ch_name in active_channels:
                     try:
-                        from channel.wechat_desktop.service import get_wechat_desktop_service
+                        from channel.wechat_desktop.storage.service import get_wechat_desktop_service
                         ch_info["desktop_status"] = get_wechat_desktop_service().status()
                     except Exception:
                         ch_info["desktop_status"] = {
@@ -4075,7 +4075,7 @@ class WechatDesktopStatusHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         web.header('Cache-Control', 'no-store')
         try:
-            from channel.wechat_desktop.service import get_wechat_desktop_service
+            from channel.wechat_desktop.storage.service import get_wechat_desktop_service
 
             return json.dumps(
                 {"status": "success", "desktop": get_wechat_desktop_service().status()},
@@ -4093,7 +4093,7 @@ class WechatDesktopPauseHandler:
             body = json.loads(web.data() or b"{}")
             if "paused" not in body:
                 raise ValueError("paused is required")
-            from channel.wechat_desktop.service import get_wechat_desktop_service
+            from channel.wechat_desktop.storage.service import get_wechat_desktop_service
 
             status = get_wechat_desktop_service().set_paused(bool(body["paused"]))
             return json.dumps({"status": "success", "desktop": status}, ensure_ascii=False)

@@ -20,7 +20,7 @@ from typing import Iterable, Iterator, Optional
 from urllib.parse import urlparse
 
 from common.log import file_logger, logger
-from channel.wechat_desktop.group_sender_ocr import RapidOcrGroupSenderResolver
+from channel.wechat_desktop.uia.group_sender_ocr import RapidOcrGroupSenderResolver
 from channel.wechat_desktop.models import (
     ConversationInfo,
     DEFAULT_SELF_SENDER_NAME,
@@ -33,7 +33,7 @@ from channel.wechat_desktop.models import (
     WechatHistoryReadError,
     WechatHistoryReadResult,
 )
-from channel.wechat_desktop.operations import (
+from channel.wechat_desktop.uia.operations import (
     conversation_titles_match,
     strip_member_count_suffix,
 )

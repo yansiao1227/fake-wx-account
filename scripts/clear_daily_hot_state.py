@@ -46,7 +46,7 @@ def _workspace_from_config_json() -> Path:
 
 
 def default_db_path() -> Path:
-    """Same default as ``channel.wechat_desktop.service._default_store_path``."""
+    """Same default as ``channel.wechat_desktop.storage.service._default_store_path``."""
     return _workspace_from_config_json() / "wechat_desktop.sqlite3"
 
 

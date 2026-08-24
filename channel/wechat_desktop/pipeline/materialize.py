@@ -1,0 +1,308 @@
+"""微信桌面通道的附件物化、引用判断和回复入队。"""
+
+from __future__ import annotations
+
+import os
+import queue
+import re
+import shutil
+import unicodedata
+import uuid
+from pathlib import Path
+
+from channel.wechat_desktop.models import WechatDesktopEvent
+from common.log import logger
+from common.utils import expand_path
+from config import conf
+
+
+class WechatDesktopMaterializeMixin:
+    """物化线程：解析附件、折叠批次，并把稳定事件写入回复 FIFO。"""
+
+    def _submit_materialization(self, events: list[WechatDesktopEvent]):
+        """原子地提交一个消息批次到附件物化线程。"""
+        if not events:
+            return False
+        with self._materialize_submit_lock:
+            if self._stop_event.is_set():
+                accepted = False
+            else:
+                self._materialize_queue.put(events)
+                accepted = True
+        if not accepted:
+            event_ids = [event.event_id for event in events]
+            for event_id in event_ids:
+                self._store.mark_event_processed(event_id)
+            self._finish_lifecycle(event_ids, "stopped")
+        return accepted
+
+    def _clear_pending_materializations(self) -> list[str]:
+        """清空尚未开始的物化批次，供停止和网络故障收尾使用。"""
+        event_ids = []
+        with self._materialize_submit_lock:
+            while True:
+                try:
+                    events = self._materialize_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if events is not self._materialize_stop:
+                    event_ids.extend(event.event_id for event in events)
+                self._materialize_queue.task_done()
+        return list(dict.fromkeys(event_ids))
+
+    @staticmethod
+    def _attachment_marker(event: WechatDesktopEvent) -> str:
+        """将已落盘附件表示成可放入 Agent 上下文的稳定文本标记。"""
+        if event.content_type == "file":
+            return f"[文件: {event.content}]"
+        if event.content_type == "image":
+            return f"[图片: {event.content}]"
+        return str(event.content or "")
+
+    @staticmethod
+    def _requires_attachment_reference(event: WechatDesktopEvent) -> bool:
+        """判断用户是否在未引用具体附件的情况下要求读取“这张图/文件”。
+
+        这种请求无法可靠确定目标，不能猜测最近附件；消费者会直接提示用户使用
+        微信引用功能后重试。生成图片之类的创作意图不属于此情况。
+        """
+        if event.content_type != "text":
+            return False
+        # 只要有明确引用，Agent 就已经有了唯一目标。被引用的文字本身可能在讨论
+        # 图片或文件；若把其措辞当成“未引用附件请求”，会错误地用提示语替换回复。
+        if event.reference:
+            return False
+        text = unicodedata.normalize("NFKC", str(event.content or "")).strip()
+        if not text or re.search(r"(?:生成|创建|制作|画一张|做一张)", text):
+            return False
+        attachment = re.search(
+            r"(?:图(?:片|像)?|照片|截图|文件|文档|附件|表格|PDF)",
+            text,
+            re.IGNORECASE,
+        )
+        question = re.search(
+            r"(?:是什么|是啥|什么内容|讲了?什么|写了?什么|说了?什么|"
+            r"内容是|分析|总结|概括|解读|看一下|看看|读一下|读取)",
+            text,
+            re.IGNORECASE,
+        )
+        return bool(attachment and question)
+
+    def _materialize_batch(
+        self, events: list[WechatDesktopEvent], *, before_share_fetch=None
+    ) -> WechatDesktopEvent:
+        """解析批次附件，并把多条消息折叠为一个可回复事件。
+
+        最后一条消息是回复目标，前面的同批消息并入它的历史。只有显式引用的附件
+        才会继续出现在普通文本上下文中，防止 Agent 把缓存中的旧图片误当成目标。
+        返回事件上的 ``_source_event_ids`` 和 ``_batch_id`` 用于生命周期追踪。
+        """
+        resolved_events = []
+        for event in events:
+            if before_share_fetch is None:
+                event, resolve_count = self._driver.materialize_event(event)
+            else:
+                event, resolve_count = self._driver.materialize_event(
+                    event, before_share_fetch=before_share_fetch
+                )
+            self._preserve_event_evidence(event)
+            resolved_events.append(event)
+            self._mark_lifecycle(
+                [event.event_id],
+                "materialized",
+                attachment_resolve_count=resolve_count,
+            )
+
+        target = resolved_events[-1]
+        batch_id = str(
+            getattr(events[-1], "_batch_id", "") or uuid.uuid4().hex
+        )
+        source_event_ids = [event.event_id for event in resolved_events]
+        history = list(target.history)
+        existing = {
+            (str(item.get("content") or ""), str(item.get("content_type") or ""))
+            for item in history
+        }
+        for event in resolved_events[:-1]:
+            content = self._attachment_marker(event)
+            key = (content, event.content_type)
+            replaced_history_item = False
+            if event.message_stable_id:
+                for item in history:
+                    if (
+                        str(item.get("_message_stable_id") or "")
+                        == event.message_stable_id
+                    ):
+                        item["content"] = content
+                        item["content_type"] = event.content_type
+                        replaced_history_item = True
+                        existing.add(key)
+                        break
+            if replaced_history_item:
+                continue
+            if key not in existing:
+                history.append(
+                    {
+                        "sender_name": event.sender_name,
+                        "content": content,
+                        "content_type": event.content_type,
+                    }
+                )
+                existing.add(key)
+        reference_type = str(target.reference.get("content_type") or "").lower()
+        if (
+            target.content_type == "text"
+            and reference_type not in {"file", "image"}
+        ):
+            # 缓存附件不能作为隐式上下文。文字消息必须明确引用目标附件后，
+            # Agent 才能看到该附件。
+            history = [
+                item
+                for item in history
+                if str(item.get("content_type") or "") not in {"file", "image"}
+            ]
+        target.history = history
+        setattr(target, "_source_event_ids", source_event_ids)
+        setattr(target, "_batch_id", batch_id)
+        setattr(
+            target,
+            "_cache_only",
+            bool(resolved_events)
+            and all(
+                event.content_type == "file" and not event.reference
+                for event in resolved_events
+            ),
+        )
+        setattr(
+            target,
+            "_attachment_reference_required",
+            self._requires_attachment_reference(target),
+        )
+        self._mark_lifecycle(
+            source_event_ids,
+            "materialized",
+            batch_id=batch_id,
+        )
+        return target
+
+    @staticmethod
+    def _has_referenced_attachment(event: WechatDesktopEvent) -> bool:
+        """任何未解析引用都在 FIFO 队首占用微信窗口定位原文。"""
+        if not event.reference:
+            return False
+        reference_type = str(event.reference.get("content_type") or "").lower()
+        return (
+            reference_type in {"file", "image", "share_card"}
+            or not bool(event.reference.get("resolved", False))
+        )
+
+    def _prepare_deferred_materialization(
+        self, events: list[WechatDesktopEvent]
+    ) -> WechatDesktopEvent:
+        """为引用附件创建轻量队列项，把实际解析推迟到回复 FIFO 队首。
+
+        图片查看器和原文件定位会操作当前微信窗口；若在物化线程提前执行，可能与
+        正在发送的上一条回复抢占窗口，因此这里只保存原始事件列表。
+        """
+        target = events[-1]
+        source_event_ids = [event.event_id for event in events]
+        batch_id = uuid.uuid4().hex
+        setattr(target, "_source_event_ids", source_event_ids)
+        setattr(target, "_batch_id", batch_id)
+        setattr(target, "_deferred_materialization_events", list(events))
+        setattr(target, "_attachment_reference_required", False)
+        return target
+
+    def _consume_materialization_queue(self):
+        """后台解析附件，并把结果转交回复 FIFO 或仅作为文件缓存结束。"""
+        while not self._stop_event.is_set():
+            try:
+                events = self._materialize_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if events is self._materialize_stop:
+                self._materialize_queue.task_done()
+                return
+            event_ids = [event.event_id for event in events]
+            materialization_active = getattr(
+                self, "_materialization_active", None
+            )
+            if materialization_active is not None:
+                materialization_active.set()
+            try:
+                if self._has_referenced_attachment(events[-1]):
+                    materialized = self._prepare_deferred_materialization(events)
+                else:
+                    materialized = self._materialize_batch(events)
+                if self._stop_event.is_set():
+                    for event_id in event_ids:
+                        self._store.mark_event_processed(event_id)
+                    self._finish_lifecycle(event_ids, "stopped")
+                elif bool(getattr(materialized, "_cache_only", False)):
+                    for event_id in event_ids:
+                        self._store.mark_event_processed(event_id)
+                    self._trace(
+                        "09-file-cached",
+                        "conversation=%s messages=%s",
+                        materialized.conversation_name,
+                        len(event_ids),
+                    )
+                    self._finish_lifecycle(event_ids, "cached")
+                else:
+                    self._enqueue_reply_event(materialized)
+            except Exception:
+                logger.exception("[WechatDesktop] message materialization failed")
+                for event_id in event_ids:
+                    self._store.mark_event_processed(event_id)
+                self._finish_lifecycle(event_ids, "failed")
+            finally:
+                if materialization_active is not None:
+                    materialization_active.clear()
+                self._materialize_queue.task_done()
+
+    def _enqueue_reply_event(self, event: WechatDesktopEvent):
+        """把稳定事件写入全局回复 FIFO，并标记其生命周期进入排队阶段。"""
+        enqueue_result = self._reply_queue.enqueue(event)
+        source_event_ids = list(
+            getattr(event, "_source_event_ids", None) or [event.event_id]
+        )
+        if not enqueue_result:
+            for event_id in source_event_ids:
+                self._store.mark_event_processed(event_id)
+            self._finish_lifecycle(source_event_ids, "duplicate")
+            return
+        self._mark_lifecycle(
+            source_event_ids,
+            "queued",
+            batch_id=str(getattr(event, "_batch_id", "") or event.event_id),
+        )
+        self._trace(
+            "09-queued",
+            "id=%s conversation=%s action=%s queue_depth=%s",
+            event.event_id[:10],
+            event.conversation_name,
+            enqueue_result.action,
+            self._reply_queue.status()["queue_depth"],
+        )
+        self._service.update_status(**self._reply_queue.status())
+
+    def _preserve_event_evidence(self, event: WechatDesktopEvent):
+        """把临时截图/附件复制到 Agent 工作区，避免微信缓存清理后路径失效。"""
+        source = str(event.evidence_path or "")
+        if not source or not os.path.isfile(source):
+            return
+        workspace = Path(expand_path(conf().get("agent_workspace", "~/cow")))
+        evidence_dir = workspace / "wechat_evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        suffix = Path(source).suffix or ".png"
+        target = evidence_dir / f"{event.event_id}{suffix}"
+        try:
+            shutil.copy2(source, target)
+            old_source = event.evidence_path
+            event.evidence_path = str(target)
+            if event.content_type == "image" and event.content == old_source:
+                event.content = str(target)
+            if event.reference.get("file_path") == old_source:
+                event.reference["file_path"] = str(target)
+        except OSError as exc:
+            logger.warning(f"[WechatDesktop] failed to preserve evidence: {exc}")

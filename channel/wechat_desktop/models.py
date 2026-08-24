@@ -8,6 +8,9 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from bridge.context import ContextType
+from channel.chat_message import ChatMessage
+
 
 UNKNOWN_SENDER_NAME = "unknown"
 DEFAULT_SELF_SENDER_NAME = "自己"
@@ -172,6 +175,36 @@ class WechatDesktopEvent:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+class WechatDesktopMessage(ChatMessage):
+    """把统一事件转成 ChatChannel 可消费的消息对象。"""
+
+    def __init__(self, event: WechatDesktopEvent):
+        super().__init__(event.to_dict())
+        self.event = event
+        self.msg_id = event.event_id
+        self.create_time = event.observed_at
+        if event.content_type == "image":
+            self.ctype = ContextType.IMAGE
+        elif event.content_type == "file" and os.path.isfile(str(event.content or "")):
+            self.ctype = ContextType.FILE
+        else:
+            self.ctype = ContextType.TEXT
+        self.content = event.content
+        self.from_user_id = event.sender_id
+        self.from_user_nickname = event.sender_name
+        self.to_user_id = "wechat_desktop_self"
+        self.to_user_nickname = "我"
+        self.other_user_id = event.conversation_id
+        self.other_user_nickname = event.conversation_name
+        self.is_group = event.is_group
+        self.is_at = event.is_at
+        self.actual_user_id = event.sender_id
+        self.actual_user_nickname = event.sender_name
+        self.at_list = []
+        self.self_display_name = ""
+        self.evidence_path = event.evidence_path
 
 
 @dataclass(frozen=True)

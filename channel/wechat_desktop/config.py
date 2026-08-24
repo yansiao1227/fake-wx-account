@@ -1,16 +1,18 @@
 """wechat_desktop 通道配置。
 
-本通道的**全部配置默认值与本机常用项**都写在本文件。根目录 ``config.json`` /
-``config-template.json`` **不必**再写 ``wechat_desktop`` 段；若 JSON 里出现该段，
-仅作为可选覆盖，会浅合并到本文件默认值之上。
+本通道的**全部业务配置**只写在本文件 ``DEFAULT_CONFIG``。包括 UIA 节拍、白名单、
+``shadow_mode``、限流、通知模板、每日热点、引用/附件策略等。
 
-全局/Agent 配置（模型、workspace 等）与密钥（``~/.cow/.env``）不放在这里。
+根目录 ``config.json`` / ``config-template.json`` / ``config.py`` 只放跨通道通用项
+（模型、Agent、``channel_type``、Web 控制台等），**不要**再写 ``wechat_desktop`` 段。
+全局/Agent 配置与密钥（``~/.cow/.env``）也不放在这里。
 """
 
 from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
+from common.log import logger
 from config import conf
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -73,6 +75,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
     # 可选诊断能力：会话扫描细粒度日志写入 run.log，不打印到控制台。
     "diagnostic_logging": True,
+
+    # 模型 API 有限次指数退避重试。相对上游 CowAgent 外层新增，只放本通道配置。
+    "model_api_max_retries": 3,
+    "model_api_retry_base_seconds": 2.0,
+    "model_api_retry_max_seconds": 10.0,
+    "model_api_retry_jitter_seconds": 0.5,
 
     # Agent 回复周期与工具调用进度通知。
     "reply_cycle_timeout_seconds": 180,
@@ -177,16 +185,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
 def load_wechat_desktop_config(
     raw: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
-    """合并通道默认配置与可选的用户覆盖。
+    """返回通道业务配置。
 
-    ``raw`` 通常来自 ``conf().get("wechat_desktop")``；缺省或为空时只用本文件默认值。
-    测试可直接传入字典。
+    运行时只读本文件 ``DEFAULT_CONFIG``，不再从根 ``config.json`` 合并
+    ``wechat_desktop`` 段。``raw`` 仅供测试注入覆盖。
     """
-    if raw is None:
-        configured = conf().get("wechat_desktop", {})
-    else:
-        configured = raw
     merged = dict(DEFAULT_CONFIG)
-    if isinstance(configured, Mapping):
-        merged.update(dict(configured))
+    if raw is None:
+        leftover = conf().get("wechat_desktop")
+        if leftover:
+            logger.warning(
+                "[WechatDesktop] 已忽略 config.json 中的 wechat_desktop 段；"
+                "请把业务配置写到 channel/wechat_desktop/config.py"
+            )
+        return merged
+    if isinstance(raw, Mapping):
+        merged.update(dict(raw))
     return merged

@@ -9,8 +9,8 @@ from types import SimpleNamespace
 
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
-from channel.wechat_desktop.fifo_queue import WechatReplyQueue
-from channel.wechat_desktop.group_sender_ocr import (
+from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
+from channel.wechat_desktop.uia.group_sender_ocr import (
     OcrTextLine,
     RapidOcrGroupSenderResolver,
 )
@@ -21,23 +21,23 @@ from channel.wechat_desktop.models import (
     UiaChatMessage,
     UiaReferencedMessage,
     WechatDesktopEvent,
+    WechatDesktopMessage,
     WechatHistoryMessage,
     WechatHistoryReadResult,
 )
-from channel.wechat_desktop.operations import resolve_local_media_path
-from channel.wechat_desktop.shell_hook import WindowsShellHook
-from channel.wechat_desktop.uia_client import (
+from channel.wechat_desktop.uia.operations import resolve_local_media_path
+from channel.wechat_desktop.uia.shell_hook import WindowsShellHook
+from channel.wechat_desktop.uia.client import (
     WechatUiaClient,
     _encode_cf_hdrop,
     parse_session_accessible_name,
 )
-from channel.wechat_desktop.uia_driver import (
+from channel.wechat_desktop.uia.driver import (
     WechatUiaDriver,
     _UiaPriorityCoordinator,
 )
-from channel.wechat_desktop.wechat_desktop_message import WechatDesktopMessage
 from channel.wechat_desktop.config import DEFAULT_CONFIG
-from channel.wechat_desktop.wechat_desktop_channel import (
+from channel.wechat_desktop.pipeline.channel import (
     ATTACHMENT_REFERENCE_REQUIRED_REPLY,
     WechatDesktopChannel,
     _format_agent_notice,
@@ -1007,7 +1007,7 @@ def test_image_viewer_uia_close_clicks_when_invoke_is_a_noop(monkeypatch):
         win32gui, "IsWindowVisible", lambda hwnd: alive.get(hwnd, False)
     )
     monkeypatch.setattr(
-        "channel.wechat_desktop.uia_client.time.monotonic",
+        "channel.wechat_desktop.uia.client.time.monotonic",
         lambda: next(ticks),
     )
 
@@ -3642,7 +3642,7 @@ def test_global_reconcile_scan_is_disabled_by_default(monkeypatch):
         shell_hook=StopHook(),
     )
     monkeypatch.setattr(
-        "channel.wechat_desktop.uia_driver.time.monotonic", lambda: 1000.0
+        "channel.wechat_desktop.uia.driver.time.monotonic", lambda: 1000.0
     )
 
     assert driver.wait_for_changes(stop_event) == "stopped"
@@ -3655,7 +3655,7 @@ def test_global_reconcile_scan_can_be_enabled(monkeypatch):
 
     ticks = iter([0.0, 2.0, 2.0])
     monkeypatch.setattr(
-        "channel.wechat_desktop.uia_driver.time.monotonic", lambda: next(ticks)
+        "channel.wechat_desktop.uia.driver.time.monotonic", lambda: next(ticks)
     )
     driver = WechatUiaDriver(
         {
@@ -5026,7 +5026,7 @@ def test_share_browser_waits_until_uia_content_is_stable(monkeypatch):
     monkeypatch.setattr(client, "_read_share_browser_uia_content_once", read_once)
     monkeypatch.setattr(client, "_stop_event", SimpleNamespace(wait=wait))
     monkeypatch.setattr(
-        "channel.wechat_desktop.uia_client.time.monotonic", lambda: clock[0]
+        "channel.wechat_desktop.uia.client.time.monotonic", lambda: clock[0]
     )
 
     content = client._wait_for_share_browser_content(200)

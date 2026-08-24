@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
-from channel.wechat_desktop.store import WechatDesktopStore
+from channel.wechat_desktop.storage.store import WechatDesktopStore
 from common.utils import expand_path
 from config import conf
 

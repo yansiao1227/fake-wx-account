@@ -24,14 +24,14 @@ from channel.wechat_desktop.models import (
     WechatDesktopEvent,
     WechatHistoryReadResult,
 )
-from channel.wechat_desktop.backend import WechatDesktopBackend
-from channel.wechat_desktop.operations import (
+from channel.wechat_desktop.uia.backend import WechatDesktopBackend
+from channel.wechat_desktop.uia.operations import (
     WechatConversationSelector,
     WechatSendOperations,
     resolve_conversation_selector,
 )
-from channel.wechat_desktop.shell_hook import WindowsShellHook
-from channel.wechat_desktop.uia_client import WechatUiaClient
+from channel.wechat_desktop.uia.shell_hook import WindowsShellHook
+from channel.wechat_desktop.uia.client import WechatUiaClient
 
 
 class _UiaPriorityCoordinator:
@@ -223,7 +223,7 @@ class WechatUiaDriver(WechatDesktopBackend):
 
     def _is_reply_conversation(self, row_key: str, row) -> bool:
         with self._operation_lock:
-            from channel.wechat_desktop.operations import conversation_titles_match
+            from channel.wechat_desktop.uia.operations import conversation_titles_match
 
             return self.reply_in_flight and (
                 row_key == self._reply_conversation_id
@@ -1153,7 +1153,7 @@ class WechatUiaDriver(WechatDesktopBackend):
                         )
                         continue
                     if active_reply_conversation:
-                        from channel.wechat_desktop.operations import (
+                        from channel.wechat_desktop.uia.operations import (
                             conversation_titles_match,
                         )
 

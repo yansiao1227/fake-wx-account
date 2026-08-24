@@ -11,7 +11,7 @@ import threading
 from datetime import datetime
 from typing import Callable, Optional
 
-from channel.wechat_desktop.baidu_hot import build_daily_hot_message
+from channel.wechat_desktop.daily_hot.baidu_hot import build_daily_hot_message
 from common.log import logger
 
 STATE_LAST_DATE = "daily_hot_last_date"

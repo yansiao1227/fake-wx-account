@@ -243,7 +243,7 @@ def _clear_singleton_cache(channel_name: str):
         "web": "channel.web.web_channel.WebChannel",
         const.WEIXIN: "channel.weixin.weixin_channel.WeixinChannel",
         "wx": "channel.weixin.weixin_channel.WeixinChannel",
-        const.WECHAT_DESKTOP: "channel.wechat_desktop.wechat_desktop_channel.WechatDesktopChannel",
+        const.WECHAT_DESKTOP: "channel.wechat_desktop.pipeline.channel.WechatDesktopChannel",
     }
     module_path = cls_map.get(channel_name)
     if not module_path:

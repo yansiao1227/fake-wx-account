@@ -15,8 +15,9 @@ python -m pip install -r requirements-windows.txt
 
 Start and sign in to exactly one desktop WeChat instance, then configure:
 
-Channel settings live only in `channel/wechat_desktop/config.py`. Root
-`config.json` does **not** need a `wechat_desktop` block. To enable the channel:
+Channel business settings live only in `channel/wechat_desktop/config.py`. Root
+`config.json` holds generic items such as model and `channel_type`; do **not**
+add a `wechat_desktop` block. To enable the channel:
 
 ```json
 {
