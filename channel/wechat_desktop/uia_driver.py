@@ -107,7 +107,11 @@ class WechatUiaDriver(WechatDesktopBackend):
             str, OrderedDict[tuple[str, str], float]
         ] = {}
         self._message_snapshots: dict[str, list[UiaChatMessage]] = {}
-        self._known_groups = {str(x) for x in config.get("auto_reply_groups", [])}
+        self._known_groups = {
+            str(x)
+            for x in list(config.get("auto_reply_groups", []) or [])
+            + list(config.get("daily_hot_broadcast_groups", []) or [])
+        }
         self._known_group_keys: set[str] = set()
         self._reply_in_flight = threading.Event()
         self._reply_conversation = ""
@@ -589,7 +593,15 @@ class WechatUiaDriver(WechatDesktopBackend):
             target_index, target = self._select_reply_target(
                 messages, is_group, owner, conversation_id, conversation_name
             )
-            return [(target_index, target)] if target is not None else []
+            if target is None:
+                return []
+            target_key = self._target_key(target, target_index)
+            with self._operation_lock:
+                already_emitted = (
+                    self._emitted_targets.get(conversation_id) == target_key
+                    or self._was_recently_emitted(conversation_id, target)
+                )
+            return [] if already_emitted else [(target_index, target)]
         if not messages:
             return []
         is_known_outgoing = getattr(self.client, "is_known_outgoing_message", None)
@@ -606,7 +618,9 @@ class WechatUiaDriver(WechatDesktopBackend):
                 continue
             if is_known_outgoing and is_known_outgoing(conversation_name, message):
                 continue
-            if not is_group and message.direction == "outgoing":
+            # Group OCR can temporarily report an outgoing bubble as unknown;
+            # the client cache remains the authoritative echo backstop.
+            if message.direction == "outgoing":
                 continue
             if is_group and not self._mentions_owner(message.content, owner):
                 continue

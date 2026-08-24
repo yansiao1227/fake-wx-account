@@ -35,6 +35,11 @@ class WechatDesktopPolicy:
             target, self.config.get("auto_reply_blacklist", [])
         )
 
+    def is_daily_hot_target(self, target: str) -> bool:
+        """检查群聊是否属于每日热点目标数组。"""
+
+        return self._matches(target, self.config.get("daily_hot_broadcast_groups", []))
+
     def group_triggered(self, event: WechatDesktopEvent) -> bool:
         """根据群回复模式判断消息是否触发 Agent。"""
 
@@ -62,6 +67,20 @@ class WechatDesktopPolicy:
             return False
         if content_type != "text":
             return bool(self.config.get("auto_send_images", False))
+        return self.store.allow_rate(
+            int(self.config.get("max_send_per_minute", 5)),
+            int(self.config.get("max_send_per_hour", 60)),
+        )
+
+    def can_broadcast_daily_hot(self, target: str) -> bool:
+        """每日热点发送门禁：只看热点目标数组和黑名单，不走自动回复白名单。"""
+
+        if bool(self.config.get("shadow_mode", True)):
+            return False
+        if self.is_blocked(target):
+            return False
+        if not self.is_daily_hot_target(target):
+            return False
         return self.store.allow_rate(
             int(self.config.get("max_send_per_minute", 5)),
             int(self.config.get("max_send_per_hour", 60)),

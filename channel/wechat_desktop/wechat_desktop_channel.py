@@ -559,6 +559,9 @@ class WechatDesktopChannel(ChatChannel):
             ),
             auto_reply_contacts=list(self.config.get("auto_reply_contacts", [])),
             auto_reply_groups=list(self.config.get("auto_reply_groups", [])),
+            daily_hot_broadcast_groups=list(
+                self.config.get("daily_hot_broadcast_groups", [])
+            ),
             group_reply_mode=str(self.config.get("group_reply_mode", "at_or_prefix")),
             last_error="",
         )
@@ -702,6 +705,21 @@ class WechatDesktopChannel(ChatChannel):
                 event.content_type,
                 len(str(event.content or "")),
             )
+            if not recorded:
+                # The event ledger fingerprint is the final duplicate guard.
+                # A UIA snapshot can be re-emitted while a private reply is
+                # still being generated; never dispatch a duplicate event or
+                # it can be mistaken for a fresh incoming message and trigger
+                # a self-reply loop. This applies equally to private and group
+                # conversations.
+                self._store.mark_event_processed(event.event_id)
+                self._finish_lifecycle([event.event_id], "duplicate")
+                self._trace(
+                    "08-skip",
+                    "id=%s reason=duplicate_event_fingerprint",
+                    event.event_id[:10],
+                )
+                continue
             if event.kind == "message" and not (
                 first_poll
                 and baseline_history_exists.get(event.conversation_id, False)
@@ -1263,7 +1281,7 @@ class WechatDesktopChannel(ChatChannel):
         self._service.update_status(**self._reply_queue.status())
 
     def _resolve_daily_hot_target(self, group_name: str) -> tuple[str, str]:
-        """把 ``auto_reply_groups`` 中的群显示名解析为发送用会话 ID。
+        """把每日热点目标群显示名解析为发送用会话 ID。
 
         若扫描缓存里能唯一匹配到该标题，优先返回 ``uia-session:...``，便于发送时
         带上 runtime_id / row_index，降低点错会话的概率；否则退回显示名本身。
@@ -1291,10 +1309,10 @@ class WechatDesktopChannel(ChatChannel):
         return name, title
 
     def enqueue_daily_hot_broadcast(self, message: str) -> int:
-        """把已准备好的每日热点文案按白名单群拆成预写发送任务并入全局 FIFO。
+        """把已准备好的每日热点文案按目标群拆成预写发送任务并入全局 FIFO。
 
-        目标仅来自 ``auto_reply_groups`` 白名单（不是当前打开的会话，也不走
-        ``auto_reply_groups_all``）。返回成功入队的群数量。
+        目标仅来自 ``daily_hot_broadcast_groups``（不是当前打开的会话，也不走
+        ``auto_reply_groups`` / ``auto_reply_groups_all``）。返回成功入队的群数量。
         """
         text = str(message or "").strip()
         if not text:
@@ -1308,19 +1326,19 @@ class WechatDesktopChannel(ChatChannel):
             logger.info("[WechatDesktop][DailyHot] skip enqueue because paused")
             return 0
 
-        # 仅向 auto_reply_groups 白名单群广播，不使用 auto_reply_groups_all。
+        # 仅向 daily_hot_broadcast_groups 广播，不使用自动回复白名单。
         groups = [
             str(name).strip()
-            for name in self.config.get("auto_reply_groups", []) or []
+            for name in self.config.get("daily_hot_broadcast_groups", []) or []
             if str(name).strip()
         ]
         if not groups:
             logger.warning(
-                "[WechatDesktop][DailyHot] no targets: auto_reply_groups is empty"
+                "[WechatDesktop][DailyHot] no targets: daily_hot_broadcast_groups is empty"
             )
         else:
             logger.info(
-                "[WechatDesktop][DailyHot] enqueue targets from auto_reply_groups=%s",
+                "[WechatDesktop][DailyHot] enqueue targets from daily_hot_broadcast_groups=%s",
                 groups,
             )
         queued = 0
@@ -1334,7 +1352,7 @@ class WechatDesktopChannel(ChatChannel):
                     detail="blacklist",
                 )
                 continue
-            if not self._policy.is_allowlisted(group_name, True):
+            if not self._policy.is_daily_hot_target(group_name):
                 continue
             conversation_id, conversation_name = self._resolve_daily_hot_target(
                 group_name
@@ -1389,10 +1407,8 @@ class WechatDesktopChannel(ChatChannel):
         target_id = event.conversation_id
         if not text:
             return "skipped"
-        if bool(self._service.status().get("paused")) or not self._policy.can_auto_send(
-            target_name,
-            event.is_group,
-            "text",
+        if bool(self._service.status().get("paused")) or not self._policy.can_broadcast_daily_hot(
+            target_name
         ):
             self._store.audit(
                 "daily_hot_broadcast",

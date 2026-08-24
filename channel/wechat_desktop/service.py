@@ -46,6 +46,7 @@ class WechatDesktopService:
             "queue_superseded": 0,
             "auto_reply_contacts": [],
             "auto_reply_groups": [],
+            "daily_hot_broadcast_groups": [],
             "group_reply_mode": "at_only",
         }
 

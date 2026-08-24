@@ -148,7 +148,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -c "import sys; print(sys.executabl
 
 ## 每日热点广播
 
-可在每天固定本地时间，向 `auto_reply_groups` 白名单群推送百度热搜首条。准备在子线程完成，发送任务写入全局回复 FIFO，不打断正在进行的回复。
+可在每天固定本地时间，向 `daily_hot_broadcast_groups` 目标群推送百度热搜首条。准备在子线程完成，发送任务写入全局回复 FIFO，不打断正在进行的回复。该数组与自动回复白名单 `auto_reply_groups` 相互独立。
 
 文案流程：
 
@@ -164,7 +164,8 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -c "import sys; print(sys.executabl
 "daily_hot_broadcast_time": "18:00",
 "daily_hot_broadcast_tab": "livelihood",  # 与 skill baidu-hot-cn 榜单类型一致
 "daily_hot_broadcast_message_prefix": "📰 今日热点",
-"auto_reply_groups": ["测试群"],
+"daily_hot_broadcast_groups": ["测试群"],
+"auto_reply_groups": ["自动回复群"],
 "shadow_mode": False,
 ```
 
@@ -227,7 +228,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe scripts\replay_openai_failed_reques
 
 ### P1：每日热点广播（已完成）
 
-定时取榜 → 检索详情 → 模型概括评论 → 白名单群 FIFO 发送。
+定时取榜 → 检索详情 → 模型概括评论 → `daily_hot_broadcast_groups` 目标群 FIFO 发送。
 
 ### P1：群聊发送者 OCR（已完成）
 

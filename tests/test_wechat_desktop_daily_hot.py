@@ -90,6 +90,9 @@ def test_load_wechat_desktop_config_defaults_and_override():
     assert overridden["daily_hot_broadcast_enabled"] is True
     assert overridden["shadow_mode"] is False
     assert overridden["daily_hot_broadcast_tab"] == "livelihood"
+    assert "daily_hot_broadcast_groups" in loaded
+    assert loaded["daily_hot_broadcast_groups"] == DEFAULT_CONFIG["daily_hot_broadcast_groups"]
+    assert loaded["auto_reply_groups"] == DEFAULT_CONFIG["auto_reply_groups"]
 
 
 def test_resolve_qianfan_api_key_prefers_env_over_config():
@@ -457,7 +460,8 @@ def _make_channel_for_enqueue(tmp_path, config_overrides=None):
     channel = object.__new__(impl)
     channel.config = {
         "shadow_mode": False,
-        "auto_reply_groups": ["群A", "群B", "黑名单群"],
+        "auto_reply_groups": ["自动回复群"],
+        "daily_hot_broadcast_groups": ["群A", "群B", "黑名单群"],
         "auto_reply_blacklist": ["黑名单群"],
         "auto_reply_groups_all": False,
         "self_display_name": "我",
@@ -550,7 +554,8 @@ def test_enqueue_daily_hot_broadcast_resolves_session_id(tmp_path):
     channel = _make_channel_for_enqueue(
         tmp_path,
         {
-            "auto_reply_groups": ["小小地下联络站"],
+            "daily_hot_broadcast_groups": ["小小地下联络站"],
+            "auto_reply_groups": ["其他自动回复群"],
             "auto_reply_blacklist": [],
         },
     )
@@ -579,6 +584,44 @@ def test_enqueue_daily_hot_broadcast_shadow_mode(tmp_path):
     channel = _make_channel_for_enqueue(tmp_path, {"shadow_mode": True})
     assert channel.enqueue_daily_hot_broadcast("热点正文") == 0
     assert channel._reply_queue.status()["queue_depth"] == 0
+
+
+def test_enqueue_daily_hot_broadcast_ignores_auto_reply_groups(tmp_path):
+    channel = _make_channel_for_enqueue(
+        tmp_path,
+        {
+            "auto_reply_groups": ["自动回复群"],
+            "daily_hot_broadcast_groups": ["热点群"],
+            "auto_reply_blacklist": [],
+            "auto_reply_groups_all": True,
+        },
+    )
+    queued = channel.enqueue_daily_hot_broadcast("热点正文")
+    assert queued == 1
+    item = channel._reply_queue.get(timeout=0.5)
+    assert item.event.conversation_name == "热点群"
+
+
+def test_policy_daily_hot_target_is_independent_from_auto_reply(tmp_path):
+    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
+    policy = WechatDesktopPolicy(
+        {
+            "shadow_mode": False,
+            "auto_reply_groups": ["自动回复群"],
+            "auto_reply_groups_all": False,
+            "daily_hot_broadcast_groups": ["热点群"],
+            "auto_reply_blacklist": [],
+            "max_send_per_minute": 5,
+            "max_send_per_hour": 60,
+        },
+        store,
+    )
+    assert policy.is_allowlisted("热点群", True) is False
+    assert policy.can_auto_send("热点群", True, "text") is False
+    assert policy.is_daily_hot_target("热点群") is True
+    assert policy.can_broadcast_daily_hot("热点群") is True
+    assert policy.is_daily_hot_target("自动回复群") is False
+    assert policy.can_broadcast_daily_hot("自动回复群") is False
 
 
 def test_send_precomposed_reply(tmp_path):

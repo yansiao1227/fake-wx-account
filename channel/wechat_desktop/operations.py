@@ -60,7 +60,7 @@ def resolve_conversation_selector(
     """把内部会话 ID 转成客户端可使用的标题和 UIA 定位信息。
 
     优先按内部 key（``uia-session:...``）精确查找。若调用方传入的是显示名
-    （例如每日热点广播使用 ``auto_reply_groups`` 里的群名），再按标题唯一匹配。
+    （例如每日热点广播使用 ``daily_hot_broadcast_groups`` 里的群名），再按标题唯一匹配。
     标题歧义时不猜测，退回仅标题定位。
     """
 

@@ -3,7 +3,8 @@
 本目录把业务编排与微信客户端操作分成四层，后续替换微信版本或自动化方案时，
 应尽量保持上层不变。
 
-1. `config.py`：通道默认配置（含每日热点 `daily_hot_broadcast_*`）。用户覆盖在
+1. `config.py`：通道默认配置（含每日热点 `daily_hot_broadcast_*` 与独立目标数组
+   `daily_hot_broadcast_groups`，不复用 `auto_reply_groups`）。用户覆盖在
    根 `config.json` 的 `wechat_desktop` 对象；密钥不放这里。
 2. `wechat_desktop_channel.py`：通道编排层。负责事件聚合、回复队列、Agent 调用、
    策略检查和生命周期记录，不应直接访问 UIA 控件。也挂载每日热点调度器并把预写
