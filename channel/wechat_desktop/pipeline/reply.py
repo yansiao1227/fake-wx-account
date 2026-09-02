@@ -11,6 +11,7 @@ from channel.wechat_desktop.pipeline.prompts import (
     ATTACHMENT_REFERENCE_REQUIRED_REPLY,
     DEFAULT_BOT_MENTION_ALIASES,
     _format_agent_notice,
+    _is_user_visible_tool_notice,
     _preflight_tool_notice_data,
     _render_event_context_lines,
     _reply_requirements,
@@ -353,7 +354,7 @@ class WechatDesktopReplyMixin:
             return False
 
     def _send_share_content_fetch_notice(self, item: ReplyQueueItem) -> bool:
-        """浏览器提示未发送时，在网络回退前补发一次趣味提示。"""
+        """内置浏览器读不到正文、回退到 web_fetch 时补发一次进度提示。"""
         if not bool(self.config.get("agent_tool_notice_enabled", True)):
             return False
         context = {
@@ -407,6 +408,8 @@ class WechatDesktopReplyMixin:
                         item.event.conversation_name,
                         item.event.conversation_id,
                     )
+                    # 分享卡片打开内置浏览器时不发进度提示：发送会和浏览器
+                    # 小窗抢同一个微信窗口，实际经常发不出去。
                     notice_sent = self._send_deferred_attachment_notice(item)
 
                     def before_share_fetch():
@@ -675,24 +678,25 @@ class WechatDesktopReplyMixin:
                 event.conversation_name, event.conversation_id
             )
             try:
-                notice_data = None
-                if bool(self.config.get("agent_preflight_notice_enabled", True)):
+                # 附件物化阶段的进度通知可以提前发；Agent 侧等到真正开始
+                # 调用用户可理解的工具后再发，避免猜错下一步工具。
+                if bool(self.config.get("agent_preflight_notice_enabled", False)):
                     notice_data = _preflight_tool_notice_data(event)
-                if (
-                    notice_data
-                    and not context["wechat_desktop_agent_notice_sent"]
-                    and bool(
-                    self.config.get("agent_tool_notice_enabled", True)
-                    )
-                ):
-                    try:
-                        context["wechat_desktop_agent_notice_sent"] = (
-                            self._send_agent_tool_notice(context, notice_data)
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[WechatDesktop] Agent preflight notice failed: %s", exc
-                        )
+                    if (
+                        notice_data
+                        and not context["wechat_desktop_agent_notice_sent"]
+                        and bool(self.config.get("agent_tool_notice_enabled", True))
+                        and self._is_user_visible_tool_notice(notice_data)
+                    ):
+                        try:
+                            context["wechat_desktop_agent_notice_sent"] = (
+                                self._send_agent_tool_notice(context, notice_data)
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[WechatDesktop] Agent preflight notice failed: %s",
+                                exc,
+                            )
                 context["on_event"] = self._make_agent_event_callback(context)
                 self.produce(context)
             except Exception:
@@ -728,20 +732,21 @@ class WechatDesktopReplyMixin:
                     and bool(self.config.get("agent_tool_notice_enabled", True))
                 ):
                     data = event.get("data", {})
-                    tool_call_id = str(
-                        data.get("tool_call_id") or data.get("tool_name") or "tool"
-                    )
-                    with lock:
-                        once = bool(
-                            self.config.get("agent_tool_notice_once_per_reply", True)
+                    if self._is_user_visible_tool_notice(data):
+                        tool_call_id = str(
+                            data.get("tool_call_id") or data.get("tool_name") or "tool"
                         )
-                        if tool_call_id not in seen_tool_calls and not (
-                            once and notice_sent
-                        ):
-                            seen_tool_calls.add(tool_call_id)
-                            notice_sent = self._send_agent_tool_notice(
-                                context, data
-                            ) or notice_sent
+                        with lock:
+                            once = bool(
+                                self.config.get("agent_tool_notice_once_per_reply", True)
+                            )
+                            if tool_call_id not in seen_tool_calls and not (
+                                once and notice_sent
+                            ):
+                                seen_tool_calls.add(tool_call_id)
+                                notice_sent = self._send_agent_tool_notice(
+                                    context, data
+                                ) or notice_sent
             except Exception as exc:
                 logger.warning(
                     "[WechatDesktop] Agent tool notice failed: %s", exc
@@ -752,11 +757,17 @@ class WechatDesktopReplyMixin:
 
         return on_event
 
+    def _is_user_visible_tool_notice(self, data: dict) -> bool:
+        """通道配置下，这次工具调用是否应向微信用户发进度通知。"""
+        return _is_user_visible_tool_notice(
+            data, self.config.get("agent_tool_notice_silent_tools")
+        )
+
     def _send_agent_tool_notice(self, context: Context, data: dict) -> bool:
         """向当前微信会话发送工具/技能进度，并登记为不参与回复识别的临时文本。
 
-        发送前再次检查队列令牌、暂停状态、影子模式和白名单，防止过期 Agent 周期
-        或只观察模式产生额外消息。
+        发送前再次检查队列令牌、暂停状态、影子模式、白名单和底层工具过滤，
+        防止过期 Agent 周期、只观察模式或 bash/read 一类内部动作产生额外消息。
         """
         msg = context.get("msg")
         target_name = (
@@ -788,6 +799,8 @@ class WechatDesktopReplyMixin:
             or self._policy.is_blocked(target_name)
             or not self._policy.is_allowlisted(target_name, is_group)
         ):
+            return False
+        if not self._is_user_visible_tool_notice(data):
             return False
 
         kind, name = _tool_notice_subject(data)

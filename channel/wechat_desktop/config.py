@@ -86,7 +86,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "reply_cycle_timeout_seconds": 180,
     "agent_tool_notice_enabled": True,
     "agent_tool_notice_once_per_reply": True,
-    "agent_preflight_notice_enabled": True,
+    # 仅在 Agent 真正开始调用工具时通知；不要在 LLM 决策前提前猜工具。
+    "agent_preflight_notice_enabled": False,
+    # 用户看不懂的底层/内部工具不发微信进度通知。读取 SKILL.md 仍按 skill 通知。
+    "agent_tool_notice_silent_tools": [
+        "bash",
+        "ls",
+        "read",
+        "write",
+        "edit",
+        "send",
+        "env_config",
+        "memory_search",
+        "memory_get",
+        "evolution_undo",
+        "wechat_desktop",
+        "wechat_history",
+        "grep",
+        "find",
+    ],
     "agent_skill_notice_templates": [
         "这题得请 `{name}` skill 出场了，我去搬个救兵，稍等一下 🧰",
         "我先翻开 `{name}` skill 的小抄，马上回来 📖",
@@ -96,11 +114,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "我准备调用 `{tool_name}` tool 查一查，稍等我操作一下 🔧",
         "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
         "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
-    ],
-    "share_browser_notice_templates": [
-        "我钻进微信内置浏览器翻翻这张卡片，马上把重点捞回来 🧭",
-        "微信内置浏览器的小窗已经推开，我去页面里巡一圈，稍等片刻 👀",
-        "卡片先别跑，我让微信内置浏览器现场开箱，看看里面藏了什么 📦",
     ],
     "share_content_fetch_notice_templates": [
         "内置浏览器没读到正文，我改用 `web_fetch` 去拆这张卡片 🕵️",
@@ -115,7 +128,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
     "auto_reply_contacts": [],
     # 自动回复群白名单。与每日热点目标列表相互独立，互不影响。
-    "auto_reply_groups": ["小小地下联络站","2026国庆出游计划"],
+    "auto_reply_groups": ["小小地下联络站","JY生活问候群"],
     "group_reply_mode": "at_only",
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",

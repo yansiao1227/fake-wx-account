@@ -48,6 +48,20 @@ HISTORY_TIME_RE = re.compile(
     r"(?P<time>(?P<year>\d{4})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日\s*"
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2}))\s*$"
 )
+FILE_SIZE_RE = re.compile(
+    r"([0-9]+(?:\.[0-9]+)?)\s*(B|K|KB|M|MB|G|GB)",
+    re.IGNORECASE,
+)
+FILE_SIZE_UNITS = {
+    "B": 1,
+    "K": 1024,
+    "KB": 1024,
+    "M": 1024 ** 2,
+    "MB": 1024 ** 2,
+    "G": 1024 ** 3,
+    "GB": 1024 ** 3,
+}
+FILE_DUPLICATE_SUFFIX_RE = re.compile(r"(?:\s*\(\d+\))+$")
 
 
 def _text(value) -> str:
@@ -1442,33 +1456,57 @@ class WechatUiaClient:
         return "text"
 
     @staticmethod
-    def _file_card_metadata(content: str) -> tuple[str, Optional[int]]:
-        """Extract the filename and displayed size from a WeChat file card."""
+    def _file_card_fields(content: str) -> tuple[str, Optional[int], str]:
+        """Extract filename, parsed size, and the raw size token from a file card."""
         lines = [line.strip() for line in _text(content).splitlines() if line.strip()]
         if len(lines) < 2 or lines[0].casefold() not in {"文件", "file"}:
-            return "", None
+            return "", None, ""
         filename = Path(lines[1]).name.strip()
         if not filename or not Path(filename).suffix:
-            return "", None
-        size = None
-        if len(lines) >= 3:
-            match = re.fullmatch(
-                r"([0-9]+(?:\.[0-9]+)?)\s*(B|K|KB|M|MB|G|GB)",
-                lines[2],
-                re.IGNORECASE,
-            )
-            if match:
-                units = {
-                    "B": 1,
-                    "K": 1024,
-                    "KB": 1024,
-                    "M": 1024 ** 2,
-                    "MB": 1024 ** 2,
-                    "G": 1024 ** 3,
-                    "GB": 1024 ** 3,
-                }
-                size = int(float(match.group(1)) * units[match.group(2).upper()])
+            return "", None, ""
+        size_token = lines[2] if len(lines) >= 3 else ""
+        size = WechatUiaClient._parse_file_card_size(size_token)
+        return filename, size, size_token
+
+    @staticmethod
+    def _file_card_metadata(content: str) -> tuple[str, Optional[int]]:
+        """Extract the filename and displayed size from a WeChat file card."""
+        filename, size, _size_token = WechatUiaClient._file_card_fields(content)
         return filename, size
+
+    @staticmethod
+    def _parse_file_card_size(token: str) -> Optional[int]:
+        match = FILE_SIZE_RE.fullmatch(str(token or "").strip())
+        if not match:
+            return None
+        return int(float(match.group(1)) * FILE_SIZE_UNITS[match.group(2).upper()])
+
+    @staticmethod
+    def _cached_file_size_limit(size_token: str, expected_size: int) -> int:
+        """Allow both a 2% band and half of the file-card display quantum.
+
+        WeChat rounds the bubble size to the printed precision. A card that
+        says ``1.2M`` can therefore be ~0.05MiB away from 1.2 * 1024^2, which
+        already exceeds a plain 2% window.
+        """
+        percent_limit = max(2048, int(expected_size * 0.02))
+        match = FILE_SIZE_RE.fullmatch(str(size_token or "").strip())
+        if not match:
+            return percent_limit
+        number = match.group(1)
+        unit = match.group(2).upper()
+        decimals = len(number.split(".", 1)[1]) if "." in number else 0
+        quantum = FILE_SIZE_UNITS[unit] * (10 ** (-decimals))
+        rounding_limit = max(2048, int(quantum / 2))
+        return max(percent_limit, rounding_limit)
+
+    @staticmethod
+    def _cached_file_name_key(name: str) -> tuple[str, str]:
+        """Compare file-card names after NFKC and stripping ``(1)`` copies."""
+        normalized = unicodedata.normalize("NFKC", str(name or "")).casefold()
+        path = Path(normalized)
+        stem = FILE_DUPLICATE_SUFFIX_RE.sub("", path.stem).strip()
+        return stem, path.suffix
 
     def _self_sender_name(self) -> str:
         return (
@@ -2401,8 +2439,11 @@ class WechatUiaClient:
                 return False
             _, browser_pid = win32process.GetWindowThreadProcessId(browser_hwnd)
             _, main_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+            # 新版微信将分享页显示为主窗口右侧的 WebView 面板。该面板和
+            # 主窗口同进程，但不能因此把 ExtensionIndicator 等任意浮层误认
+            # 成浏览器；嵌入式页面固定使用 Chromium 的宿主窗口类。
             if int(browser_pid) == int(main_pid):
-                return True
+                return win32gui.GetClassName(browser_hwnd) == "Chrome_WidgetWin_0"
             process = win32api.OpenProcess(
                 win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
                 False,
@@ -2442,7 +2483,12 @@ class WechatUiaClient:
     def _find_opened_share_browser(
         self, main_hwnd: int, visible_before: set[int]
     ) -> int:
+        """定位独立或右侧嵌入式的微信分享页 WebView。"""
         import win32gui
+
+        embedded = self._find_embedded_share_browser(main_hwnd)
+        if embedded:
+            return embedded
 
         native_candidates = []
         foreground = int(win32gui.GetForegroundWindow() or 0)
@@ -2468,6 +2514,55 @@ class WechatUiaClient:
         if foreground in candidates:
             return foreground
         return candidates[0] if len(candidates) == 1 else 0
+
+    def _find_embedded_share_browser(self, main_hwnd: int) -> int:
+        """返回新版微信右侧分享页面板的原生窗口句柄。
+
+        新版客户端不再为分享页单独创建可由 ``EnumWindows`` 稳定枚举的
+        顶层窗口；页面作为主窗口中的 ``Chrome_WidgetWin_0`` 出现。通过
+        文档控件和右侧位置双重约束，避免将其它 Chromium 浮层误判为分享页。
+        """
+        try:
+            import uiautomation as auto
+
+            with auto.UIAutomationInitializerInThread():
+                root = auto.ControlFromHandle(main_hwnd)
+                root_bounds = _bounds(root)
+                if not root_bounds:
+                    return 0
+                left, _top, right, _bottom = root_bounds
+                width = max(1, right - left)
+                candidates: list[tuple[int, tuple[int, int, int, int]]] = []
+                for control in [root, *self._walk(root, 256)]:
+                    if _text(getattr(control, "ClassName", "")) != "Chrome_WidgetWin_0":
+                        continue
+                    handle = int(getattr(control, "NativeWindowHandle", 0) or 0)
+                    bounds = _bounds(control)
+                    if not handle or handle == int(main_hwnd) or not bounds:
+                        continue
+                    # 侧边栏从主窗口右半部分展开，并承载网页 DocumentControl。
+                    if bounds[0] < left + width * 0.45:
+                        continue
+                    descendants = [control, *self._walk(control, 96)]
+                    if not any(
+                        "document" in _text(
+                            getattr(item, "ControlTypeName", "")
+                        ).casefold()
+                        for item in descendants
+                    ):
+                        continue
+                    candidates.append((handle, bounds))
+                if not candidates:
+                    return 0
+                # 同时存在多个 WebView 时，选择最靠右的侧边页面。
+                candidates.sort(key=lambda item: (item[1][0], item[1][2]), reverse=True)
+                return candidates[0][0]
+        except Exception as exc:
+            logger.debug(
+                "[WechatDesktop][share-browser] embedded panel probe failed: %s",
+                exc,
+            )
+            return 0
 
     @staticmethod
     def _clipboard_unicode_after(action) -> str:
@@ -3116,6 +3211,7 @@ class WechatUiaClient:
                 Path.home() / "Documents" / "WeChat Files",
             ]
         )
+        roots.extend(self._xwechat_configured_file_roots())
         try:
             import win32api
             import win32con
@@ -3132,6 +3228,7 @@ class WechatUiaClient:
             finally:
                 process.Close()
             roots.append(executable.parent.parent / "Documents" / "xwechat_files")
+            roots.append(executable.parent.parent.parent / "Documents" / "xwechat_files")
         except Exception:
             pass
         unique = []
@@ -3147,26 +3244,59 @@ class WechatUiaClient:
                 unique.append(resolved)
         return unique
 
+    @staticmethod
+    def _xwechat_configured_file_roots() -> list[Path]:
+        """Read WeChat 4's custom documents path from xwechat config ini files."""
+        appdata = os.environ.get("APPDATA") or ""
+        config_dir = Path(appdata) / "Tencent" / "xwechat" / "config"
+        roots: list[Path] = []
+        try:
+            if not config_dir.is_dir():
+                return roots
+            for ini in config_dir.glob("*.ini"):
+                try:
+                    raw = ini.read_text(encoding="utf-8", errors="ignore").strip()
+                except OSError:
+                    continue
+                if not raw:
+                    continue
+                documents = Path(raw.splitlines()[0].strip())
+                nested = documents / "xwechat_files"
+                if nested.is_dir():
+                    roots.append(nested)
+                elif documents.is_dir():
+                    roots.append(documents)
+        except OSError:
+            return roots
+        return roots
+
     def _find_cached_message_file(self, content: str) -> str:
-        filename, expected_size = self._file_card_metadata(content)
+        filename, expected_size, size_token = self._file_card_fields(content)
         if not filename:
             return ""
-        original = Path(filename)
-        duplicate_name = re.compile(
-            rf"^{re.escape(original.stem)}(?:\s*\(\d+\))?{re.escape(original.suffix)}$",
-            re.IGNORECASE,
+        wanted_key = self._cached_file_name_key(filename)
+        if not wanted_key[0] or not wanted_key[1]:
+            return ""
+        size_limit = (
+            self._cached_file_size_limit(size_token, expected_size)
+            if expected_size is not None
+            else 0
         )
         candidates = []
         for root in self._wechat_data_roots():
             patterns = (
                 "*/msg/file/*/*",
+                "*/*/msg/file/*/*",
                 "*/FileStorage/File/*/*",
             )
             for pattern in patterns:
                 try:
                     paths = root.glob(pattern)
                     for path in paths:
-                        if not path.is_file() or not duplicate_name.fullmatch(path.name):
+                        if (
+                            not path.is_file()
+                            or self._cached_file_name_key(path.name) != wanted_key
+                        ):
                             continue
                         stat = path.stat()
                         size_gap = (
@@ -3174,9 +3304,7 @@ class WechatUiaClient:
                             if expected_size is not None
                             else 0
                         )
-                        if expected_size is not None and size_gap > max(
-                            2048, int(expected_size * 0.02)
-                        ):
+                        if expected_size is not None and size_gap > size_limit:
                             continue
                         candidates.append((size_gap, -stat.st_mtime_ns, path))
                 except OSError:
@@ -3404,8 +3532,13 @@ class WechatUiaClient:
                 logger.warning(
                     "[WechatDesktop] native Save As fallback failed: %s", exc
                 )
+        filename, expected_size = self._file_card_metadata(message.content)
         logger.warning(
-            "[WechatDesktop] file bubble was detected but no local file path was available: %s",
+            "[WechatDesktop] file bubble was detected but no local file path "
+            "was available: name=%s expected_size=%s roots=%s content=%s",
+            filename,
+            expected_size,
+            [str(root) for root in self._wechat_data_roots()],
             message.content,
         )
         return ""

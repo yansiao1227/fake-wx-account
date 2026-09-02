@@ -40,6 +40,7 @@ from channel.wechat_desktop.pipeline.prompts import (
     _format_agent_notice,
     _format_failure_notice,
     _is_network_reply_error,
+    _is_user_visible_tool_notice,
     _normalize_auto_reply_text,
     _preflight_tool_notice_data,
     _render_event_context_lines,

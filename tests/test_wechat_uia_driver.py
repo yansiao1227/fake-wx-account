@@ -43,6 +43,7 @@ from channel.wechat_desktop.pipeline.channel import (
     _format_agent_notice,
     _format_failure_notice,
     _is_network_reply_error,
+    _is_user_visible_tool_notice,
     _preflight_tool_notice_data,
     _render_event_context_lines,
     _reply_requirements,
@@ -2068,6 +2069,64 @@ def test_cached_file_match_uses_displayed_size_and_accepts_duplicate_suffix(
     assert matched == str(current)
 
 
+def test_cached_file_match_allows_one_decimal_size_rounding(tmp_path, monkeypatch):
+    month = tmp_path / "wxid_example" / "msg" / "file" / "2026-08"
+    month.mkdir(parents=True)
+    filename = "【（应届）多模态算法工程师_北京 40-70K】林芮瑭 26年应届生(1)(1).pdf"
+    cached = month / filename
+    cached.write_bytes(b"x" * 1_284_386)
+    client = WechatUiaClient({})
+    monkeypatch.setattr(client, "_wechat_data_roots", lambda: [tmp_path])
+
+    matched = client._find_cached_message_file(
+        "文件\n【（应届）多模态算法工程师_北京 40-70K】林芮瑭 26年应届生(1).pdf\n"
+        "1.2M\n微信电脑版"
+    )
+
+    assert matched == str(cached)
+    assert WechatUiaClient._cached_file_size_limit("1.2M", 1_258_291) >= 26_095
+
+
+def test_cached_file_match_strips_repeated_duplicate_suffix(tmp_path, monkeypatch):
+    month = tmp_path / "wxid_example" / "msg" / "file" / "2026-08"
+    month.mkdir(parents=True)
+    cached = month / "岗位JD(1)(1).pdf"
+    cached.write_bytes(b"x" * 4096)
+    client = WechatUiaClient({})
+    monkeypatch.setattr(client, "_wechat_data_roots", lambda: [tmp_path])
+
+    matched = client._find_cached_message_file("文件\n岗位JD.pdf\n4.0K\n微信电脑版")
+
+    assert matched == str(cached)
+
+
+def test_cached_file_name_key_normalizes_fullwidth_and_duplicate_suffix():
+    left = WechatUiaClient._cached_file_name_key(
+        "【（应届）岗位.pdf"
+    )
+    right = WechatUiaClient._cached_file_name_key(
+        "【(应届)岗位(1)(1).pdf"
+    )
+
+    assert left == right
+    assert left[1] == ".pdf"
+
+
+def test_xwechat_configured_file_roots_read_custom_documents(tmp_path, monkeypatch):
+    appdata = tmp_path / "appdata"
+    documents = tmp_path / "Wechat" / "Documents"
+    files_root = documents / "xwechat_files"
+    files_root.mkdir(parents=True)
+    config_dir = appdata / "Tencent" / "xwechat" / "config"
+    config_dir.mkdir(parents=True)
+    (config_dir / "account.ini").write_text(str(documents), encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    roots = WechatUiaClient._xwechat_configured_file_roots()
+
+    assert files_root.resolve() in [path.resolve() for path in roots]
+
+
 def test_store_file_in_project_tmp_preserves_bytes_and_deduplicates(tmp_path):
     source = tmp_path / "source" / "报告.txt"
     source.parent.mkdir()
@@ -3402,6 +3461,14 @@ def test_tool_notice_subject_recognizes_skill_reads_and_regular_tools():
         }
     ) == ("skill", "vision")
     assert _tool_notice_subject(
+        {
+            "tool_name": "read",
+            "arguments": {
+                "path": r"C:\cow\skills\@user_087fbff2\govwriting\SKILL.md"
+            },
+        }
+    ) == ("skill", "govwriting")
+    assert _tool_notice_subject(
         {"tool_name": "web_search", "arguments": {"query": "天气"}}
     ) == ("tool", "web_search")
 
@@ -3503,6 +3570,69 @@ def test_agent_error_sends_one_final_failure_notice():
     assert any(args[0] == "agent_failure_notice" for args, _ in audits)
 
 
+def test_user_visible_tool_notice_skips_internal_tools_but_keeps_skills():
+    assert _is_user_visible_tool_notice({"tool_name": "bash"}) is False
+    assert _is_user_visible_tool_notice({"tool_name": "read"}) is False
+    assert _is_user_visible_tool_notice({"tool_name": "ls"}) is False
+    assert _is_user_visible_tool_notice({"tool_name": "web_search"}) is True
+    assert _is_user_visible_tool_notice({"tool_name": "vision"}) is True
+    assert _is_user_visible_tool_notice(
+        {
+            "tool_name": "read",
+            "arguments": {"path": r"C:\cow\skills\docx\SKILL.md"},
+        }
+    ) is True
+    assert _is_user_visible_tool_notice(
+        {
+            "tool_name": "read",
+            "arguments": {
+                "path": r"C:\cow\skills\@user_087fbff2\govwriting\SKILL.md"
+            },
+        }
+    ) is True
+    assert _is_user_visible_tool_notice(
+        {"tool_name": "微信内置浏览器", "notice_template_key": "share_browser_notice_templates"}
+    ) is False
+    assert _is_user_visible_tool_notice(
+        {"tool_name": "web_fetch", "notice_template_key": "share_content_fetch_notice_templates"}
+    ) is True
+    assert _is_user_visible_tool_notice(
+        {"tool_name": "web_search"}, silent_tools=["web_search"]
+    ) is False
+
+
+def test_agent_callback_notifies_first_visible_tool_and_skips_bash():
+    channel = _bare_wechat_channel()
+    event = WechatDesktopEvent(
+        "message", "uia-session:a", "Alice", "a", "Alice", "text", "hello"
+    )
+    sent = []
+    lifecycle = []
+    downstream = []
+    channel.config = {
+        "agent_tool_notice_enabled": True,
+        "agent_tool_notice_once_per_reply": True,
+        "agent_tool_notice_silent_tools": DEFAULT_CONFIG["agent_tool_notice_silent_tools"],
+    }
+    channel._mark_lifecycle = lambda ids, stage, **_kwargs: lifecycle.append((ids, stage))
+    channel._send_agent_tool_notice = lambda _context, data: sent.append(data) or True
+    context = {
+        "on_event": lambda payload: downstream.append(payload["data"]["tool_name"]),
+        "wechat_desktop_source_event_ids": [event.event_id],
+        "wechat_desktop_agent_notice_sent": False,
+    }
+    on_event = channel._make_agent_event_callback(context)
+
+    on_event({"type": "tool_execution_start", "data": {"tool_name": "bash", "tool_call_id": "1"}})
+    on_event({"type": "tool_execution_start", "data": {"tool_name": "ls", "tool_call_id": "2"}})
+    on_event({"type": "tool_execution_start", "data": {"tool_name": "web_search", "tool_call_id": "3"}})
+    on_event({"type": "tool_execution_start", "data": {"tool_name": "vision", "tool_call_id": "4"}})
+
+    assert [item["tool_name"] for item in sent] == ["web_search"]
+    assert downstream == ["bash", "ls", "web_search", "vision"]
+    assert lifecycle[0][1] == "first_tool"
+
+
 def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     docx_event = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "file", r"C:\tmp\LDAP.docx"
@@ -3576,12 +3706,8 @@ def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     assert _tool_notice_subject(
         _preflight_tool_notice_data(pdf_reference)
     ) == ("skill", "pdf-reader")
-    share_notice = _preflight_tool_notice_data(share_reference)
-    assert _tool_notice_subject(share_notice) == ("tool", "微信内置浏览器")
-    assert share_notice["notice_template_key"] == "share_browser_notice_templates"
-    assert _tool_notice_subject(
-        _preflight_tool_notice_data(standalone_share)
-    ) == ("tool", "微信内置浏览器")
+    assert _preflight_tool_notice_data(share_reference) is None
+    assert _preflight_tool_notice_data(standalone_share) is None
     assert _preflight_tool_notice_data(text_event) is None
 
 
@@ -4463,7 +4589,7 @@ def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
     ]
 
 
-def test_share_browser_notice_is_displayed_only_once_before_materialization():
+def test_share_browser_notice_is_not_sent_before_materialization():
     channel = _bare_wechat_channel()
     channel._stop_event = threading.Event()
     channel._reply_queue = WechatReplyQueue()
@@ -4499,7 +4625,7 @@ def test_share_browser_notice_is_displayed_only_once_before_materialization():
     channel._mark_lifecycle = lambda *_args, **_kwargs: None
     channel._finish_lifecycle = lambda *_args, **_kwargs: None
     channel._send_deferred_attachment_notice = (
-        lambda _item: notices.append("微信内置浏览器") or True
+        lambda _item: notices.append("微信内置浏览器") or False
     )
     channel._send_share_content_fetch_notice = (
         lambda _item: notices.append("网络回退") or True
@@ -4515,7 +4641,7 @@ def test_share_browser_notice_is_displayed_only_once_before_materialization():
 
     channel._consume_reply_queue()
 
-    assert notices == ["微信内置浏览器"]
+    assert notices == ["微信内置浏览器", "网络回退"]
     assert getattr(event, "_preflight_attachment_notice_sent") is True
 
 
@@ -4918,6 +5044,30 @@ def test_share_browser_flow_clicks_quote_right_clicks_more_and_closes(monkeypatc
         ("copy", 200),
         ("close", (200, 100)),
     ]
+
+
+def test_share_browser_prefers_right_embedded_webview_panel(monkeypatch):
+    import uiautomation as auto
+
+    main = GeometryControl((0, 0, 1800, 1000))
+    side_document = GeometryControl((1000, 100, 1800, 1000), "文章正文")
+    side_document.ControlTypeName = "DocumentControl"
+    side_panel = GeometryControl(
+        (1000, 0, 1800, 1000), children=[side_document]
+    )
+    side_panel.ClassName = "Chrome_WidgetWin_0"
+    side_panel.NativeWindowHandle = 200
+    left_document = GeometryControl((0, 100, 700, 1000), "不是侧边分享页")
+    left_document.ControlTypeName = "DocumentControl"
+    left_panel = GeometryControl((0, 0, 700, 1000), children=[left_document])
+    left_panel.ClassName = "Chrome_WidgetWin_0"
+    left_panel.NativeWindowHandle = 201
+    main._children = [left_panel, side_panel]
+    client = WechatUiaClient({})
+
+    monkeypatch.setattr(auto, "ControlFromHandle", lambda _hwnd: main)
+
+    assert client._find_embedded_share_browser(100) == 200
 
 
 def test_share_browser_direct_read_skips_copy_link_and_closes(monkeypatch):

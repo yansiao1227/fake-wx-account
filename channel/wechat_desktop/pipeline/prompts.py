@@ -19,7 +19,7 @@ DEFAULT_BOT_MENTION_ALIASES = ("颜料盒bot",)
 
 
 def _normalize_auto_reply_text(value) -> str:
-    """去掉“建议回复：”等代写包装，只保留要发给微信用户的正文。"""
+    """清理代写包装及模型误附的末尾 ``...``，保留发送正文。"""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -38,6 +38,10 @@ def _normalize_auto_reply_text(value) -> str:
         if text.startswith(left) and text.endswith(right) and len(text) > 2:
             text = text[len(left):-len(right)].strip()
             break
+    # 部分模型会把日志/流式输出惯用的 ASCII 省略号带进最终答案。它不是
+    # 微信的“正在输入”状态，也不承载回复语义；只收掉末尾连续的 ``...``，
+    # 不触碰正文中的省略号或中文 ``……``。
+    text = re.sub(r"(?:\s*\.\.\.)+\s*$", "", text).rstrip()
     return text
 
 
@@ -155,22 +159,79 @@ def _reply_requirements(event: WechatDesktopEvent) -> str:
     )
 
 
-def _tool_notice_subject(data: dict) -> tuple[str, str]:
-    """返回通知类型和展示名，并把读取 SKILL.md 识别为技能调用。"""
-    tool_name = str(data.get("tool_name") or "tool").strip() or "tool"
-    arguments = data.get("arguments", {})
+_DEFAULT_SILENT_TOOL_NOTICE_NAMES = frozenset(
+    {
+        "bash",
+        "ls",
+        "read",
+        "write",
+        "edit",
+        "send",
+        "env_config",
+        "memory_search",
+        "memory_get",
+        "evolution_undo",
+        "wechat_desktop",
+        "wechat_history",
+        "grep",
+        "find",
+    }
+)
+
+
+def _normalize_tool_notice_arguments(arguments):
+    """把工具参数统一成 dict，兼容 JSON 字符串。"""
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
         except (TypeError, ValueError):
-            arguments = {}
-    if isinstance(arguments, dict):
-        for key in ("path", "file_path", "location"):
-            value = str(arguments.get(key) or "").replace("\\", "/").rstrip("/")
-            match = re.search(r"(?:^|/)skills/([^/]+)/SKILL\.md$", value, re.I)
-            if match:
-                return "skill", match.group(1)
+            return {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _tool_notice_subject(data: dict) -> tuple[str, str]:
+    """返回通知类型和展示名，并把读取 SKILL.md 识别为技能调用。
+
+    Skill 可以直接放在 ``skills/<name>``，也可以放在用户或市场命名空间
+    ``skills/@user_xxx/<name>``；展示名始终取紧邻 ``SKILL.md`` 的目录。
+    """
+    tool_name = str(data.get("tool_name") or "tool").strip() or "tool"
+    arguments = _normalize_tool_notice_arguments(data.get("arguments", {}))
+    for key in ("path", "file_path", "location"):
+        value = str(arguments.get(key) or "").replace("\\", "/").rstrip("/")
+        match = re.search(r"(?:^|/)skills/(?:[^/]+/)*([^/]+)/SKILL\.md$", value, re.I)
+        if match:
+            return "skill", match.group(1)
     return "tool", tool_name
+
+
+def _is_user_visible_tool_notice(data: dict, silent_tools=None) -> bool:
+    """判断这次工具调用是否值得向微信用户发进度通知。
+
+    真正开始执行时才通知；bash/read/ls 等底层工具默认静默。读取 SKILL.md
+    会显示成 skill 名，因此仍要通知。web_fetch 回退等带专用模板的通道通知
+    仍会发出。
+    """
+    if not data:
+        return False
+    template_key = str(data.get("notice_template_key") or "").strip()
+    if template_key == "share_browser_notice_templates":
+        return False
+    if template_key:
+        return True
+    kind, name = _tool_notice_subject(data)
+    if kind == "skill":
+        return True
+    names = {
+        str(item).strip().casefold()
+        for item in (
+            silent_tools
+            if silent_tools is not None
+            else _DEFAULT_SILENT_TOOL_NOTICE_NAMES
+        )
+        if str(item).strip()
+    }
+    return name.casefold() not in names
 
 
 def _format_agent_notice(templates: list[str], kind: str, name: str) -> str:
@@ -207,19 +268,15 @@ def _preflight_tool_notice_data(event: WechatDesktopEvent) -> dict | None:
         reference_type = str(event.reference.get("content_type") or "").lower()
         reference_path = str(event.reference.get("file_path") or "")
         if reference_type == "share_card":
-            return {
-                "tool_name": "微信内置浏览器",
-                "notice_template_key": "share_browser_notice_templates",
-            }
+            # 打开微信内置浏览器会占用当前窗口，进度提示经常发不出去，
+            # 也不再向用户预告这个底层动作。
+            return None
         if reference_type in {"image", "file"}:
             if not reference_path:
                 return None
             content_type, path = reference_type, reference_path
     if content_type == "share_card":
-        return {
-            "tool_name": "微信内置浏览器",
-            "notice_template_key": "share_browser_notice_templates",
-        }
+        return None
     if content_type == "image":
         return {"tool_name": "vision", "arguments": {"path": path}}
     if content_type != "file":
