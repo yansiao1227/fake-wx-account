@@ -7,7 +7,7 @@ Unlike ``web_search`` (raw multi-source snippets), this tool asks Qianfan to
 search the open web and return an LLM-summarized answer with citation markers
 and reference links. No query rewrite is applied — the user query is sent as-is.
 
-Like ``doubao_search``, successful results are returned as normal tool output
+Like ``ai_web_search``, successful results are returned as normal tool output
 for cowagent to compose the user-facing reply (no direct-final-answer
 short-circuit).
 
@@ -76,9 +76,9 @@ class BaiduAiSearch(BaseTool):
         "Real-time web Q&A via Baidu Qianfan Intelligent Search. Returns a "
         "summarized answer with citation markers plus source references for you "
         "to compose the user-facing reply (same agent-summary flow as "
-        "doubao_search). Search cascade: doubao_search → baidu_ai_search → "
-        "web_search. Prefer doubao_search first when available; use this when "
-        "Doubao is unavailable or you need a model-summarized search draft. "
+        "ai_web_search). Search cascade: ai_web_search → baidu_ai_search → "
+        "web_search. Prefer ai_web_search first (it routes here); call this "
+        "directly for a model-summarized search draft. "
         "Do not rewrite the query before calling. When the daily intelligent-"
         "search free quota is exhausted, this tool automatically falls back to "
         "web_search. When using the answer, cite the reference URLs as "
@@ -422,7 +422,7 @@ class BaiduAiSearch(BaseTool):
         if data.get("followup_queries"):
             output["followup_queries"] = data.get("followup_queries")
 
-        # Like doubao_search: leave composition to cowagent (no direct_final_answer).
+        # Like ai_web_search: leave composition to cowagent (no direct_final_answer).
         return ToolResult.success(output)
 
     @staticmethod

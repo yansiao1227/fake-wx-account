@@ -1432,7 +1432,7 @@ class AgentStreamExecutor:
         """Return a ready-made user reply when a single tool supplies one.
 
         Opt-in short-circuit for tools that set ``direct_final_answer``. Search
-        tools (doubao_search / baidu_ai_search / web_search) do not use this;
+        tools (ai_web_search / baidu_ai_search / web_search) do not use this;
         multi-tool turns never short-circuit.
         """
         if not tool_calls or not tool_results:

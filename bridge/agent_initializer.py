@@ -343,7 +343,7 @@ class AgentInitializer:
         
         for tool_name in tool_manager.tool_classes.keys():
             try:
-                # Search cascade: doubao_search → baidu_ai_search → web_search.
+                # Search cascade: ai_web_search → baidu_ai_search → web_search.
                 # Each tool's is_available() also considers its next fallback.
                 if tool_name == "web_search":
                     from agent.tools.web_search.web_search import WebSearch
@@ -360,12 +360,12 @@ class AgentInitializer:
                         )
                         continue
 
-                if tool_name == "doubao_search":
-                    from agent.tools.doubao_search.doubao_search import DoubaoSearch
-                    if not DoubaoSearch.is_available():
+                if tool_name == "ai_web_search":
+                    from agent.tools.ai_web_search.ai_web_search import AiWebSearch
+                    if not AiWebSearch.is_available():
                         logger.debug(
-                            "[AgentInitializer] DoubaoSearch skipped - "
-                            "no WEB_SEARCH_API_KEY and no baidu_ai_search/web_search fallback"
+                            "[AgentInitializer] AiWebSearch skipped - "
+                            "baidu_ai_search/web_search fallback unavailable"
                         )
                         continue
 

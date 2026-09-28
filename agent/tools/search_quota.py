@@ -29,7 +29,6 @@ CAP_BAIDU_AI_SEARCH = "baidu_ai_search"
 CAP_QUERY_REWRITE = "query_rewrite"
 CAP_QIANFAN = "qianfan"  # Baidu web_search provider
 CAP_TAVILY = "tavily"
-CAP_DOUBAO = "doubao"  # Volcengine 豆包搜索 / SearchInfinity
 
 _QUOTA_HINTS = (
     "quota",

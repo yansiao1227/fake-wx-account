@@ -1,0 +1,55 @@
+---
+title: ai_web_search - AI Web Search
+description: Preferred search entry that routes to baidu_ai_search
+---
+
+Preferred real-time web search entry for the agent.
+
+This tool is **not** mixed into `web_search` multi-source fan-out. Prefer it first for factual / timely questions; it immediately uses [`baidu_ai_search`](/tools/baidu-ai-search), which may further fall back to [`web_search`](/tools/web-search).
+
+### Search degradation chain
+
+```text
+ai_web_search  →  baidu_ai_search  →  web_search
+```
+
+Every call goes straight to `baidu_ai_search`.
+
+## Credential
+
+| Source | Field |
+| --- | --- |
+| Environment (recommended) | `QIANFAN_API_KEY` in `~/.cow/.env` (for `baidu_ai_search`) |
+| Config fallback | `qianfan_api_key` |
+| Last resort | `web_search` providers (Baidu / Tavily / DDGS / …) |
+
+## Configuration
+
+```json
+{
+  "tools": {
+    "ai_web_search": {
+      "fallback_to_baidu_ai_search": true
+    }
+  }
+}
+```
+
+- `fallback_to_baidu_ai_search`: keep `true` (default). Disabling this leaves the tool with nothing to call.
+
+Older configs that still use `tools.doubao_search` are read as a fallback.
+
+## Tool Parameters
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | Yes | Search keywords (recommend 1–100 characters) |
+| `count` | integer | No | Result count (1–50, default 10; baidu_ai_search caps at 20) |
+| `freshness` | string | No | `noLimit` / `oneDay` / `oneWeek` / `oneMonth` / `oneYear` / `YYYY-MM-DD..YYYY-MM-DD` |
+| `auth_level` | integer | No | Ignored (kept for compatibility) |
+| `query_rewrite` | boolean | No | Ignored (kept for compatibility) |
+| `summary` | boolean | No | Ignored (kept for compatibility) |
+
+## Citation
+
+When the answer uses search results, cite supporting URLs as clickable source links. The tool also returns a `citationPolicy` field on success, plus `fallback_from` / `fallback_reason`.

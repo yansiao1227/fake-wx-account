@@ -44,10 +44,7 @@
   "self_evolution_enabled": true,
   "mcp_tool_retrieval_enabled": false,
   "tools": {
-    "doubao_search": {
-      "api_key": "",
-      "auth_level": 0,
-      "query_rewrite": false,
+    "ai_web_search": {
       "fallback_to_baidu_ai_search": true
     },
     "web_search": {

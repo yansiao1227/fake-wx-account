@@ -8,7 +8,7 @@ description: 搜索互联网获取实时信息，支持多个搜索厂商
 另支持博查、智谱、LinkAI 等后端（`fixed` 策略或三源均不可用时的回退）。
 
 <Note>
-  火山引擎 **豆包搜索** 是独立工具：[`doubao_search`](/zh/tools/doubao-search)，**不是** `web_search` 的厂商。优先降级链：`doubao_search` → `baidu_ai_search` → `web_search`。
+  [`ai_web_search`](/zh/tools/ai-web-search) 是独立工具，**不是** `web_search` 的厂商。它直接走 `baidu_ai_search`。优先降级链：`ai_web_search` → `baidu_ai_search` → `web_search`。
 </Note>
 
 <Tip>

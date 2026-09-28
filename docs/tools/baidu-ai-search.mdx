@@ -5,7 +5,7 @@ description: Baidu Qianfan intelligent search that returns summarized answers wi
 
 Search the open web via [Baidu Qianfan Intelligent Search](https://cloud.baidu.com/doc/qianfan-api/s/Hmbu8m06u) and return an LLM-summarized answer with citation markers and source references.
 
-Search cascade sibling of [`doubao_search`](/tools/doubao-search): returns a model draft answer plus sources as **normal tool output**. Cowagent still composes the user-facing reply (no direct-final-answer short-circuit). The user query is sent **as-is** (no query rewrite). When the daily free quota is exhausted (or the remote API reports quota / rate-limit errors), `baidu_ai_search` automatically degrades to [`web_search`](/tools/web-search).
+Search cascade sibling of [`ai_web_search`](/tools/ai-web-search): returns a model draft answer plus sources as **normal tool output**. Cowagent still composes the user-facing reply (no direct-final-answer short-circuit). The user query is sent **as-is** (no query rewrite). When the daily free quota is exhausted (or the remote API reports quota / rate-limit errors), `baidu_ai_search` automatically degrades to [`web_search`](/tools/web-search).
 
 ## Credential
 
@@ -20,7 +20,7 @@ Reuses the Qianfan API key:
 
 1. **Prefer intelligent search** while local daily quota remains and the day is not marked exhausted.
 2. Call `POST /v2/ai_search/chat/completions` with a model (intelligent generation mode). **No query rewrite.**
-3. On success, return `answer` / `references` / `results` to the agent loop so **cowagent can summarize and format** the final user reply (same flow as `doubao_search`).
+3. On success, return `answer` / `references` / `results` to the agent loop so **cowagent can summarize and format** the final user reply (same flow as `ai_web_search`).
 4. On local quota exhaustion, missing key, timeout, or remote quota/billing errors → mark the day exhausted for `baidu_ai_search` and **fall back to `web_search`**.
 
 ## Configuration

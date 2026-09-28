@@ -1,0 +1,55 @@
+---
+title: ai_web_search - 智能联网搜索
+description: 首选联网搜索入口，直接走 baidu_ai_search
+---
+
+Agent 首选的实时联网搜索入口。
+
+**不与** `web_search` 多源 fan-out 混用；作为单独搜索工具注册，并处于降级链最优先位置。每次调用立即使用 [`baidu_ai_search`](/zh/tools/baidu-ai-search)，后者还可继续降级到 [`web_search`](/zh/tools/web-search)。
+
+### 搜索降级链
+
+```text
+ai_web_search  →  baidu_ai_search  →  web_search
+```
+
+所有调用直接进入 `baidu_ai_search`。
+
+## 凭证
+
+| 来源 | 字段 |
+| --- | --- |
+| 环境变量（推荐） | `~/.cow/.env` 中的 `QIANFAN_API_KEY`（给 `baidu_ai_search`） |
+| 配置回退 | `qianfan_api_key` |
+| 最后兜底 | `web_search` 各厂商（百度 / Tavily / DDGS / …） |
+
+## 配置
+
+```json
+{
+  "tools": {
+    "ai_web_search": {
+      "fallback_to_baidu_ai_search": true
+    }
+  }
+}
+```
+
+- `fallback_to_baidu_ai_search`：保持 `true`（默认）。关掉此项后工具没有可调用的后端。
+
+旧配置里的 `tools.doubao_search` 仍会作为回退读取。
+
+## 工具参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `query` | string | 是 | 搜索关键词（建议 1–100 字） |
+| `count` | integer | 否 | 返回条数（1–50，默认 10；baidu_ai_search 上限 20） |
+| `freshness` | string | 否 | `noLimit` / `oneDay` / `oneWeek` / `oneMonth` / `oneYear` / `YYYY-MM-DD..YYYY-MM-DD` |
+| `auth_level` | integer | 否 | 忽略（仅兼容旧调用） |
+| `query_rewrite` | boolean | 否 | 忽略（仅兼容旧调用） |
+| `summary` | boolean | 否 | 忽略（仅兼容旧调用） |
+
+## 引用要求
+
+使用搜索结果作答时，必须以可点击链接引用支持事实的 URL。成功调用会附带 `citationPolicy`，以及 `fallback_from` / `fallback_reason`。

@@ -153,7 +153,7 @@
               {
                 "group": "Optional Tools",
                 "pages": [
-                  "tools/doubao-search",
+                  "tools/ai-web-search",
                   "tools/baidu-ai-search",
                   "tools/web-search",
                   "tools/vision",
@@ -376,7 +376,7 @@
               {
                 "group": "可选工具",
                 "pages": [
-                  "zh/tools/doubao-search",
+                  "zh/tools/ai-web-search",
                   "zh/tools/baidu-ai-search",
                   "zh/tools/web-search",
                   "zh/tools/vision",

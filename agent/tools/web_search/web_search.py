@@ -37,8 +37,8 @@ Credentials
 
 Query rewrite docs: https://cloud.baidu.com/doc/qianfan-api/s/tmokwnznj
 
-Note: 火山引擎豆包搜索 is a separate tool ``doubao_search``, not a web_search
-provider.
+Note: ``ai_web_search`` is a separate tool (it routes to baidu_ai_search),
+not a web_search provider.
 """
 
 import json
@@ -345,8 +345,9 @@ class WebSearch(BaseTool):
     name: str = "web_search"
     description: str = (
         "Search the web for multi-source raw results (titles, URLs, snippets). "
-        "Search cascade: doubao_search → baidu_ai_search → web_search. Prefer doubao_search "
-        "first, then baidu_ai_search for summarized Q&A; use this tool as the last-resort "
+        "Search cascade: ai_web_search → baidu_ai_search → web_search. Prefer ai_web_search "
+        "first (it routes to baidu_ai_search), then "
+        "baidu_ai_search for summarized Q&A; use this tool as the last-resort "
         "fallback or when you need a broader multi-provider result list. "
         "When using these results in an answer, cite the supporting result URLs as "
         "clickable source links; do not present search-derived factual claims without citations."

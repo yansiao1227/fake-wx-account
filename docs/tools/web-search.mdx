@@ -8,7 +8,7 @@ Search the internet for multi-source raw results (titles, URLs, snippets). Suppo
 Default pipeline: optional Qianfan **query rewrite**, then parallel fan-out to **Baidu / Tavily / DDGS**, merge and rank by relevance.
 
 <Note>
-  Volcengine Doubao Search is a **separate** tool: [`doubao_search`](/tools/doubao-search). It is not a `web_search` provider. Preferred cascade: `doubao_search` → `baidu_ai_search` → `web_search`.
+  [`ai_web_search`](/tools/ai-web-search) is a **separate** tool, not a `web_search` provider. It routes to `baidu_ai_search`. Preferred cascade: `ai_web_search` → `baidu_ai_search` → `web_search`.
 </Note>
 
 Quota behavior: there is **no local request counter** for Baidu or Tavily. When rewrite, Baidu, or Tavily hits a remote free-tier / rate-limit error, a **same-day exhaustion flag** is stored and that capability is skipped for the rest of the day (no retries). Transient failures fall back for the current call only.

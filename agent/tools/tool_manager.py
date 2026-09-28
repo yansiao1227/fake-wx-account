@@ -45,12 +45,6 @@ def _expand_mcp_env_value(value: Any) -> Any:
         val = os.environ.get(key)
         if val:
             return val
-        # Agent Plan key often reuses the Ark / 豆包搜索 subscription key.
-        if key == "AGENT_PLAN_API_KEY":
-            for alt in ("WEB_SEARCH_API_KEY", "ARK_API_KEY", "DOUBAO_SEARCH_API_KEY"):
-                alt_val = os.environ.get(alt)
-                if alt_val:
-                    return alt_val
         return original
 
     def _replace_braced(match: re.Match) -> str:
@@ -74,8 +68,8 @@ def _normalize_mcp_configs(raw) -> list:
       - list format (mcp_servers):  [{"name": "x", "type": "stdio", ...}]
       - dict format (mcpServers):   {"x": {"command": "npx", ...}}
 
-    Official Volcengine-style configs often use ``transport: "http"`` instead of
-    ``type``. Map that before defaulting remote URL servers to SSE.
+    Remote configs may use ``transport: "http"`` instead of ``type``.
+    Map that before defaulting remote URL servers to SSE.
     """
     if isinstance(raw, list):
         items = list(raw)

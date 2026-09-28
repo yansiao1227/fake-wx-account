@@ -196,7 +196,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "find": "find files by pattern",
             "bash": "run shell commands",
             "terminal": "manage background processes",
-            "doubao_search": "primary real-time web search (Doubao; falls back to baidu_ai_search→web_search)",
+            "ai_web_search": "primary real-time web search (uses baidu_ai_search→web_search)",
             "baidu_ai_search": "web Q&A draft + sources (agent composes reply; falls back to web_search)",
             "web_search": "multi-source raw web search results (last-resort search)",
             "web_fetch": "fetch URL content",
@@ -218,7 +218,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
             "find": "按模式查找文件",
             "bash": "执行shell命令",
             "terminal": "管理后台进程",
-            "doubao_search": "首选实时联网搜索（豆包；失败降级 baidu_ai_search→web_search）",
+            "ai_web_search": "首选实时联网搜索（内部走 baidu_ai_search→web_search）",
             "baidu_ai_search": "联网问答草稿+来源（由 Agent 汇总回复；失败降级 web_search）",
             "web_search": "多源原始网页检索（搜索兜底）",
             "web_fetch": "获取URL内容",
@@ -235,7 +235,7 @@ def _build_tooling_section(tools: List[Any], language: str) -> List[str]:
     tool_order = [
         "read", "write", "edit", "ls", "grep", "find",
         "bash", "terminal",
-        "doubao_search", "baidu_ai_search", "web_search", "web_fetch", "browser",
+        "ai_web_search", "baidu_ai_search", "web_search", "web_fetch", "browser",
         "memory_search", "memory_get",
         "env_config", "scheduler", "send", "vision",
     ]

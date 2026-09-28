@@ -67,14 +67,14 @@ def _import_optional_tools():
     except Exception as e:
         logger.error(f"[Tools] BaiduAiSearch failed to load: {e}")
 
-    # DoubaoSearch Tool (Volcengine 豆包搜索 / SearchInfinity)
+    # AiWebSearch Tool (preferred search entry; routes to baidu_ai_search)
     try:
-        from agent.tools.doubao_search.doubao_search import DoubaoSearch
-        tools['DoubaoSearch'] = DoubaoSearch
+        from agent.tools.ai_web_search.ai_web_search import AiWebSearch
+        tools['AiWebSearch'] = AiWebSearch
     except ImportError as e:
-        logger.error(f"[Tools] DoubaoSearch not loaded - missing dependency: {e}")
+        logger.error(f"[Tools] AiWebSearch not loaded - missing dependency: {e}")
     except Exception as e:
-        logger.error(f"[Tools] DoubaoSearch failed to load: {e}")
+        logger.error(f"[Tools] AiWebSearch failed to load: {e}")
 
     # WebFetch Tool
     try:
@@ -102,7 +102,7 @@ EnvConfig = _optional_tools.get('EnvConfig')
 SchedulerTool = _optional_tools.get('SchedulerTool')
 WebSearch = _optional_tools.get('WebSearch')
 BaiduAiSearch = _optional_tools.get('BaiduAiSearch')
-DoubaoSearch = _optional_tools.get('DoubaoSearch')
+AiWebSearch = _optional_tools.get('AiWebSearch')
 WebFetch = _optional_tools.get('WebFetch')
 Vision = _optional_tools.get('Vision')
 GoogleSearch = _optional_tools.get('GoogleSearch')
@@ -183,7 +183,7 @@ __all__ = [
     'SchedulerTool',
     'BaiduAiSearch',
     'WebSearch',
-    'DoubaoSearch',
+    'AiWebSearch',
     'WebFetch',
     'Vision',
     'BrowserTool',

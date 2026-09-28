@@ -1255,24 +1255,24 @@ class AgentBridge:
         """
         Add or remove conditional tools based on current environment variables.
 
-        Search cascade: doubao_search → baidu_ai_search → web_search.
+        Search cascade: ai_web_search (routes to baidu_ai_search) → web_search.
         """
         try:
-            from agent.tools.doubao_search.doubao_search import DoubaoSearch
+            from agent.tools.ai_web_search.ai_web_search import AiWebSearch
 
-            has_tool = any(t.name == "doubao_search" for t in agent.tools)
-            available = DoubaoSearch.is_available()
+            has_tool = any(t.name == "ai_web_search" for t in agent.tools)
+            available = AiWebSearch.is_available()
 
             if available and not has_tool:
-                tool = DoubaoSearch()
+                tool = AiWebSearch()
                 tool.model = agent.model
                 agent.tools.append(tool)
-                logger.info("[AgentBridge] doubao_search tool added (now available)")
+                logger.info("[AgentBridge] ai_web_search tool added (now available)")
             elif not available and has_tool:
-                agent.tools = [t for t in agent.tools if t.name != "doubao_search"]
-                logger.info("[AgentBridge] doubao_search tool removed (no longer available)")
+                agent.tools = [t for t in agent.tools if t.name != "ai_web_search"]
+                logger.info("[AgentBridge] ai_web_search tool removed (no longer available)")
         except Exception as e:
-            logger.debug(f"[AgentBridge] Failed to refresh doubao_search tool: {e}")
+            logger.debug(f"[AgentBridge] Failed to refresh ai_web_search tool: {e}")
 
         try:
             from agent.tools.baidu_ai_search.baidu_ai_search import BaiduAiSearch

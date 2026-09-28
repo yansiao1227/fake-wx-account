@@ -84,7 +84,7 @@ def test_baidu_ai_search_request_matches_official_api(monkeypatch, tmp_path):
     assert result.result["references"][0]["url"] == "https://example.cn/oil"
     assert result.result["results"][0]["title"] == "油价调整"
     assert result.result["request_id"] == "req-ai-1"
-    # Same agent-summary flow as doubao_search: no direct-final short-circuit.
+    # Same agent-summary flow as ai_web_search: no direct-final short-circuit.
     assert "direct_final_answer" not in result.result
     assert "final_answer_text" not in result.result
     assert calls["url"] == "https://qianfan.baidubce.com/v2/ai_search/chat/completions"
