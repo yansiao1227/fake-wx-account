@@ -11,7 +11,7 @@ def test_mcp_config_loads_canonical_env_before_expanding_headers(
 ):
     env_file = tmp_path / ".cow" / ".env"
     env_file.parent.mkdir()
-    env_file.write_text("AGENT_PLAN_API_KEY=ark-test-value\n", encoding="utf-8")
+    env_file.write_text("EXAMPLE_MCP_TOKEN=secret-test-value\n", encoding="utf-8")
 
     mcp_file = tmp_path / "cow" / "mcp.json"
     mcp_file.parent.mkdir()
@@ -19,11 +19,11 @@ def test_mcp_config_loads_canonical_env_before_expanding_headers(
         json.dumps(
             {
                 "mcpServers": {
-                    "datapro": {
+                    "example": {
                         "type": "http",
                         "url": "https://example.invalid/mcp",
                         "headers": {
-                            "X-Agent-Plan-Key": "${AGENT_PLAN_API_KEY}"
+                            "Authorization": "Bearer ${EXAMPLE_MCP_TOKEN}"
                         },
                     }
                 }
@@ -32,7 +32,7 @@ def test_mcp_config_loads_canonical_env_before_expanding_headers(
         encoding="utf-8",
     )
 
-    monkeypatch.delenv("AGENT_PLAN_API_KEY", raising=False)
+    monkeypatch.delenv("EXAMPLE_MCP_TOKEN", raising=False)
     monkeypatch.setattr(
         tool_manager_module,
         "expand_path",
@@ -42,7 +42,7 @@ def test_mcp_config_loads_canonical_env_before_expanding_headers(
 
     configs = ToolManager._load_mcp_configs(fake_manager)
 
-    assert configs[0]["headers"]["X-Agent-Plan-Key"] == "ark-test-value"
+    assert configs[0]["headers"]["Authorization"] == "Bearer secret-test-value"
 
 
 def test_refresh_all_skills_uses_canonical_env_path(monkeypatch, tmp_path):
