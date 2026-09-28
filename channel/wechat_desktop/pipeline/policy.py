@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.triggers import group_message_triggered
 
 
 class WechatDesktopPolicy:
@@ -45,43 +46,31 @@ class WechatDesktopPolicy:
 
         if not event.is_group:
             return True
-        mode = self.config.get("group_reply_mode", "at_or_prefix")
-        prefixes = self.config.get("group_command_prefixes", ["/cow"])
-        prefix_hit = any(event.content.lstrip().startswith(p) for p in prefixes if p)
-        if mode == "all":
-            return True
-        if mode == "at_only":
-            return bool(event.is_at)
-        if mode == "prefix":
-            return prefix_hit
-        return bool(event.is_at or prefix_hit)
+        return group_message_triggered(self.config, event.content, event.is_at)
 
-    def can_auto_send(self, target: str, is_group: bool, content_type: str) -> bool:
-        """执行最终发送门禁；影子模式下永远不自动发送。"""
-
-        if bool(self.config.get("shadow_mode", True)):
+    def allows_send(self, target: str, is_group: bool, content_type: str, *, daily_hot: bool = False) -> bool:
+        """无副作用的策略检查；发送额度由发送服务在操作前预留。"""
+        if bool(self.config.get("shadow_mode", True)) or self.is_blocked(target):
             return False
-        if self.is_blocked(target):
-            return False
+        if daily_hot:
+            return content_type == "text" and self.is_daily_hot_target(target)
         if not self.is_allowlisted(target, is_group):
             return False
-        if content_type != "text":
-            return bool(self.config.get("auto_send_images", False))
-        return self.store.allow_rate(
-            int(self.config.get("max_send_per_minute", 5)),
-            int(self.config.get("max_send_per_hour", 60)),
+        return content_type == "text" or (
+            content_type == "image" and bool(self.config.get("auto_send_images", False))
         )
+
+    def reserve_send(self, units: int = 1) -> bool:
+        from channel.wechat_desktop.config import DEFAULT_CONFIG
+        return self.store.allow_rate(
+            int(self.config.get("max_send_per_minute", DEFAULT_CONFIG["max_send_per_minute"])),
+            int(self.config.get("max_send_per_hour", DEFAULT_CONFIG["max_send_per_hour"])),
+            units=units,
+        )
+
+    def can_auto_send(self, target: str, is_group: bool, content_type: str) -> bool:
+        """兼容旧调用：检查策略并预留一条消息的额度。"""
+        return self.allows_send(target, is_group, content_type) and self.reserve_send()
 
     def can_broadcast_daily_hot(self, target: str) -> bool:
-        """每日热点发送门禁：只看热点目标数组和黑名单，不走自动回复白名单。"""
-
-        if bool(self.config.get("shadow_mode", True)):
-            return False
-        if self.is_blocked(target):
-            return False
-        if not self.is_daily_hot_target(target):
-            return False
-        return self.store.allow_rate(
-            int(self.config.get("max_send_per_minute", 5)),
-            int(self.config.get("max_send_per_hour", 60)),
-        )
+        return self.allows_send(target, True, "text", daily_hot=True) and self.reserve_send()

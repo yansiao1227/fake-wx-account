@@ -9,6 +9,8 @@ from typing import Callable, Mapping
 from urllib.parse import unquote
 
 from channel.wechat_desktop.models import ConversationInfo
+from channel.wechat_desktop.contracts import SendResult, SendStatus
+from channel.wechat_desktop.send_control import SendCancelled, SendNotSubmitted
 
 # WeChat group headers often append the member count, e.g. "项目群(9)" / "项目群（9）".
 # Session list AutomationId usually keeps the bare name (session_item_项目群).
@@ -91,17 +93,17 @@ def resolve_conversation_selector(
     )
 
 
-def build_delivery_result(result: dict, observation: dict) -> dict:
+def build_delivery_result(result: dict, observation: dict) -> SendResult:
     """统一封装发送结果，屏蔽不同微信后端的原始返回格式。"""
 
-    return {
+    return SendResult.from_backend({
         **result,
         "accepted_by": "uia",
         "verification": (
             "outgoing_uia_bubble" if result.get("verified") else "unverified"
         ),
         "observation": observation,
-    }
+    })
 
 
 def resolve_local_media_path(path_or_url: str) -> Path:
@@ -175,7 +177,7 @@ class WechatSendOperations:
         if hasattr(client, "uia_section"):
             client.uia_section = reply_session
 
-    def send_text(self, conversation: str, text: str, *, expedited: bool = False) -> dict:
+    def send_text(self, conversation: str, text: str, *, expedited: bool = False) -> SendResult:
         """发送文本；进度提示可通过 ``expedited`` 跳过拟人化节流。
 
         不在这里整体持有回复租约：客户端按有界 UI 段自行获取
@@ -189,20 +191,41 @@ class WechatSendOperations:
         }
         if expedited:
             kwargs["expedited"] = True
-        result = self._client.send_message(selector.title, text, **kwargs)
-        return build_delivery_result(result, self._observation_reader())
+        try:
+            result = self._client.send_message(selector.title, text, **kwargs)
+        except SendCancelled:
+            raise
+        except SendNotSubmitted as exc:
+            result = SendResult(SendStatus.NOT_SENT, str(exc))
+        except Exception as exc:
+            result = SendResult(SendStatus.UNCERTAIN, str(exc))
+        return self._result_with_observation(result)
 
-    def send_image(self, conversation: str, image_path: str) -> dict:
+    def _result_with_observation(self, result) -> SendResult:
+        try:
+            observation = self._observation_reader()
+        except Exception as exc:
+            observation = {"error": str(exc)}
+        return build_delivery_result(result, observation)
+
+    def send_image(self, conversation: str, image_path: str) -> SendResult:
         """解析为绝对路径后，通过微信文件粘贴能力发送图片。"""
 
-        path = str(resolve_local_media_path(image_path))
+        try:
+            path = str(resolve_local_media_path(image_path))
+        except (ValueError, OSError) as exc:
+            return SendResult(SendStatus.NOT_SENT, str(exc))
         if not Path(path).is_file():
-            raise FileNotFoundError(f"image file does not exist: {path}")
+            return SendResult(SendStatus.NOT_SENT, f"image file does not exist: {path}")
         selector = self._selector_resolver(conversation)
-        result = self._client.send_file(
-            selector.title,
-            [path],
-            runtime_id=selector.runtime_id,
-            row_index=selector.row_index,
-        )
-        return build_delivery_result(result, self._observation_reader())
+        try:
+            result = self._client.send_file(
+                selector.title, [path], runtime_id=selector.runtime_id, row_index=selector.row_index,
+            )
+        except SendCancelled:
+            raise
+        except SendNotSubmitted as exc:
+            result = SendResult(SendStatus.NOT_SENT, str(exc))
+        except Exception as exc:
+            result = SendResult(SendStatus.UNCERTAIN, str(exc))
+        return self._result_with_observation(result)

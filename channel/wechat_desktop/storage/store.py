@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+import hashlib
 import sqlite3
 import threading
 import time
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.contracts import EventReceipt, EVENT_TERMINALS, SendResult
 
 # Schema version used to gate one-time startup migrations.
 # Bump this whenever a new migration is added to _run_startup_migrations().
@@ -38,6 +39,7 @@ class WechatDesktopStore:
 
     def __init__(self, path: str):
         self.path = path
+        self.evidence_dir = Path(path).resolve().parent / "wechat_evidence"
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._tls = threading.local()
@@ -80,6 +82,33 @@ class WechatDesktopStore:
                     observed_at REAL NOT NULL,
                     processed_at REAL
                 );
+                CREATE TABLE IF NOT EXISTS broadcast_jobs (
+                    fire_date TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(fire_date, target)
+                );
+                CREATE TABLE IF NOT EXISTS managed_evidence (
+                    path TEXT PRIMARY KEY,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS event_runs (
+                    event_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    delivery_id TEXT PRIMARY KEY,
+                    event_ids TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL,
@@ -119,6 +148,18 @@ class WechatDesktopStore:
                     WHERE source_event_id != '';
                 """
             )
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(events)")}
+            if "managed_evidence_path" not in columns:
+                # 旧 evidence_path 的所有权未知，不能自动当作可删除的通道副本。
+                db.execute("ALTER TABLE events ADD COLUMN managed_evidence_path TEXT NOT NULL DEFAULT ''")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_events_managed_evidence ON events(managed_evidence_path) "
+                "WHERE managed_evidence_path != ''"
+            )
+            delivery_columns = {row["name"] for row in db.execute("PRAGMA table_info(deliveries)")}
+            if "dedupe_key" not in delivery_columns:
+                db.execute("ALTER TABLE deliveries ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dedupe ON deliveries(dedupe_key) WHERE dedupe_key != ''")
 
     # ------------------------------------------------------------------
     # Startup migrations (run at most once per DB file per version)
@@ -197,11 +238,136 @@ class WechatDesktopStore:
             except sqlite3.IntegrityError:
                 return False
 
-    def mark_event_processed(self, event_id: str):
+    def receive_event(self, event: WechatDesktopEvent) -> EventReceipt:
+        """原子登记事件与接收状态；重复快照返回原事件身份，不再次投递 Agent。"""
+        with self._lock:
+            db = self._connect()
+            # record_event 的兼容入口保留独立事务；接收使用 SAVEPOINT 覆盖两个写入。
+            db.execute("SAVEPOINT receive_event")
+            try:
+                fingerprint = event.fingerprint()
+                row = db.execute("SELECT event_id FROM events WHERE event_id=? OR fingerprint=?",
+                                 (event.event_id, fingerprint)).fetchone()
+                if row is not None:
+                    run = db.execute("SELECT state FROM event_runs WHERE event_id=?", (row["event_id"],)).fetchone()
+                    receipt = EventReceipt(event.event_id, row["event_id"], False, run["state"] if run else "legacy")
+                else:
+                    db.execute(
+                        "INSERT INTO events(event_id,fingerprint,kind,conversation_id,conversation_name,"
+                        "sender_id,sender_name,content_type,content,evidence_path,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (event.event_id, fingerprint, event.kind, event.conversation_id, event.conversation_name,
+                         event.sender_id, event.sender_name, event.content_type, event.content, event.evidence_path, event.observed_at),
+                    )
+                    db.execute("INSERT INTO event_runs VALUES (?, 'received', '', ?)", (event.event_id, time.time()))
+                    receipt = EventReceipt(event.event_id, event.event_id, True, "received")
+                db.execute("RELEASE receive_event")
+                return receipt
+            except Exception:
+                db.execute("ROLLBACK TO receive_event")
+                db.execute("RELEASE receive_event")
+                raise
+
+    def set_event_state(self, event_ids: Iterable[str], state: str, reason: str = ""):
+        if state not in EVENT_TERMINALS | {"received", "queued", "running", "sending"}:
+            raise ValueError(f"unknown event state: {state}")
+        with self._lock, self._connect() as db:
+            for event_id in dict.fromkeys(event_ids):
+                row = db.execute("SELECT state FROM event_runs WHERE event_id=?", (event_id,)).fetchone()
+                if row and row["state"] in EVENT_TERMINALS:
+                    continue  # 迟到回调不能把终态改回运行态或改写超时结果。
+                ranks = {"received": 0, "queued": 1, "running": 2, "sending": 3}
+                if row and state in ranks and ranks.get(row["state"], -1) > ranks[state]:
+                    continue
+                db.execute(
+                    "INSERT INTO event_runs(event_id,state,reason,updated_at) SELECT event_id,?,?,? FROM events WHERE event_id=? "
+                    "ON CONFLICT(event_id) DO UPDATE SET state=excluded.state,reason=excluded.reason,updated_at=excluded.updated_at",
+                    (state, reason, time.time(), event_id),
+                )
+                if state in EVENT_TERMINALS:
+                    db.execute("UPDATE events SET processed_at=? WHERE event_id=?", (time.time(), event_id))
+
+    def event_state(self, event_id: str) -> dict:
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT * FROM event_runs WHERE event_id=?", (event_id,)).fetchone()
+            return dict(row) if row else {}
+
+    def begin_delivery(self, event_ids: list[str], target: str, content_hash: str) -> str:
+        delivery_id = uuid.uuid4().hex
+        with self._lock, self._connect() as db:
+            db.execute("INSERT INTO deliveries(delivery_id,event_ids,target,content_hash,status,result,updated_at) VALUES (?,?,?,?, 'sending', '{}', ?)",
+                       (delivery_id, json.dumps(event_ids), target, content_hash, time.time()))
+        return delivery_id
+
+    def claim_delivery(self, event_ids: list[str], target: str, content_hash: str, *, retry_not_sent: bool = False) -> tuple[str, SendResult | None]:
+        """同一入站任务的同一输出只提交一次，日志不完整也不自动重放。"""
+        ids = json.dumps(sorted(set(event_ids)))
+        key = hashlib.sha256(json.dumps([ids, target, content_hash]).encode()).hexdigest() if event_ids else ""
+        delivery_id = uuid.uuid4().hex
+        with self._lock, self._connect() as db:
+            inserted = db.execute(
+                "INSERT OR IGNORE INTO deliveries(delivery_id,event_ids,target,content_hash,status,result,updated_at,dedupe_key) "
+                "VALUES (?,?,?,?, 'sending', '{}', ?, ?)",
+                (delivery_id, ids, target, content_hash, time.time(), key),
+            )
+            if inserted.rowcount:
+                return delivery_id, None
+            row = db.execute("SELECT delivery_id,result,status FROM deliveries WHERE dedupe_key=?", (key,)).fetchone()
+            if retry_not_sent and row["status"] == "not_sent":
+                db.execute("UPDATE deliveries SET status='sending',result='{}',updated_at=? WHERE delivery_id=?",
+                           (time.time(), row["delivery_id"]))
+                return row["delivery_id"], None
+            return row["delivery_id"], SendResult.from_backend(json.loads(row["result"]))
+
+    def finish_delivery(self, delivery_id: str, result: SendResult):
+        with self._lock, self._connect() as db:
+            db.execute("UPDATE deliveries SET status=?,result=?,updated_at=? WHERE delivery_id=?",
+                       (result.status.value, json.dumps(result.to_dict(), ensure_ascii=False), time.time(), delivery_id))
+
+    def delivery_outcome(self, event_ids: list[str], fallback: str) -> str:
+        """超时/退出时发送可能仍在另一线程，保守地保留不确定性。"""
+        with self._lock, self._connect() as db:
+            rows = db.execute("SELECT event_ids,status FROM deliveries WHERE status IN ('sending','unverified','partial','uncertain')").fetchall()
+        statuses = {row["status"] for row in rows if set(json.loads(row["event_ids"])).intersection(event_ids)}
+        if statuses.intersection({"sending", "unverified", "uncertain"}):
+            return "uncertain"
+        return "partial" if "partial" in statuses else fallback
+
+    def recover_interrupted_events(self) -> dict:
+        """只在旧工作线程全部退出后调用；普通消息不自动恢复执行。"""
+        counts = {"interrupted": 0, "uncertain": 0}
+        with self._lock:
+            with self._connect() as db:
+                rows = db.execute("SELECT event_id FROM event_runs WHERE state IN ('received','queued','running','sending')").fetchall()
+                db.execute("UPDATE deliveries SET status='uncertain',updated_at=? WHERE status='sending'", (time.time(),))
+            for row in rows:
+                state = self.delivery_outcome([row["event_id"]], "interrupted")
+                self.set_event_state([row["event_id"]], state, "restart_no_replay")
+                counts[state] = counts.get(state, 0) + 1
+        return counts
+
+    def mark_event_processed(self, event_id: str, terminal: str = "skipped", reason: str = ""):
+        self.set_event_state([event_id], terminal, reason)
         with self._lock, self._connect() as db:
             db.execute(
                 "UPDATE events SET processed_at=? WHERE event_id=?",
                 (time.time(), event_id),
+            )
+
+    def set_event_evidence(self, event_id: str, source: str, managed_path: str):
+        """只登记通道目录中的副本；源文件路径仅用于追溯，永不负责删除。"""
+        path = Path(managed_path).resolve()
+        if path.parent != self.evidence_dir.resolve():
+            raise ValueError("managed evidence must be inside the channel evidence directory")
+        with self._lock, self._connect() as db:
+            updated = db.execute(
+                "UPDATE events SET evidence_path=?, managed_evidence_path=? WHERE event_id=?",
+                (source, str(path), event_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("cannot attach evidence to an unknown event")
+            db.execute(
+                "INSERT OR IGNORE INTO managed_evidence(path, created_at) VALUES (?, ?)",
+                (str(path), time.time()),
             )
 
     def append_conversation_history(
@@ -221,24 +387,27 @@ class WechatDesktopStore:
             return False
         timestamp = float(created_at or time.time())
         with self._lock, self._connect() as db:
-            duplicate = db.execute(
-                """
-                SELECT 1 FROM conversation_history
-                 WHERE conversation_id=? AND sender_name=? AND direction=?
-                   AND content_type=? AND content=? AND created_at>=?
-                 LIMIT 1
-                """,
-                (
-                    str(conversation_id),
-                    str(sender_name or ""),
-                    str(direction or "incoming"),
-                    str(content_type),
-                    content,
-                    timestamp - 300,
-                ),
-            ).fetchone()
-            if duplicate is not None:
-                return False
+            # 有稳定事件身份时允许用户重复说同一句话；仅基线导入按内容去重。
+            if not source_event_id:
+                duplicate = db.execute(
+                    """
+                    SELECT 1 FROM conversation_history
+                     WHERE conversation_id=? AND sender_name=? AND direction=?
+                       AND content_type=? AND content=? AND created_at BETWEEN ? AND ?
+                     LIMIT 1
+                    """,
+                    (
+                        str(conversation_id),
+                        str(sender_name or ""),
+                        str(direction or "incoming"),
+                        str(content_type),
+                        content,
+                        timestamp - 300,
+                        timestamp + 300,
+                    ),
+                ).fetchone()
+                if duplicate is not None:
+                    return False
             try:
                 db.execute(
                     """
@@ -377,6 +546,7 @@ class WechatDesktopStore:
                 SELECT history_id, conversation_id, sender_name, direction,
                        content_type, content, created_at
                   FROM conversation_history
+                 WHERE source_event_id = ''
                  ORDER BY created_at, history_id
                 """
             ).fetchall()
@@ -440,7 +610,9 @@ class WechatDesktopStore:
         except Exception:
             return default
 
-    def allow_rate(self, per_minute: int, per_hour: int, kind: str = "send") -> bool:
+    def allow_rate(self, per_minute: int, per_hour: int, kind: str = "send", *, units: int = 1) -> bool:
+        if units < 1:
+            return False
         now = time.time()
         with self._lock, self._connect() as db:
             db.execute("DELETE FROM rate_events WHERE created_at < ?", (now - 3600,))
@@ -452,11 +624,11 @@ class WechatDesktopStore:
                 "SELECT COUNT(*) AS c FROM rate_events WHERE kind=? AND created_at>=?",
                 (kind, now - 3600),
             ).fetchone()["c"]
-            if minute_count >= int(per_minute) or hour_count >= int(per_hour):
+            if minute_count + units > int(per_minute) or hour_count + units > int(per_hour):
                 return False
-            db.execute(
+            db.executemany(
                 "INSERT INTO rate_events(created_at, kind) VALUES (?, ?)",
-                (now, kind),
+                [(now, kind)] * units,
             )
             return True
 
@@ -466,13 +638,7 @@ class WechatDesktopStore:
         history_retention_days: int = 90,
     ):
         cutoff = time.time() - max(1, int(retention_days)) * 86400
-        evidence_paths: List[str] = []
         with self._lock, self._connect() as db:
-            rows = db.execute(
-                "SELECT evidence_path FROM events WHERE observed_at < ?",
-                (cutoff,),
-            ).fetchall()
-            evidence_paths.extend(row["evidence_path"] for row in rows if row["evidence_path"])
             db.execute("DELETE FROM events WHERE observed_at < ?", (cutoff,))
             history_cutoff = time.time() - max(
                 1, int(history_retention_days)
@@ -481,8 +647,46 @@ class WechatDesktopStore:
                 "DELETE FROM conversation_history WHERE created_at < ?",
                 (history_cutoff,),
             )
-        for path in evidence_paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            # 持有存储锁直到删除完成，避免另一个事件刚登记共享副本就被删除。
+            rows = db.execute(
+                "SELECT path FROM managed_evidence WHERE path NOT IN "
+                "(SELECT managed_evidence_path FROM events WHERE managed_evidence_path != '')"
+            ).fetchall()
+            for row in rows:
+                path = Path(row["path"])
+                # 即便旧数据库被错误写入外部路径，也不越过目录边界删除。
+                if path.resolve().parent != self.evidence_dir.resolve():
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    # 保留登记，下一轮继续清理，避免永久遗留副本。
+                    continue
+                db.execute("DELETE FROM managed_evidence WHERE path=?", (row["path"],))
+
+
+    def ensure_broadcast_job(self, fire_date: str, target: str, message: str) -> dict:
+        with self._lock, self._connect() as db:
+            db.execute("INSERT OR IGNORE INTO broadcast_jobs(fire_date,target,message,status,updated_at) VALUES (?,?,?,'pending',?)",
+                       (fire_date, target, message, time.time()))
+            return dict(db.execute("SELECT * FROM broadcast_jobs WHERE fire_date=? AND target=?", (fire_date, target)).fetchone())
+
+    def set_broadcast_status(self, fire_date: str, target: str, status: str, *, expected: tuple[str, ...] = ()) -> bool:
+        with self._lock, self._connect() as db:
+            sql = "UPDATE broadcast_jobs SET status=?, updated_at=? WHERE fire_date=? AND target=?"
+            params = [status, time.time(), fire_date, target]
+            if expected:
+                sql += " AND status IN (" + ",".join("?" for _ in expected) + ")"
+                params.extend(expected)
+            return db.execute(sql, params).rowcount == 1
+
+    def has_pending_broadcasts(self, fire_date: str) -> bool:
+        with self._lock, self._connect() as db:
+            return db.execute("SELECT 1 FROM broadcast_jobs WHERE fire_date=? AND status IN ('pending','queued') LIMIT 1", (fire_date,)).fetchone() is not None
+
+    def broadcast_status_counts(self, fire_date: str) -> dict[str, int]:
+        with self._lock, self._connect() as db:
+            return {row["status"]: row["count"] for row in db.execute(
+                "SELECT status, COUNT(*) AS count FROM broadcast_jobs WHERE fire_date=? GROUP BY status",
+                (fire_date,),
+            )}

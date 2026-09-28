@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from dataclasses import asdict
 
+from channel.wechat_desktop.pipeline.delivery import DeliveryService, DeliveryBlocked
 from bridge.context import Context
 from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.pipeline.prompts import (
@@ -16,10 +18,24 @@ from channel.wechat_desktop.pipeline.prompts import (
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.models import WechatHistoryReadError
 from common.log import file_logger, logger
+from channel.wechat_desktop.contracts import SendResult
 
 
 class WechatDesktopSendMixin:
     """发送路径：安全门、目标复核、审计，以及受限的 Agent 动作入口。"""
+
+    def _deliver(self, target, content, **kwargs):
+        token = kwargs.get("token", "")
+        if not kwargs.get("source_event_ids"):
+            kwargs["source_event_ids"] = self._reply_queue.source_event_ids(token) if token else []
+        service = DeliveryService(
+            config=self.config, policy=self._policy, backend=self._driver,
+            is_paused=lambda: bool(self._service.status().get("paused")),
+            is_stopped=lambda: bool(getattr(self, "_stop_event", None) and self._stop_event.is_set()),
+            is_active=lambda token: self._reply_queue.is_active(token),
+            store=self._store,
+        )
+        return service.send(target, content, **kwargs)
 
     @staticmethod
     def _content_hash(content) -> str:
@@ -29,6 +45,14 @@ class WechatDesktopSendMixin:
     def send(self, reply: Reply, context: Context):
         """ChatChannel 发送入口；所有安全判断集中在 ``_send_reply_impl``。"""
         return self._send_reply_impl(reply, context)
+
+    def _send(self, reply: Reply, context: Context, retry_cnt=0):
+        """覆盖 ChatChannel 的通用重试：微信发送异常也不得自动重放。"""
+        try:
+            return self.send(reply, context)
+        except Exception:
+            context["wechat_desktop_queue_terminal"] = "uncertain"
+            logger.exception("[WechatDesktop] delivery aborted; automatic replay disabled")
 
     def _send_agent_failure_notice(
         self,
@@ -76,7 +100,7 @@ class WechatDesktopSendMixin:
             if bool(
                 context
                 and context.get("wechat_desktop_failure_notice_sent", False)
-            ) or bool(event and getattr(event, "_failure_notice_sent", False)):
+            ) or bool(event and event.task.failure_notice_sent):
                 return True
             is_group = bool(
                 getattr(event, "is_group", False)
@@ -93,25 +117,19 @@ class WechatDesktopSendMixin:
             notice = _format_failure_notice(
                 self.config.get("agent_failure_notice_templates", [])
             )
-            send_target = (
-                target_id
-                if str(target_id).startswith("uia-session:")
-                else target_name
-            )
+            send_target = (target_id or target_name)
             source_event_ids = list(
                 context.get("wechat_desktop_source_event_ids", [])
                 if context
-                else getattr(event, "_source_event_ids", None)
+                else event.task.source_event_ids
                 or ([event.event_id] if event is not None else [])
             )
             self._mark_lifecycle(source_event_ids, "send_started")
             try:
-                send_interim = getattr(self._driver, "send_interim_text", None)
-                result = (
-                    send_interim(send_target, notice)
-                    if send_interim
-                    else self._driver.send_text(send_target, notice)
-                )
+                result = self._deliver(send_target, notice, policy_target=target_name,
+                                       is_group=is_group, interim=True,
+                                       source_event_ids=source_event_ids,
+                                       token=queue_token if require_active else "")
                 if not result.get("success"):
                     raise RuntimeError(str(result.get("message") or "send failed"))
             except Exception as exc:
@@ -139,7 +157,7 @@ class WechatDesktopSendMixin:
             if context is not None:
                 context["wechat_desktop_failure_notice_sent"] = True
             if event is not None:
-                setattr(event, "_failure_notice_sent", True)
+                event.task.failure_notice_sent = True
             verified = bool(result.get("verified"))
             self._mark_lifecycle(
                 source_event_ids,
@@ -189,7 +207,9 @@ class WechatDesktopSendMixin:
         ):
             return
         context["wechat_desktop_reply_cycle"] = False
-        self._driver.end_reply_cycle()
+        token = str(context.get("wechat_desktop_queue_token") or "")
+        if not token or self._reply_queue.is_active(token):
+            self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
 
     def _success_callback(self, session_id, **kwargs):
         """Agent 成功结束时释放后端并唤醒等待中的 FIFO 消费者。"""
@@ -258,11 +278,7 @@ class WechatDesktopSendMixin:
         msg = context.get("msg")
         target_name = getattr(msg, "other_user_nickname", "") or context.get("receiver", "")
         target_id = getattr(msg, "other_user_id", "") or context.get("receiver", "")
-        send_target = (
-            target_id
-            if str(target_id).startswith("uia-session:")
-            else target_name
-        )
+        send_target = (target_id or target_name)
         is_group = bool(context.get("isgroup", False))
         source_type = str(
             context.get("wechat_desktop_source_type", "unknown")
@@ -324,7 +340,7 @@ class WechatDesktopSendMixin:
                 return
             can_auto = (
                 not paused
-                and self._policy.can_auto_send(target_name, is_group, "text")
+                and self._policy.allows_send(target_name, is_group, "text")
             )
             self._trace(
                 "10-reply-ready",
@@ -362,7 +378,17 @@ class WechatDesktopSendMixin:
                             )
                             return
                     self._mark_lifecycle(source_event_ids, "send_started")
-                    result = self._driver.send_text(send_target, reply_text)
+                    result = self._deliver(send_target, reply_text, policy_target=target_name,
+                                           is_group=is_group, token=queue_token, source_event_ids=source_event_ids)
+                    if result.get("status") in {"partial", "uncertain"}:
+                        context["wechat_desktop_queue_terminal"] = result["status"]
+                        self._store.audit(
+                            "send_text", target_name, result["status"], self._content_hash(reply_text),
+                            detail=json.dumps({key: result.get(key) for key in (
+                                "chunks", "submitted_chunks", "verified_chunks", "retryable", "message"
+                            )}, ensure_ascii=False),
+                        )
+                        return
                     if result.get("success"):
                         verified = bool(result.get("verified"))
                         self._mark_lifecycle(
@@ -395,9 +421,12 @@ class WechatDesktopSendMixin:
                             content=reply_text,
                             source_type=source_type,
                         )
-                        context["wechat_desktop_queue_terminal"] = "completed"
+                        context["wechat_desktop_queue_terminal"] = SendResult.from_backend(result).terminal
                         return
                     raise RuntimeError(str(result.get("message") or "send failed"))
+                except DeliveryBlocked:
+                    context["wechat_desktop_queue_terminal"] = "skipped"
+                    return
                 except Exception as exc:
                     self._mark_lifecycle(
                         source_event_ids,
@@ -424,7 +453,7 @@ class WechatDesktopSendMixin:
         if reply.type in (ReplyType.IMAGE, ReplyType.IMAGE_URL):
             can_auto = (
                 not paused
-                and self._policy.can_auto_send(target_name, is_group, "image")
+                and self._policy.allows_send(target_name, is_group, "image")
             )
             self._trace(
                 "10-image-ready",
@@ -439,7 +468,15 @@ class WechatDesktopSendMixin:
             if can_auto:
                 try:
                     self._mark_lifecycle(source_event_ids, "send_started")
-                    result = self._driver.send_image(send_target, str(reply.content))
+                    result = self._deliver(send_target, str(reply.content), policy_target=target_name,
+                                           is_group=is_group, content_type="image", token=queue_token, source_event_ids=source_event_ids)
+                    if result.get("status") in {"partial", "uncertain"}:
+                        context["wechat_desktop_queue_terminal"] = result["status"]
+                        self._store.audit(
+                            "send_image", target_name, result["status"], self._content_hash(reply.content),
+                            detail=str(result.get("message", "")),
+                        )
+                        return
                     if result.get("success"):
                         verified = bool(result.get("verified"))
                         self._mark_lifecycle(
@@ -453,7 +490,7 @@ class WechatDesktopSendMixin:
                             target_name,
                             verified,
                         )
-                        context["wechat_desktop_queue_terminal"] = "completed"
+                        context["wechat_desktop_queue_terminal"] = SendResult.from_backend(result).terminal
                         self._store.audit(
                             "send_image",
                             target_name,
@@ -516,7 +553,7 @@ class WechatDesktopSendMixin:
         discarded_event_ids.extend(self._clear_pending_materializations())
         discarded_event_ids = list(dict.fromkeys(discarded_event_ids))
         for event_id in discarded_event_ids:
-            self._store.mark_event_processed(event_id)
+            self._store.mark_event_processed(event_id, "failed", "network_queue_cancelled")
         self._finish_lifecycle(discarded_event_ids, "failed")
         error_detail = str(reply.content or "")
         self._trace(
@@ -632,7 +669,7 @@ class WechatDesktopSendMixin:
             }
 
         can_auto = (
-            self._policy.can_auto_send(
+            self._policy.allows_send(
                 conversation,
                 is_group,
                 "text",
@@ -645,7 +682,17 @@ class WechatDesktopSendMixin:
             }
 
         try:
-            result = self._driver.send_text(conversation, text)
+            result = self._deliver(conversation, text, policy_target=conversation, is_group=is_group)
+            if result.get("status") == "not_sent":
+                return {"status": "failed", "conversation": conversation,
+                        "verified": False, "retryable": False,
+                        "message": result.get("message", ""), "delivery": dict(result)}
+            if result.get("status") in {"partial", "uncertain"}:
+                self._store.audit(
+                    "send_text", conversation, result["status"], self._content_hash(text),
+                    detail=str(result.get("message", "")),
+                )
+                return {**result, "conversation": conversation}
             if result.get("success") and result.get("verified"):
                 self._store.audit(
                     "send_text",

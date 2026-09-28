@@ -9,7 +9,7 @@ from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessa
 from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
 from channel.wechat_desktop.storage.service import reset_wechat_desktop_service_for_tests
 from channel.wechat_desktop.storage.store import WechatDesktopStore
-from channel.wechat_desktop.pipeline.channel import _normalize_auto_reply_text
+from channel.wechat_desktop.pipeline.prompts import _normalize_auto_reply_text
 
 
 

@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from common.log import file_logger, logger
+from channel.wechat_desktop.config import DEFAULT_CONFIG
+from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus, SendResult, SendStatus
+from channel.wechat_desktop.send_control import check_send_allowed
 from channel.wechat_desktop.models import (
     ReplyTargetValidation,
     UNKNOWN_SENDER_NAME,
@@ -24,6 +27,7 @@ from channel.wechat_desktop.models import (
     WechatDesktopEvent,
     WechatHistoryReadResult,
 )
+from channel.wechat_desktop.triggers import group_message_triggered, group_requires_mention
 from channel.wechat_desktop.uia.backend import WechatDesktopBackend
 from channel.wechat_desktop.uia.operations import (
     WechatConversationSelector,
@@ -58,12 +62,17 @@ class _UiaPriorityCoordinator:
                     while self._owner is not None or (
                         not reply and self._reply_waiters > 0
                     ):
-                        self._condition.wait()
+                        if reply:
+                            check_send_allowed()
+                        self._condition.wait(timeout=0.05)
+                    if reply:
+                        check_send_allowed()
                     self._owner = thread_id
                     self._depth = 1
                 finally:
                     if registered_waiter:
                         self._reply_waiters -= 1
+                        self._condition.notify_all()
         try:
             yield
         finally:
@@ -101,6 +110,8 @@ class WechatUiaDriver(WechatDesktopBackend):
         self._hook_started = False
         self._last_hook_at = 0.0
         self._rows = {}
+        self._retry_conversations: set[str] = set()
+        self._unacknowledged_events: dict[str, WechatDesktopEvent] = {}
         self._conversation_selectors = {}
         self._emitted_targets: dict[str, str] = {}
         self._recent_emitted_identities: dict[
@@ -259,6 +270,11 @@ class WechatUiaDriver(WechatDesktopBackend):
     def wait_for_changes(self, stop_event: threading.Event) -> str:
         """Wait for a flash or the low-frequency reconciliation deadline."""
         self.start()
+        if self._retry_conversations or self._unacknowledged_events:
+            retry_delay = max(0.25, float(self.config.get(
+                "uia_scan_retry_seconds", DEFAULT_CONFIG["uia_scan_retry_seconds"]
+            )))
+            return "stopped" if stop_event.wait(retry_delay) else "scan-retry"
         reconcile_enabled = bool(
             self.config.get("shell_hook_reconcile_enabled", False)
         )
@@ -570,7 +586,9 @@ class WechatUiaDriver(WechatDesktopBackend):
             # must not suppress a real incoming message.
             if not is_group and message.direction == "outgoing":
                 continue
-            if not is_group or self._mentions_owner(message.content, owner):
+            if not is_group or group_message_triggered(
+                self.config, message.content, self._mentions_owner(message.content, owner)
+            ):
                 return index, message
         return -1, None
 
@@ -622,7 +640,9 @@ class WechatUiaDriver(WechatDesktopBackend):
             # the client cache remains the authoritative echo backstop.
             if message.direction == "outgoing":
                 continue
-            if is_group and not self._mentions_owner(message.content, owner):
+            if is_group and not group_message_triggered(
+                self.config, message.content, self._mentions_owner(message.content, owner)
+            ):
                 continue
             target_key = self._target_key(message, index)
             with self._operation_lock:
@@ -1017,7 +1037,7 @@ class WechatUiaDriver(WechatDesktopBackend):
             observed_at=time.time() + ordinal / 1_000_000.0,
             event_id=event_id,
         )
-        setattr(event, "_fingerprint_content", target_key)
+        event.task.fingerprint_content = target_key
         return event
 
     def observe_events(self) -> tuple[dict, list[WechatDesktopEvent]]:
@@ -1025,6 +1045,11 @@ class WechatUiaDriver(WechatDesktopBackend):
         # ``_operation_lock`` in short sections; never hold that state lock
         # while waiting for a scan-priority UIA lease.
         with self._scan_loop_lock:
+            with self._operation_lock:
+                pending = list(self._unacknowledged_events.values())
+            if pending:
+                # 接收端不可用时保留同一事件 ID，先交付旧批次，不继续堆积新快照。
+                return self._observation(read_owner=False, redelivery=True), pending
             try:
                 if self._reply_ui_pending.is_set():
                     return self._observation(
@@ -1045,6 +1070,7 @@ class WechatUiaDriver(WechatDesktopBackend):
                     first_scan = not self._rows
                     previous_rows = self._rows
                     self._rows = current_rows
+                    self._retry_conversations.intersection_update(current_rows)
                 process_startup_unread = bool(
                     self.config.get("process_startup_unread_messages", True)
                 )
@@ -1079,7 +1105,7 @@ class WechatUiaDriver(WechatDesktopBackend):
                     # A private conversation is only a discovery candidate
                     # while its session row says it has unread messages. The
                     # message itself is read only after entering the chat.
-                    if row.not_read_number > 0 or (
+                    if row_key in self._retry_conversations or row.not_read_number > 0 or (
                         row.mentions_self and changed
                     ) or active_reply_conversation:
                         candidates.append((row_key, row))
@@ -1123,186 +1149,202 @@ class WechatUiaDriver(WechatDesktopBackend):
                             )
 
                 events: list[WechatDesktopEvent] = []
+                scan_errors = []
                 ordinal = 0
                 for row_key, row in candidates:
-                    name = row.conversation_title
-                    active_reply_conversation = self._is_reply_conversation(
-                        row_key, row
-                    )
-                    if not active_reply_conversation and not discovery_focus_ready:
-                        self._trace(
-                            "02-skip",
-                            "conversation=%s reason=foreground_activation_deferred",
-                            name,
+                    try:
+                        name = row.conversation_title
+                        active_reply_conversation = self._is_reply_conversation(
+                            row_key, row
                         )
-                        continue
-                    with self._operation_lock:
-                        is_group = (
-                            row_key in self._known_group_keys
-                            or name in self._known_groups
-                        )
-                    if (
-                        is_group
-                        and not row.mentions_self
-                        and not active_reply_conversation
-                    ):
-                        self._trace(
-                            "02-skip",
-                            "conversation=%s reason=known_group_without_session_mention",
-                            name,
-                        )
-                        continue
-                    if active_reply_conversation:
-                        from channel.wechat_desktop.uia.operations import (
-                            conversation_titles_match,
-                        )
-
-                        header = self._scan_uia(self.client.get_title)
-                        if not conversation_titles_match(header.title, name):
+                        if not active_reply_conversation and not discovery_focus_ready:
                             self._trace(
                                 "02-skip",
-                                "conversation=%s reason=reply_monitor_not_active current=%s",
+                                "conversation=%s reason=foreground_activation_deferred",
                                 name,
-                                header.title or "<empty>",
                             )
                             continue
-                        is_group = header.header_type == "group"
-                        self._trace(
-                            "03-header",
-                            "conversation=%s title=%s type=%s members=%s monitor=background",
-                            name,
-                            header.title,
-                            header.header_type,
-                            header.chat_number,
-                        )
-                    elif not is_group:
-                        located = self._scan_uia(
-                            self.client.locate_conversation,
-                            name, row.runtime_id, row.row_index
-                        )
-                        self._trace(
-                            "03-enter",
-                            "conversation=%s located=%s runtime=%s row=%s",
-                            name,
-                            located,
-                            row.runtime_id or "<empty>",
-                            row.row_index,
-                        )
-                        if not located:
+                        with self._operation_lock:
+                            is_group = (
+                                row_key in self._known_group_keys
+                                or name in self._known_groups
+                            )
+                        if (
+                            is_group
+                            and group_requires_mention(self.config)
+                            and row_key not in self._retry_conversations
+                            and not row.mentions_self
+                            and not active_reply_conversation
+                        ):
+                            self._trace(
+                                "02-skip",
+                                "conversation=%s reason=known_group_without_session_mention",
+                                name,
+                            )
                             continue
-                        header = self._scan_uia(self.client.get_title)
-                        is_group = header.header_type == "group"
-                        self._trace(
-                            "03-header",
-                            "conversation=%s title=%s type=%s members=%s",
-                            name,
-                            header.title,
-                            header.header_type,
-                            header.chat_number,
-                        )
-                        if is_group:
-                            with self._operation_lock:
-                                self._known_group_keys.add(row_key)
-                            if (
-                                not row.mentions_self
-                                and not active_reply_conversation
-                            ):
+                        if active_reply_conversation:
+                            from channel.wechat_desktop.uia.operations import (
+                                conversation_titles_match,
+                            )
+
+                            header = self._scan_uia(self.client.get_title)
+                            if not conversation_titles_match(header.title, name):
                                 self._trace(
                                     "02-skip",
-                                    "conversation=%s reason=group_without_session_mention",
+                                    "conversation=%s reason=reply_monitor_not_active current=%s",
                                     name,
+                                    header.title or "<empty>",
                                 )
                                 continue
+                            is_group = header.header_type == "group"
+                            self._trace(
+                                "03-header",
+                                "conversation=%s title=%s type=%s members=%s monitor=background",
+                                name,
+                                header.title,
+                                header.header_type,
+                                header.chat_number,
+                            )
+                        elif not is_group:
+                            located = self._scan_uia(
+                                self.client.locate_conversation,
+                                name, row.runtime_id, row.row_index
+                            )
+                            self._trace(
+                                "03-enter",
+                                "conversation=%s located=%s runtime=%s row=%s",
+                                name,
+                                located,
+                                row.runtime_id or "<empty>",
+                                row.row_index,
+                            )
+                            if not located:
+                                continue
+                            header = self._scan_uia(self.client.get_title)
+                            is_group = header.header_type == "group"
+                            self._trace(
+                                "03-header",
+                                "conversation=%s title=%s type=%s members=%s",
+                                name,
+                                header.title,
+                                header.header_type,
+                                header.chat_number,
+                            )
+                            if is_group:
+                                with self._operation_lock:
+                                    self._known_group_keys.add(row_key)
+                                if (
+                                    group_requires_mention(self.config)
+                                    and row_key not in self._retry_conversations
+                                    and not row.mentions_self
+                                    and not active_reply_conversation
+                                ):
+                                    self._trace(
+                                        "02-skip",
+                                        "conversation=%s reason=group_without_session_mention",
+                                        name,
+                                    )
+                                    continue
 
-                    messages = self._scan_uia(
-                        self.client.get_chat_history,
-                        name,
-                        self._message_limit(),
-                        runtime_id=row.runtime_id,
-                        row_index=row.row_index,
-                        ensure_conversation=not active_reply_conversation,
-                    )
-                    messages = self._exclude_private_outgoing_messages(
-                        messages, name, is_group
-                    )
-                    messages = self._stabilize_messages(row_key, messages)
-                    self._trace(
-                        "04-history",
-                        "conversation=%s group=%s visible_messages=%s",
-                        name,
-                        is_group,
-                        len(messages),
-                    )
-                    if active_reply_conversation:
-                        with self._operation_lock:
-                            owner = self._owner_name
-                        owner_source = "driver-cache"
-                    else:
-                        owner_info = self._scan_uia(self.client.get_owner_info)
-                        owner = owner_info.nick_name
-                        owner_source = owner_info.source
-                    self._trace(
-                        "05-owner",
-                        "conversation=%s available=%s source=%s name=%s",
-                        name,
-                        bool(owner),
-                        owner_source,
-                        owner or "<empty>",
-                    )
-                    targets = self._select_reply_targets(
-                        messages, is_group, owner, row_key, name
-                    )
-                    if not targets:
-                        reason = (
-                            "owner_name_unavailable"
-                            if is_group and not owner
-                            else "no_visible_owner_mention"
-                            if is_group
-                            else "no_visible_message"
-                        )
-                        self._trace(
-                            "06-target",
-                            "conversation=%s selected=False reason=%s visible_messages=%s",
+                        messages = self._scan_uia(
+                            self.client.get_chat_history,
                             name,
-                            reason,
+                            self._message_limit(),
+                            runtime_id=row.runtime_id,
+                            row_index=row.row_index,
+                            ensure_conversation=not active_reply_conversation,
+                        )
+                        self._retry_conversations.discard(row_key)
+                        messages = self._exclude_private_outgoing_messages(
+                            messages, name, is_group
+                        )
+                        messages = self._stabilize_messages(row_key, messages)
+                        self._trace(
+                            "04-history",
+                            "conversation=%s group=%s visible_messages=%s",
+                            name,
+                            is_group,
                             len(messages),
                         )
-                        with self._operation_lock:
-                            self._emitted_targets.pop(row_key, None)
-                        continue
-                    for target_index, message in targets:
-                        self._trace(
-                            "06-target",
-                            "conversation=%s selected=True index=%s type=%s chars=%s",
-                            name,
-                            target_index,
-                            message.message_type,
-                            len(str(message.content or "")),
-                        )
-                        target_key = self._target_key(message, target_index)
-                        history = self._history_snapshot(
-                            messages, target_index, is_group, row_key
-                        )
-                        ordinal += 1
-                        event = self._event(
-                            row_key,
-                            name,
-                            message,
-                            history,
-                            is_group,
-                            bool(is_group),
-                            ordinal,
-                            target_key,
-                            row.not_read_number,
-                        )
-                        if event is not None:
+                        if active_reply_conversation:
                             with self._operation_lock:
-                                self._emitted_targets[row_key] = target_key
-                                self._remember_emitted_target(row_key, message)
-                            events.append(event)
+                                owner = self._owner_name
+                            owner_source = "driver-cache"
+                        else:
+                            owner_info = self._scan_uia(self.client.get_owner_info)
+                            owner = owner_info.nick_name
+                            owner_source = owner_info.source
+                        self._trace(
+                            "05-owner",
+                            "conversation=%s available=%s source=%s name=%s",
+                            name,
+                            bool(owner),
+                            owner_source,
+                            owner or "<empty>",
+                        )
+                        targets = self._select_reply_targets(
+                            messages, is_group, owner, row_key, name
+                        )
+                        if not targets:
+                            reason = (
+                                "owner_name_unavailable"
+                                if is_group and not owner
+                                else "no_visible_owner_mention"
+                                if is_group
+                                else "no_visible_message"
+                            )
+                            self._trace(
+                                "06-target",
+                                "conversation=%s selected=False reason=%s visible_messages=%s",
+                                name,
+                                reason,
+                                len(messages),
+                            )
+                            with self._operation_lock:
+                                self._emitted_targets.pop(row_key, None)
+                            continue
+                        for target_index, message in targets:
+                            if len(events) >= self.config.get("event_receipt_capacity", DEFAULT_CONFIG["event_receipt_capacity"]):
+                                self._retry_conversations.add(row_key)
+                                break
+                            self._trace(
+                                "06-target",
+                                "conversation=%s selected=True index=%s type=%s chars=%s",
+                                name,
+                                target_index,
+                                message.message_type,
+                                len(str(message.content or "")),
+                            )
+                            target_key = self._target_key(message, target_index)
+                            history = self._history_snapshot(
+                                messages, target_index, is_group, row_key
+                            )
+                            ordinal += 1
+                            event = self._event(
+                                row_key,
+                                name,
+                                message,
+                                history,
+                                is_group,
+                                bool(is_group and self._mentions_owner(message.content, owner)),
+                                ordinal,
+                                target_key,
+                                row.not_read_number,
+                            )
+                            if event is not None:
+                                with self._operation_lock:
+                                    self._unacknowledged_events[event.event_id] = event
+                                    self._emitted_targets[row_key] = target_key
+                                    self._remember_emitted_target(row_key, message)
+                                events.append(event)
+                    except Exception as exc:
+                        self._retry_conversations.add(row_key)
+                        scan_errors.append({"conversation_id": row_key, "error": str(exc)})
+                        logger.warning("[WechatDesktop] conversation scan failed: %s", row_key, exc_info=True)
                 return self._observation(
                     visible_conversations=len(rows),
                     unread_conversations=sum(row.not_read_number > 0 for row in rows),
+                    scan_errors=scan_errors,
                 ), events
             except Exception as exc:
                 self._trace("06-error", "observation_failed error=%s", exc)
@@ -1310,6 +1352,30 @@ class WechatUiaDriver(WechatDesktopBackend):
                     error=f"WeChat UI Automation unavailable: {exc}",
                     uia_available=False,
                 ), []
+
+    def acknowledge_events(self, event_ids: list[str]) -> None:
+        with self._operation_lock:
+            for event_id in event_ids:
+                self._unacknowledged_events.pop(event_id, None)
+
+    def resolve_target(self, conversation: str) -> TargetResolution:
+        from channel.wechat_desktop.uia.operations import conversation_titles_match
+
+        key = str(conversation or "").strip()
+        with self._operation_lock:
+            selectors = dict(self._conversation_selectors)
+        if key in selectors:
+            return TargetResolution(TargetStatus.RESOLVED, ConversationTarget(key, selectors[key].conversation_title))
+        if key.startswith("uia-session:"):
+            return TargetResolution(TargetStatus.STALE, reason="conversation identity is no longer visible")
+        matches = [(identity, row) for identity, row in selectors.items()
+                   if conversation_titles_match(row.conversation_title, key)]
+        if len(matches) > 1:
+            return TargetResolution(TargetStatus.AMBIGUOUS, reason="multiple conversations have the same display name")
+        if not matches:
+            return TargetResolution(TargetStatus.NOT_FOUND, reason="conversation is not in the observed session list")
+        identity, row = matches[0]
+        return TargetResolution(TargetStatus.RESOLVED, ConversationTarget(identity, row.conversation_title))
 
     def _resolve_selector(self, conversation: str) -> WechatConversationSelector:
         """在状态锁内读取会话缓存，再交给纯函数生成定位参数。"""
@@ -1387,11 +1453,12 @@ class WechatUiaDriver(WechatDesktopBackend):
                     messages, index, event.is_group, event.conversation_id
                 ),
                 event.is_group,
-                bool(event.is_group),
+                bool(event.is_group and self._mentions_owner(target.content, owner)),
                 0,
                 target_key,
             )
             if replacement_event is not None:
+                self._unacknowledged_events[replacement_event.event_id] = replacement_event
                 self._emitted_targets[event.conversation_id] = target_key
                 self._remember_emitted_target(event.conversation_id, target)
         return ReplyTargetValidation(
@@ -1564,17 +1631,26 @@ class WechatUiaDriver(WechatDesktopBackend):
         self._trace("history_close", "conversation=%s", result.conversation_title)
         return result
 
-    def send_text(self, conversation: str, text: str) -> dict:
+    def send_text(self, conversation: str, text: str) -> SendResult:
         """通过独立发送组件发送普通回复。"""
 
-        return self._send_operations.send_text(conversation, text)
+        resolution = self.resolve_target(conversation)
+        if resolution.target is None:
+            return SendResult(SendStatus.NOT_SENT, resolution.reason)
+        return self._send_operations.send_text(resolution.target.conversation_id, text)
 
-    def send_interim_text(self, conversation: str, text: str) -> dict:
+    def send_interim_text(self, conversation: str, text: str) -> SendResult:
         """发送进度提示，不等待普通回复的拟人化节流间隔。"""
 
-        return self._send_operations.send_text(conversation, text, expedited=True)
+        resolution = self.resolve_target(conversation)
+        if resolution.target is None:
+            return SendResult(SendStatus.NOT_SENT, resolution.reason)
+        return self._send_operations.send_text(resolution.target.conversation_id, text, expedited=True)
 
-    def send_image(self, conversation: str, image_path: str) -> dict:
+    def send_image(self, conversation: str, image_path: str) -> SendResult:
         """通过独立发送组件发送图片。"""
 
-        return self._send_operations.send_image(conversation, image_path)
+        resolution = self.resolve_target(conversation)
+        if resolution.target is None:
+            return SendResult(SendStatus.NOT_SENT, resolution.reason)
+        return self._send_operations.send_image(resolution.target.conversation_id, image_path)

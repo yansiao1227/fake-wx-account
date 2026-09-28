@@ -5,7 +5,8 @@ import json
 import os
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 from bridge.context import ContextType
@@ -126,6 +127,26 @@ class WechatHistoryReadError(RuntimeError):
 
 
 @dataclass
+class ReplyTaskMetadata:
+    """流水线运行元数据，不序列化到 Agent 消息或事件指纹中。"""
+
+    created_at: float = field(default_factory=time.monotonic)
+    source_event_ids: list[str] = field(default_factory=list)
+    batch_id: str = ""
+    deferred_materialization_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
+    cache_only: bool = False
+    attachment_reference_required: bool = False
+    proactive_send: bool = False
+    precomposed_reply_text: str = ""
+    preflight_attachment_notice_sent: bool = False
+    failure_notice_sent: bool = False
+    broadcast_date: str = ""
+    broadcast_target: str = ""
+    fingerprint_content: str | None = None
+    baseline_only: bool = False
+
+
+@dataclass
 class WechatDesktopEvent:
     """微信后端交给通道层的统一事件模型。"""
 
@@ -152,8 +173,12 @@ class WechatDesktopEvent:
     observed_at: float = field(default_factory=time.time)
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
+    task: ReplyTaskMetadata = field(default_factory=ReplyTaskMetadata, repr=False, compare=False)
+
     def fingerprint(self) -> str:
-        fingerprint_content = getattr(self, "_fingerprint_content", self.content)
+        fingerprint_content = self.task.fingerprint_content
+        if fingerprint_content is None:
+            fingerprint_content = self.content
         if self.content_type == "image" and os.path.isfile(str(self.content or "")):
             digest = hashlib.sha256()
             with open(self.content, "rb") as image_file:
@@ -174,7 +199,7 @@ class WechatDesktopEvent:
         ).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return {item.name: deepcopy(getattr(self, item.name)) for item in fields(self) if item.name != "task"}
 
 
 class WechatDesktopMessage(ChatMessage):

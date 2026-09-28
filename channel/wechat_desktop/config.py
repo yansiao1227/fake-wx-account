@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Mapping, Optional
 
 from common.log import logger
@@ -54,7 +55,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shell_hook_reconcile_enabled": False,
     "shell_hook_debounce_ms": 250,
     "reply_monitor_interval_seconds": 1.0,
-    "active_conversation_burst_limit": 5,
+    # 会话读取失败后主动重试；点击可能已清除未读标记，不能只等下一次闪烁。
+    "uia_scan_retry_seconds": 1.0,
+    "event_receipt_capacity": 100,
+    # 待处理容量（不含正在执行的任务）；超过容量拒绝新任务并记录原因。
+    "reply_queue_capacity": 100,
+    "materialize_queue_capacity": 100,
+    "reply_queue_max_wait_seconds": 300,
+    "worker_join_timeout_seconds": 2.0,
 
     # 当前会话聊天记录窗口读取。仅通过 UIA 读取，不写入本地会话历史库。
     "wechat_history_read_enabled": True,
@@ -128,7 +136,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
     "auto_reply_contacts": [],
     # 自动回复群白名单。与每日热点目标列表相互独立，互不影响。
-    "auto_reply_groups": ["小小地下联络站","JY生活问候群"],
+    "auto_reply_groups": ["小小地下联络站", "JY生活问候群", "22~25级实验室科研天才们"],
     "group_reply_mode": "at_only",
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",
@@ -183,7 +191,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "process_startup_unread_messages": True,
 
     # 每日热点广播（通道专属）：到点后在子线程准备百度热搜首条，再入全局回复 FIFO。
-    "daily_hot_broadcast_enabled": True,
+    "daily_hot_broadcast_enabled": False,
     "daily_hot_broadcast_time": "18:00",
     "daily_hot_broadcast_tab": "livelihood",
     "daily_hot_broadcast_message_prefix": "📰 今日热点",
@@ -203,7 +211,7 @@ def load_wechat_desktop_config(
     运行时只读本文件 ``DEFAULT_CONFIG``，不再从根 ``config.json`` 合并
     ``wechat_desktop`` 段。``raw`` 仅供测试注入覆盖。
     """
-    merged = dict(DEFAULT_CONFIG)
+    merged = deepcopy(DEFAULT_CONFIG)
     if raw is None:
         leftover = conf().get("wechat_desktop")
         if leftover:
@@ -211,7 +219,43 @@ def load_wechat_desktop_config(
                 "[WechatDesktop] 已忽略 config.json 中的 wechat_desktop 段；"
                 "请把业务配置写到 channel/wechat_desktop/config.py"
             )
-        return merged
+        return validate_config(merged)
     if isinstance(raw, Mapping):
-        merged.update(dict(raw))
-    return merged
+        merged.update(deepcopy(dict(raw)))
+    return validate_config(merged)
+
+
+def validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    """在启动前报告配置错误，业务层无需维护另一套默认值。"""
+    for key, default in DEFAULT_CONFIG.items():
+        value = config[key]
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise ValueError(f"{key} must be a boolean")
+        elif isinstance(default, (int, float)):
+            import math
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"{key} must be a finite non-negative number")
+            if isinstance(default, int) and not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer")
+        elif isinstance(default, list):
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                raise ValueError(f"{key} must be a list of strings")
+    for key in ("reply_queue_capacity", "materialize_queue_capacity", "event_receipt_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds"):
+        if config[key] <= 0:
+            raise ValueError(f"{key} must be positive")
+    for key in config:
+        if key.endswith("_min") and key[:-4] + "_max" in config:
+            if config[key] > config[key[:-4] + "_max"]:
+                raise ValueError(f"{key} exceeds its maximum")
+    if not 100 <= config["uia_text_chunk_chars"] <= 4000:
+        raise ValueError("uia_text_chunk_chars must be between 100 and 4000")
+    if config["group_reply_mode"] not in {"all", "at_only", "prefix", "at_or_prefix"}:
+        raise ValueError("invalid group_reply_mode")
+    try:
+        hour, minute = map(int, config["daily_hot_broadcast_time"].split(":"))
+        if not (0 <= hour < 24 and 0 <= minute < 60):
+            raise ValueError()
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("daily_hot_broadcast_time must be HH:MM") from None
+    return config

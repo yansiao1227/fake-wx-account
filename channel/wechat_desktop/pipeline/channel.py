@@ -16,38 +16,26 @@
 - ``prompts``：提示词、通知文案和纯函数
 - ``scan``：扫描、策略过滤、私聊聚合
 - ``materialize``：附件物化与入队
-- ``reply``：FIFO 消费、Agent 投递、每日热点
+- ``reply``：FIFO 任务准备、分流和收尾
+- ``broadcast``：每日热点目标展开、任务认领和预写发送
+- ``agent_reply``：Agent 上下文、回调通知和超时取消
+- ``lifecycle``：独立的耗时诊断记录
 - ``send``：最终发送、失败处理、Agent 动作
 """
 
 from __future__ import annotations
-
 import queue
 import threading
-import time
-
 from bridge.reply import ReplyType
 from channel.chat_channel import ChatChannel
-from channel.wechat_desktop.config import DEFAULT_CONFIG, load_wechat_desktop_config
+from channel.wechat_desktop.config import load_wechat_desktop_config
 from channel.wechat_desktop.daily_hot.scheduler import DailyHotScheduler
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.pipeline.materialize import WechatDesktopMaterializeMixin
 from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
-from channel.wechat_desktop.pipeline.prompts import (
-    ATTACHMENT_REFERENCE_REQUIRED_REPLY,
-    DEFAULT_BOT_MENTION_ALIASES,
-    _format_agent_notice,
-    _format_failure_notice,
-    _is_network_reply_error,
-    _is_user_visible_tool_notice,
-    _normalize_auto_reply_text,
-    _preflight_tool_notice_data,
-    _render_event_context_lines,
-    _reply_requirements,
-    _strip_group_bot_mentions,
-    _tool_notice_subject,
-)
+from channel.wechat_desktop.pipeline.prompts import _normalize_auto_reply_text
 from channel.wechat_desktop.pipeline.reply import WechatDesktopReplyMixin
 from channel.wechat_desktop.pipeline.scan import WechatDesktopScanMixin
 from channel.wechat_desktop.pipeline.send import WechatDesktopSendMixin
@@ -56,7 +44,8 @@ from channel.wechat_desktop.uia.backend import create_wechat_desktop_backend
 from common.log import file_logger, logger
 from common.singleton import singleton
 
-# 测试与工厂仍可从本模块导入默认配置和纯函数。
+
+# 通道工厂入口；纯函数直接从 prompts 模块导入。
 __all__ = ["WechatDesktopChannel", "DEFAULT_CONFIG"]
 
 
@@ -86,12 +75,16 @@ class WechatDesktopChannel(
         super().__init__()
         self.config = load_wechat_desktop_config()
         self._stop_event = threading.Event()
+        self._runtime_lock = threading.RLock()
+        self._runtime_state = "stopped"
+        self._warmup_thread = None
         # 后端通过工厂创建，为未来迁移到非 UIA 实现保留稳定替换点。
         self._driver = create_wechat_desktop_backend(self.config)
 
         # 最终回复必须全局串行；队列项同时固化入队时的上下文快照。
         self._reply_queue = WechatReplyQueue(
-            int(self.config.get("active_conversation_burst_limit", 5))
+            capacity=self.config["reply_queue_capacity"],
+            max_wait_seconds=self.config["reply_queue_max_wait_seconds"],
         )
 
         # 私聊消息先按会话短暂聚合，避免连续气泡触发多次独立回复。值为
@@ -105,7 +98,7 @@ class WechatDesktopChannel(
         # 附件物化与消息扫描解耦。提交锁只保护“停止/入队”的原子性，耗时解析
         # 在独立线程执行，不持有该锁。
         self._materialize_submit_lock = threading.RLock()
-        self._materialize_queue: queue.Queue = queue.Queue()
+        self._materialize_queue: queue.Queue = queue.Queue(maxsize=self.config["materialize_queue_capacity"])
         self._materialize_stop = object()
         self._materialization_active = threading.Event()
         self._queue_thread = None
@@ -114,10 +107,8 @@ class WechatDesktopChannel(
         self._daily_hot_scheduler: DailyHotScheduler | None = None
 
         # 生命周期表只用于诊断耗时，不参与消息业务判断。
-        self._lifecycle_lock = threading.RLock()
+        self._lifecycle = LifecycleRecorder()
         self._failure_notice_lock = threading.RLock()
-        self._lifecycles: dict[str, dict] = {}
-        self._scan_count = 0
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
         self._policy = WechatDesktopPolicy(self.config, self._store)
@@ -153,97 +144,13 @@ class WechatDesktopChannel(
             )
 
     def _start_lifecycle(self, event: WechatDesktopEvent):
-        """为新观察到的事件创建端到端耗时记录。"""
-        now = time.monotonic()
-        with self._lifecycle_lock:
-            self._lifecycles.setdefault(
-                event.event_id,
-                {
-                    "event_id": event.event_id,
-                    "conversation": event.conversation_name,
-                    "batch_id": "",
-                    "detected": now,
-                    "materialized": None,
-                    "queued": None,
-                    "agent_started": None,
-                    "first_tool": None,
-                    "agent_done": None,
-                    "send_started": None,
-                    "send_verified": None,
-                    "send_result": "-",
-                    "detected_scan": self._scan_count,
-                    "attachment_resolve_count": 0,
-                    "superseded_by": "",
-                },
-            )
+        self._lifecycle.start(event)
 
-    def _mark_lifecycle(
-        self,
-        event_ids,
-        stage: str,
-        *,
-        batch_id: str = "",
-        attachment_resolve_count: int = 0,
-        send_result: str = "",
-    ):
-        """记录生命周期阶段的首次到达时间和少量累计指标。"""
-        now = time.monotonic()
-        with self._lifecycle_lock:
-            for event_id in event_ids:
-                lifecycle = self._lifecycles.get(str(event_id))
-                if lifecycle is None:
-                    continue
-                if stage in lifecycle and lifecycle[stage] is None:
-                    lifecycle[stage] = now
-                if batch_id:
-                    lifecycle["batch_id"] = batch_id
-                if attachment_resolve_count:
-                    lifecycle["attachment_resolve_count"] += int(
-                        attachment_resolve_count
-                    )
-                if send_result:
-                    lifecycle["send_result"] = send_result
+    def _mark_lifecycle(self, event_ids, stage: str, **metrics):
+        self._lifecycle.mark(event_ids, stage, **metrics)
 
     def _finish_lifecycle(self, event_ids, terminal: str):
-        """结束生命周期并输出从发现到发送完成的阶段耗时。"""
-        rows = []
-        with self._lifecycle_lock:
-            for event_id in event_ids:
-                lifecycle = self._lifecycles.pop(str(event_id), None)
-                if lifecycle is not None:
-                    rows.append(lifecycle)
-            scan_count = self._scan_count
-        for lifecycle in rows:
-            detected = lifecycle["detected"]
-
-            def elapsed(field):
-                """把阶段时间转换为相对发现时刻的毫秒字符串。"""
-                value = lifecycle.get(field)
-                return "-" if value is None else str(max(0, int((value - detected) * 1000)))
-
-            logger.info(
-                "[WechatDesktop][lifecycle] "
-                "event_id=%s batch_id=%s conversation=%s terminal=%s "
-                "detected=0 materialized=%s queued=%s agent_started=%s "
-                "first_tool=%s agent_done=%s send_started=%s send_verified=%s "
-                "scan_count=%s attachment_resolve_count=%s superseded_by=%s "
-                "send_result=%s",
-                lifecycle["event_id"],
-                lifecycle["batch_id"] or "-",
-                lifecycle["conversation"],
-                terminal,
-                elapsed("materialized"),
-                elapsed("queued"),
-                elapsed("agent_started"),
-                elapsed("first_tool"),
-                elapsed("agent_done"),
-                elapsed("send_started"),
-                elapsed("send_verified"),
-                max(1, scan_count - int(lifecycle["detected_scan"]) + 1),
-                lifecycle["attachment_resolve_count"],
-                lifecycle["superseded_by"] or "-",
-                lifecycle["send_result"],
-            )
+        self._lifecycle.finish(event_ids, terminal)
 
     def _warmup_group_sender_ocr(self) -> None:
         """后台预加载 RapidOCR，避免首次群聊扫描被模型加载拖慢。"""
@@ -264,15 +171,47 @@ class WechatDesktopChannel(
                 exc,
             )
 
+    def _live_workers(self):
+        workers = [self._scan_thread, self._materialize_thread, self._queue_thread, self._warmup_thread]
+        alive = [worker.name for worker in workers if worker and worker.is_alive()]
+        if self._daily_hot_scheduler and self._daily_hot_scheduler.is_alive():
+            alive.append("daily_hot")
+        return alive
+
     def startup(self):
-        """初始化运行状态、启动三个工作线程，并阻塞到通道停止。"""
-        self._stop_event.clear()
+        """旧运行完全结束后才允许创建新一代队列和停止信号。"""
+        with self._runtime_lock:
+            if self._runtime_state in {"starting", "running"} or self._live_workers():
+                raise RuntimeError("wechat_desktop is running or still stopping")
+            self._runtime_state = "starting"
+            self._stop_event = threading.Event()
+            stop_event = self._stop_event
+            self._bootstrapped = False
+            try:
+                self._start_workers()
+                self._runtime_state = "running"
+            except Exception:
+                self.stop()
+                raise
+        while not stop_event.wait(0.25):
+            alive = self._live_workers()
+            required = {"cow-wechat-scan", "cow-wechat-materialize", "cow-wechat-reply-fifo"}
+            missing = required.difference(alive)
+            if missing:
+                self._service.update_status(last_error=f"workers stopped: {sorted(missing)}", worker_healthy=False)
+                self.stop()
+                break
+
+    def _start_workers(self):
+        recovery = self._store.recover_interrupted_events()
+        self._service.update_status(event_recovery=recovery)
         # 尽早加载 RapidOCR 模型，避免首次识别群聊发送者时付出数秒加载延迟。
-        threading.Thread(
+        self._warmup_thread = threading.Thread(
             target=self._warmup_group_sender_ocr,
             name="cow-wechat-rapidocr-warmup",
             daemon=True,
-        ).start()
+        )
+        self._warmup_thread.start()
         try:
             activated = self._driver.ensure_foreground()
             logger.info(
@@ -286,9 +225,10 @@ class WechatDesktopChannel(
                 exc,
             )
         self._reply_queue = WechatReplyQueue(
-            int(self.config.get("active_conversation_burst_limit", 5))
+            capacity=self.config["reply_queue_capacity"],
+            max_wait_seconds=self.config["reply_queue_max_wait_seconds"],
         )
-        self._materialize_queue = queue.Queue()
+        self._materialize_queue = queue.Queue(maxsize=self.config["materialize_queue_capacity"])
         self._materialization_active.clear()
         self._queue_thread = threading.Thread(
             target=self._consume_reply_queue,
@@ -308,6 +248,8 @@ class WechatDesktopChannel(
         self._service.set_agent_executor(self._execute_agent_action)
         self._service.update_status(
             running=True,
+            worker_healthy=True,
+            stopping_workers=[],
             paused=bool(self._store.get_state("paused", False)),
             shadow_mode=bool(self.config.get("shadow_mode", True)),
             auto_reply_private_all=bool(
@@ -337,6 +279,7 @@ class WechatDesktopChannel(
             config=self.config,
             store=self._store,
             enqueue_callback=self.enqueue_daily_hot_broadcast,
+            enqueue_dated_callback=self.enqueue_daily_hot_broadcast,
             is_paused=lambda: bool(self._service.status().get("paused")),
         )
         self._daily_hot_scheduler.start()
@@ -357,40 +300,29 @@ class WechatDesktopChannel(
             bool(self.config.get("daily_hot_broadcast_enabled", False)),
             self.config.get("daily_hot_broadcast_time", "18:00"),
         )
-        while not self._stop_event.wait(0.25):
-            pass
 
     def stop(self):
-        """停止接收新任务，清空各阶段待处理项，并有限等待工作线程退出。"""
-        self._stop_event.set()
-        scheduler = self._daily_hot_scheduler
-        if scheduler is not None:
-            scheduler.stop()
-        pending_ids = self._clear_pending_private_batches()
-        for event_id in pending_ids:
-            self._store.mark_event_processed(event_id)
-            self._finish_lifecycle([event_id], "stopped")
-        queued_ids = self._reply_queue.clear_pending()
-        for event_id in queued_ids:
-            self._store.mark_event_processed(event_id)
-        self._finish_lifecycle(queued_ids, "stopped")
-        materializing_ids = self._clear_pending_materializations()
-        for event_id in materializing_ids:
-            self._store.mark_event_processed(event_id)
-        self._finish_lifecycle(materializing_ids, "stopped")
-        self._materialize_queue.put(self._materialize_stop)
-        discarded = self._reply_queue.stop()
-        close = getattr(self._driver, "close", None)
-        if close:
-            close()
-        self._service.set_agent_executor(None)
-        self._service.update_status(running=False, login_status="stopped")
-        for worker in (
-            self._scan_thread,
-            self._materialize_thread,
-            self._queue_thread,
-        ):
-            if worker and worker is not threading.current_thread():
-                worker.join(timeout=2.0)
-        if discarded:
-            logger.info("[WechatDesktop] discarded %s queued messages on stop", discarded)
+        """停止接收任务；超时仍有线程存活时保留 stopping，禁止覆盖运行状态。"""
+        with self._runtime_lock:
+            self._runtime_state = "stopping"
+            self._stop_event.set()
+            self._service.set_agent_executor(None)
+            queued_ids = self._reply_queue.clear_pending()
+            self._reply_queue.stop()
+            self._best_effort("driver_close", self._driver.close)
+            timeout = self.config["worker_join_timeout_seconds"]
+            if self._daily_hot_scheduler is not None:
+                self._best_effort("scheduler_stop", self._daily_hot_scheduler.stop, join_timeout=timeout)
+            pending_ids = queued_ids + self._clear_pending_private_batches()
+            pending_ids.extend(self._clear_pending_materializations())
+            for event_id in pending_ids:
+                self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, "stopped", "channel_stopped")
+            self._best_effort("finish_lifecycle", self._finish_lifecycle, pending_ids, "stopped")
+            # 消费者有短轮询，不依赖往满队列里写入哨兵来唤醒。
+            for worker in (self._scan_thread, self._materialize_thread, self._queue_thread, self._warmup_thread):
+                if worker and worker.ident is not None and worker is not threading.current_thread():
+                    worker.join(timeout=timeout)
+            alive = self._live_workers()
+            self._runtime_state = "stopping" if alive else "stopped"
+            self._service.update_status(running=False, login_status=self._runtime_state,
+                                        worker_healthy=not alive, stopping_workers=alive)

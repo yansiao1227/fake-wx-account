@@ -1,265 +1,41 @@
-"""微信桌面通道的 FIFO 消费、Agent 投递、进度通知和每日热点入队。"""
+"""FIFO 任务准备、分流和收尾；广播与 Agent 细节委托给各自协调器。"""
 
 from __future__ import annotations
-
-import re
-import threading
-from pathlib import Path
-
+from channel.wechat_desktop.pipeline.agent_reply import AgentReplyCoordinator
+from channel.wechat_desktop.pipeline.broadcast import BroadcastCoordinator
 from bridge.context import Context, ContextType
-from channel.wechat_desktop.pipeline.prompts import (
-    ATTACHMENT_REFERENCE_REQUIRED_REPLY,
-    DEFAULT_BOT_MENTION_ALIASES,
-    _format_agent_notice,
-    _is_user_visible_tool_notice,
-    _preflight_tool_notice_data,
-    _render_event_context_lines,
-    _reply_requirements,
-    _strip_group_bot_mentions,
-    _tool_notice_subject,
-)
+from channel.wechat_desktop.pipeline.prompts import ATTACHMENT_REFERENCE_REQUIRED_REPLY
 from channel.wechat_desktop.pipeline.fifo_queue import ReplyQueueItem
-from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage
+from channel.wechat_desktop.pipeline.worker import ReplyWorker, best_effort
+from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.contracts import SendResult
 from common.log import logger
-from plugins import Event, EventContext, PluginManager
 
 
 class WechatDesktopReplyMixin:
-    """回复线程：串行消费 FIFO，调用 Agent，并发送预写文案与进度通知。"""
+    """串行回复流程及通道兼容入口，不持有协调器的业务实现。"""
 
     def _resolve_daily_hot_target(self, group_name: str) -> tuple[str, str]:
-        """把每日热点目标群显示名解析为发送用会话 ID。
+        return BroadcastCoordinator(self).resolve_target(group_name)
 
-        若扫描缓存里能唯一匹配到该标题，优先返回 ``uia-session:...``，便于发送时
-        带上 runtime_id / row_index，降低点错会话的概率；否则退回显示名本身。
-        """
-        name = str(group_name or "").strip()
-        if not name:
-            return name, name
-        resolver = getattr(self._driver, "_resolve_selector", None)
-        if not callable(resolver):
-            return name, name
-        try:
-            selector = resolver(name)
-        except Exception:
-            return name, name
-        title = str(getattr(selector, "title", "") or name).strip() or name
-        runtime_id = str(getattr(selector, "runtime_id", "") or "").strip()
-        if runtime_id:
-            conversation_id = f"uia-session:{runtime_id}"
-            logger.info(
-                "[WechatDesktop][DailyHot] resolved target title=%s -> %s",
-                title,
-                conversation_id,
-            )
-            return conversation_id, title
-        return name, title
-
-    def enqueue_daily_hot_broadcast(self, message: str) -> int:
-        """把已准备好的每日热点文案按目标群拆成预写发送任务并入全局 FIFO。
-
-        目标仅来自 ``daily_hot_broadcast_groups``（不是当前打开的会话，也不走
-        ``auto_reply_groups`` / ``auto_reply_groups_all``）。返回成功入队的群数量。
-        """
-        text = str(message or "").strip()
-        if not text:
-            return 0
-        if bool(self.config.get("shadow_mode", True)):
-            logger.info(
-                "[WechatDesktop][DailyHot] skip enqueue because shadow_mode is on"
-            )
-            return 0
-        if bool(self._service.status().get("paused")):
-            logger.info("[WechatDesktop][DailyHot] skip enqueue because paused")
-            return 0
-
-        # 仅向 daily_hot_broadcast_groups 广播，不使用自动回复白名单。
-        groups = [
-            str(name).strip()
-            for name in self.config.get("daily_hot_broadcast_groups", []) or []
-            if str(name).strip()
-        ]
-        if not groups:
-            logger.warning(
-                "[WechatDesktop][DailyHot] no targets: daily_hot_broadcast_groups is empty"
-            )
-        else:
-            logger.info(
-                "[WechatDesktop][DailyHot] enqueue targets from daily_hot_broadcast_groups=%s",
-                groups,
-            )
-        queued = 0
-        for group_name in groups:
-            if self._policy.is_blocked(group_name):
-                self._store.audit(
-                    "daily_hot_broadcast",
-                    group_name,
-                    "blocked",
-                    self._content_hash(text),
-                    detail="blacklist",
-                )
-                continue
-            if not self._policy.is_daily_hot_target(group_name):
-                continue
-            conversation_id, conversation_name = self._resolve_daily_hot_target(
-                group_name
-            )
-            event = WechatDesktopEvent(
-                kind="proactive_send",
-                conversation_id=conversation_id,
-                conversation_name=conversation_name,
-                sender_id="system",
-                sender_name="daily_hot_broadcast",
-                content_type="text",
-                content=text,
-                direction="outgoing",
-                is_group=True,
-                source_type="group",
-            )
-            setattr(event, "_proactive_send", True)
-            setattr(event, "_precomposed_reply_text", text)
-            setattr(event, "_source_event_ids", [event.event_id])
-            setattr(event, "_batch_id", event.event_id)
-            self._start_lifecycle(event)
-            self._store.record_event(event)
-            self._enqueue_reply_event(event)
-            queued += 1
-            self._store.audit(
-                "daily_hot_broadcast",
-                group_name,
-                "queued",
-                self._content_hash(text),
-                detail=f"event_id={event.event_id}",
-            )
-        if queued == 0:
-            self._store.audit(
-                "daily_hot_broadcast",
-                "",
-                "no_targets",
-                self._content_hash(text),
-                detail="no allowlisted groups",
-            )
-        scheduler = getattr(self, "_daily_hot_scheduler", None)
-        if scheduler is not None:
-            self._service.update_status(**scheduler.status())
-        return queued
+    def enqueue_daily_hot_broadcast(self, message: str, fire_date: str = "") -> int:
+        return BroadcastCoordinator(self).enqueue(message, fire_date)
 
     def _send_precomposed_reply(self, item: ReplyQueueItem) -> str:
-        """发送入队前已准备好的文案（如每日热点），不调用 Agent。"""
-        event = item.event
-        text = str(
-            getattr(event, "_precomposed_reply_text", None) or event.content or ""
-        ).strip()
-        target_name = event.conversation_name
-        target_id = event.conversation_id
-        if not text:
-            return "skipped"
-        if bool(self._service.status().get("paused")) or not self._policy.can_broadcast_daily_hot(
-            target_name
-        ):
-            self._store.audit(
-                "daily_hot_broadcast",
-                target_name,
-                "skipped",
-                self._content_hash(text),
-                detail="paused or policy blocked",
-            )
-            return "skipped"
+        return BroadcastCoordinator(self).send(item)
 
-        # 优先使用仍有效的 uia-session 键（精确 runtime_id）。若该行已离开扫描
-        # 缓存，则退回显示名，避免 locate 把 "uia-session:..." 当成会话标题。
-        send_target = target_name
-        if str(target_id).startswith("uia-session:"):
-            resolver = getattr(self._driver, "_resolve_selector", None)
-            if callable(resolver):
-                try:
-                    selector = resolver(target_id)
-                    if str(getattr(selector, "runtime_id", "") or "").strip():
-                        send_target = target_id
-                except Exception:
-                    pass
-        logger.info(
-            "[WechatDesktop][DailyHot] precomposed send target_name=%s "
-            "conversation_id=%s send_target=%s",
-            target_name,
-            target_id,
-            send_target,
-        )
-        self._driver.begin_reply_cycle(target_name, target_id)
-        self._mark_lifecycle(item.source_event_ids, "send_started")
-        try:
-            result = self._driver.send_text(send_target, text)
-        except Exception as exc:
-            self._mark_lifecycle(
-                item.source_event_ids,
-                "send_started",
-                send_result="failed",
-            )
-            logger.warning(
-                "[WechatDesktop] precomposed send failed target=%s: %s",
-                target_name,
-                exc,
-            )
-            self._store.audit(
-                "send_text",
-                target_name,
-                "failed",
-                self._content_hash(text),
-                detail=f"precomposed:{exc}",
-            )
-            return "failed"
-        if not result.get("success"):
-            self._mark_lifecycle(
-                item.source_event_ids,
-                "send_started",
-                send_result="failed",
-            )
-            self._store.audit(
-                "send_text",
-                target_name,
-                "failed",
-                self._content_hash(text),
-                detail="precomposed send unsuccessful",
-            )
-            return "failed"
+    def _claim_broadcast_send(self, event):
+        return BroadcastCoordinator(self).claim(event)
 
-        verified = bool(result.get("verified"))
-        self._mark_lifecycle(
-            item.source_event_ids,
-            "send_verified" if verified else "send_started",
-            send_result="verified" if verified else "unverified",
-        )
-        self._store.audit(
-            "send_text",
-            target_name,
-            "success" if verified else "unverified",
-            self._content_hash(text),
-            detail="daily_hot_broadcast",
-        )
-        self._store.append_conversation_history(
-            conversation_id=target_id,
-            conversation_name=target_name,
-            sender_name=str(self.config.get("self_display_name") or "我"),
-            direction="outgoing",
-            content_type="text",
-            content=text,
-            source_type=event.source_type or "group",
-        )
-        self._trace(
-            "12-precomposed-send",
-            "target=%s chars=%s verified=%s",
-            target_name,
-            len(text),
-            verified,
-        )
-        return "completed"
+    def _set_broadcast_status(self, event, status):
+        return BroadcastCoordinator(self).set_status(event, status)
 
     def _send_attachment_reference_prompt(self, item: ReplyQueueItem) -> str:
         """拒绝猜测未明确指向的附件，并直接发送“请引用后再问”的提示。"""
         event = item.event
         target_name = event.conversation_name
         target_id = event.conversation_id
-        if bool(self._service.status().get("paused")) or not self._policy.can_auto_send(
+        if bool(self._service.status().get("paused")) or not self._policy.allows_send(
             target_name,
             event.is_group,
             "text",
@@ -277,16 +53,12 @@ class WechatDesktopReplyMixin:
                 detail=validation.reason,
             )
             return "skipped"
-        send_target = (
-            target_id
-            if str(target_id).startswith("uia-session:")
-            else target_name
-        )
+        send_target = (target_id or target_name)
         self._mark_lifecycle(item.source_event_ids, "send_started")
         try:
-            result = self._driver.send_text(
-                send_target,
-                ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+            result = self._deliver(
+                send_target, ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+                policy_target=target_name, is_group=event.is_group, token=item.token, source_event_ids=item.source_event_ids,
             )
         except Exception as exc:
             self._mark_lifecycle(
@@ -328,571 +100,172 @@ class WechatDesktopReplyMixin:
             content=ATTACHMENT_REFERENCE_REQUIRED_REPLY,
             source_type=event.source_type,
         )
-        return "completed"
+        return SendResult.from_backend(result).terminal
 
     def _send_deferred_attachment_notice(self, item: ReplyQueueItem) -> bool:
-        """引用附件解析前尽早发送工具进度通知，降低用户等待的不确定感。"""
-        event = item.event
-        notice_data = _preflight_tool_notice_data(event)
-        if not notice_data or not bool(
-            self.config.get("agent_tool_notice_enabled", True)
-        ):
-            return False
-        context = {
-            "msg": WechatDesktopMessage(event),
-            "receiver": event.conversation_id or event.conversation_name,
-            "isgroup": event.is_group,
-            "wechat_desktop_queue_token": item.token,
-            "wechat_desktop_source_type": event.source_type,
-        }
-        try:
-            return self._send_agent_tool_notice(context, notice_data)
-        except Exception as exc:
-            logger.warning(
-                "[WechatDesktop] early attachment notice failed: %s", exc
-            )
-            return False
+        return AgentReplyCoordinator(self).send_attachment_notice(item)
 
     def _send_share_content_fetch_notice(self, item: ReplyQueueItem) -> bool:
-        """内置浏览器读不到正文、回退到 web_fetch 时补发一次进度提示。"""
-        if not bool(self.config.get("agent_tool_notice_enabled", True)):
-            return False
-        context = {
-            "msg": WechatDesktopMessage(item.event),
-            "receiver": item.event.conversation_id or item.event.conversation_name,
-            "isgroup": item.event.is_group,
-            "wechat_desktop_queue_token": item.token,
-            "wechat_desktop_source_type": item.event.source_type,
-        }
-        try:
-            return self._send_agent_tool_notice(
-                context,
-                {
-                    "tool_name": "web_fetch",
-                    "notice_template_key": "share_content_fetch_notice_templates",
-                },
-            )
-        except Exception as exc:
-            logger.warning("[WechatDesktop] share content fetch notice failed: %s", exc)
-            return False
+        return AgentReplyCoordinator(self).send_share_fetch_notice(item)
+
+    _best_effort = staticmethod(best_effort)
 
     def _consume_reply_queue(self):
-        """串行消费最终回复任务，并等待每个 Agent 周期到达终态。
+        ReplyWorker(
+            queue=self._reply_queue,
+            stop_event=self._stop_event,
+            process=self._process_reply_item,
+            on_error=self._on_reply_worker_error,
+            on_finish=self._on_reply_worker_finish,
+        ).run()
 
-        引用附件先在队首完成延迟物化；之后恢复入队时固化的上文，避免等待期间
-        微信 UI 变化导致上下文漂移。普通任务由 Agent 回调设置 ``item.done``；超时
-        时令牌失效，迟到结果会在发送路径被丢弃。
-        """
-        while not self._stop_event.is_set():
-            item = self._reply_queue.get(timeout=0.25)
-            if item is None:
-                continue
-            self._service.update_status(
-                mode="replying",
-                reply_in_flight=True,
-                reply_conversation=item.event.conversation_name,
-                **self._reply_queue.status(),
-            )
-            terminal = "failed"
-            deferred_failed = False
-            deferred_events = list(
-                getattr(
-                    item.event, "_deferred_materialization_events", None
-                )
-                or []
-            )
-            if deferred_events:
-                try:
-                    # 延迟物化会打开图片查看器或定位文件，必须纳入独占回复周期。
-                    self._driver.begin_reply_cycle(
-                        item.event.conversation_name,
-                        item.event.conversation_id,
-                    )
-                    # 分享卡片打开内置浏览器时不发进度提示：发送会和浏览器
-                    # 小窗抢同一个微信窗口，实际经常发不出去。
-                    notice_sent = self._send_deferred_attachment_notice(item)
+    def _on_reply_worker_error(self, item, exc):
+        self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
+        self._best_effort("worker_error", self._service.update_status, last_error=str(exc))
 
-                    def before_share_fetch():
-                        nonlocal notice_sent
-                        if not notice_sent:
-                            notice_sent = self._send_share_content_fetch_notice(item)
+    def _on_reply_worker_finish(self, item, terminal):
+        # 也覆盖尚未进入 Agent 的过期任务和准备阶段异常。
+        for event_id in item.source_event_ids:
+            self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, terminal)
+        self._best_effort("finish_lifecycle", self._finish_lifecycle, item.source_event_ids, terminal)
+        self._service.update_status(reply_in_flight=False, reply_conversation="", **self._reply_queue.status())
 
-                    materialized = self._materialize_batch(
-                        deferred_events, before_share_fetch=before_share_fetch
-                    )
-                    setattr(
-                        materialized,
-                        "_preflight_attachment_notice_sent",
-                        notice_sent,
-                    )
-                    item.event = materialized
-                except Exception:
-                    deferred_failed = True
-                    logger.exception(
-                        "[WechatDesktop] deferred attachment materialization failed"
-                    )
-            # 任务在 FIFO 中等待时界面可能已经滑走，始终使用入队时固化的会话上下文回复。
-            item.restore_context()
-            reference_required = bool(
-                getattr(item.event, "_attachment_reference_required", False)
-            )
-            proactive_send = bool(
-                getattr(item.event, "_proactive_send", False)
-                or getattr(item.event, "_precomposed_reply_text", None)
-            )
-            if not reference_required and not proactive_send:
-                self._mark_lifecycle(
-                    item.source_event_ids,
-                    "agent_started",
-                    batch_id=item.batch_id,
-                )
+    def _process_reply_item(self, item: ReplyQueueItem) -> str:
+        self._store.set_event_state(item.source_event_ids, "running")
+        self._service.update_status(
+            mode="replying",
+            reply_in_flight=True,
+            reply_conversation=item.event.conversation_name,
+            **self._reply_queue.status(),
+        )
+        terminal = "failed"
+        deferred_failed = False
+        deferred_events = list(
+            item.event.task.deferred_materialization_events
+            or []
+        )
+        if deferred_events:
             try:
-                if deferred_failed:
-                    dispatched = False
-                elif item.expired:
-                    terminal = item.terminal or "skipped"
-                    dispatched = False
-                elif reference_required:
-                    terminal = self._send_attachment_reference_prompt(item)
-                    dispatched = False
-                elif proactive_send:
-                    terminal = self._send_precomposed_reply(item)
-                    dispatched = False
-                else:
-                    dispatched = self._dispatch_message(item.event, item.token)
-                if reference_required or proactive_send:
-                    pass
-                elif deferred_failed:
-                    terminal = "failed"
-                elif not dispatched:
-                    terminal = item.terminal or "skipped"
-                else:
-                    timeout = max(
-                        1.0,
-                        float(self.config.get("reply_cycle_timeout_seconds", 180)),
-                    )
-                    if item.done.wait(timeout):
-                        terminal = item.terminal or "completed"
-                    else:
-                        terminal = "timeout"
-                        self._reply_queue.expire(item.token)
-                        try:
-                            from agent.protocol import get_cancel_registry
-
-                            get_cancel_registry().cancel_request(item.event.event_id)
-                        except Exception as exc:
-                            logger.warning(
-                                "[WechatDesktop] failed to cancel timed-out event %s: %s",
-                                item.event.event_id,
-                                exc,
-                            )
-            except Exception as exc:
-                terminal = "failed"
-                logger.error(
-                    "[WechatDesktop] queued message failed: %s", exc, exc_info=True
-                )
-            finally:
-                if terminal in {"failed", "timeout"} and not proactive_send:
-                    try:
-                        self._send_agent_failure_notice(
-                            event=item.event,
-                            reason=(
-                                "reply_timeout"
-                                if terminal == "timeout"
-                                else "reply_failed"
-                            ),
-                            require_active=terminal != "timeout",
-                        )
-                    except Exception as notice_exc:
-                        logger.warning(
-                            "[WechatDesktop] final failure notice crashed: %s",
-                            notice_exc,
-                        )
-                if not reference_required:
-                    self._driver.end_reply_cycle()
-                    if not proactive_send:
-                        self._mark_lifecycle(item.source_event_ids, "agent_done")
-                for event_id in item.source_event_ids:
-                    self._store.mark_event_processed(event_id)
-                self._store.audit(
-                    "reply_queue",
+                # 延迟物化会打开图片查看器或定位文件，必须纳入独占回复周期。
+                self._driver.begin_reply_cycle(
                     item.event.conversation_name,
-                    terminal,
-                    detail=f"event_id={item.event.event_id}",
+                    item.event.conversation_id,
                 )
-                self._reply_queue.finish(item, terminal)
-                self._finish_lifecycle(item.source_event_ids, terminal)
-                status_updates = {
-                    "reply_in_flight": False,
-                    "reply_conversation": "",
-                    **self._reply_queue.status(),
-                }
-                scheduler = getattr(self, "_daily_hot_scheduler", None)
-                if scheduler is not None:
-                    status_updates.update(scheduler.status())
-                self._service.update_status(**status_updates)
+                # 分享卡片打开内置浏览器时不发进度提示：发送会和浏览器
+                # 小窗抢同一个微信窗口，实际经常发不出去。
+                notice_sent = self._send_deferred_attachment_notice(item)
+
+                def before_share_fetch():
+                    nonlocal notice_sent
+                    if not notice_sent:
+                        notice_sent = self._send_share_content_fetch_notice(item)
+
+                materialized = self._materialize_batch(
+                    deferred_events, before_share_fetch=before_share_fetch
+                )
+                materialized.task.preflight_attachment_notice_sent = notice_sent
+                item.event = materialized
+            except Exception:
+                deferred_failed = True
+                logger.exception(
+                    "[WechatDesktop] deferred attachment materialization failed"
+                )
+        # 任务在 FIFO 中等待时界面可能已经滑走，始终使用入队时固化的会话上下文回复。
+        item.restore_context()
+        reference_required = bool(
+            item.event.task.attachment_reference_required
+        )
+        proactive_send = bool(
+            item.event.task.proactive_send
+            or item.event.task.precomposed_reply_text
+        )
+        if not reference_required and not proactive_send:
+            self._mark_lifecycle(
+                item.source_event_ids,
+                "agent_started",
+                batch_id=item.batch_id,
+            )
+        try:
+            if deferred_failed:
+                dispatched = False
+            elif item.expired:
+                terminal = item.terminal or "skipped"
+                dispatched = False
+            elif reference_required:
+                terminal = self._send_attachment_reference_prompt(item)
+                dispatched = False
+            elif proactive_send:
+                terminal = self._send_precomposed_reply(item)
+                dispatched = False
+            else:
+                dispatched = self._dispatch_message(item.event, item.token)
+            if reference_required or proactive_send:
+                pass
+            elif deferred_failed:
+                terminal = "failed"
+            elif not dispatched:
+                terminal = item.terminal or "skipped"
+            else:
+                terminal = AgentReplyCoordinator(self).wait_for_reply(item)
+        except Exception as exc:
+            terminal = "failed"
+            logger.error(
+                "[WechatDesktop] queued message failed: %s", exc, exc_info=True
+            )
+        finally:
+            terminal = self._store.delivery_outcome(item.source_event_ids, terminal)
+            if terminal in {"failed", "timeout"} and not proactive_send:
+                try:
+                    self._send_agent_failure_notice(
+                        event=item.event,
+                        reason=(
+                            "reply_timeout"
+                            if terminal == "timeout"
+                            else "reply_failed"
+                        ),
+                        require_active=terminal != "timeout",
+                    )
+                except Exception as notice_exc:
+                    logger.warning(
+                        "[WechatDesktop] final failure notice crashed: %s",
+                        notice_exc,
+                    )
+            if not reference_required:
+                self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
+                if not proactive_send:
+                    self._mark_lifecycle(item.source_event_ids, "agent_done")
+            self._best_effort(
+                "reply_audit", self._store.audit, "reply_queue",
+                item.event.conversation_name,
+                terminal,
+                detail=f"event_id={item.event.event_id}",
+            )
+            status_updates = {
+                "reply_in_flight": False,
+                "reply_conversation": "",
+                **self._reply_queue.status(),
+            }
+            scheduler = getattr(self, "_daily_hot_scheduler", None)
+            if scheduler is not None:
+                status_updates.update(scheduler.status())
+            self._service.update_status(**status_updates)
+
+        return terminal
 
     def _image_agent_prompt(self, event: WechatDesktopEvent) -> str:
-        """把本地图片路径转换为明确要求调用 vision 的文字提示。"""
-        if not bool(self.config.get("analyze_incoming_images", True)):
-            return "[收到一张图片，当前 AI 仅处理文字，请人工查看]"
-        if not event.content or not Path(event.content).is_file():
-            return "[收到一张图片，但无法提取图像区域]"
-        return (
-            f"[需要回复的微信图片已保存到本地: {event.content}]\n"
-            "请使用 vision 工具读取这张图片，并先筛选图片附近会话历史中与其高度相关的内容，"
-            "再判断发送者的意图并自然回复。"
-            "不要只做机械的图片描述；如果发送者是在提问、确认或延续前文，应直接回应其真实意图。"
-        )
+        return AgentReplyCoordinator(self).build_image_prompt(event)
 
     def _dispatch_message(self, event: WechatDesktopEvent, queue_token: str = "") -> bool:
-        """构造 Agent 上下文并启动一次异步回复周期。
-
-        引用消息只包含被引用内容和当前消息；普通消息携带入队时的候选上文并要求
-        Agent 做相关性筛选。图片和文件仍以文本上下文投递，但附加必须调用对应工具
-        的指令。返回 ``True`` 表示已成功交给 Agent，最终发送状态由回调完成。
-        """
-        msg = WechatDesktopMessage(event)
-        ctype = msg.ctype
-        content = msg.content
-        attachment_instruction = ""
-        if ctype == ContextType.IMAGE:
-            ctype = ContextType.TEXT
-            content = self._image_agent_prompt(event)
-            if (
-                bool(self.config.get("analyze_incoming_images", True))
-                and event.content
-                and Path(event.content).is_file()
-            ):
-                attachment_instruction = (
-                    "当前消息是一张图片，必须先使用 vision 工具读取图片，"
-                    "再结合筛选出的高相关上下文回复。"
-                )
-        elif ctype == ContextType.FILE:
-            ctype = ContextType.TEXT
-            content = f"[微信文件已保存到本地: {event.content}]"
-            attachment_instruction = (
-                "当前消息是一个文件，请读取该文件，并结合筛选出的高相关上下文自然回复发送者。"
-            )
-        if event.reference:
-            reference_type = str(event.reference.get("content_type") or "text")
-            reference_path = str(event.reference.get("file_path") or "")
-            if reference_type == "image" and reference_path:
-                attachment_instruction = (
-                    f"被引用的原图片已保存到本地: {reference_path}。"
-                    "必须先使用 vision 工具读取这张大图，再回答当前消息。"
-                )
-            elif reference_type == "file" and reference_path:
-                attachment_instruction = (
-                    f"被引用的原文件已保存到本地: {reference_path}。"
-                    "必须先根据文件扩展名调用适配的工具或技能读取该文件，"
-                    "再结合当前消息回答。"
-                )
-            elif reference_type == "image":
-                attachment_instruction = (
-                    "被引用的图片未能从微信查看器中安全截取。"
-                    "不要猜测图片内容，直接说明目前无法读取该图片。"
-                )
-            elif reference_type == "file":
-                attachment_instruction = (
-                    "被引用的文件未能从微信缓存中取得。"
-                    "不要猜测文件内容，直接说明目前无法读取该文件。"
-                )
-        if ctype == ContextType.TEXT:
-            history_items = list(event.history)
-            self._trace(
-                "09-context",
-                "id=%s conversation=%s history_items=%s history_source=%s",
-                event.event_id[:10],
-                event.conversation_name,
-                len(history_items),
-                "visible",
-            )
-            history_heading, history_lines = _render_event_context_lines(event)
-            sections = []
-            if history_lines:
-                sections.extend(
-                    [
-                        history_heading,
-                        "\n".join(history_lines),
-                    ]
-                )
-            sections.extend(
-                [
-                    (
-                        "[需要回复的引用消息]"
-                        if event.reference
-                        else "[需要回复的新消息]"
-                    ),
-                    (
-                        f"{event.sender_name or '群成员'}: {content}"
-                        if event.is_group
-                        else str(content)
-                    ),
-                    "[回复要求]",
-                    _reply_requirements(event),
-                ]
-            )
-            if attachment_instruction:
-                sections.append(attachment_instruction)
-            content = "\n".join(sections)
-            if event.is_group:
-                content = _strip_group_bot_mentions(
-                    content,
-                    [
-                        *DEFAULT_BOT_MENTION_ALIASES,
-                        self.config.get("self_display_name", ""),
-                    ],
-                )
-        context = self._compose_context(
-            ctype,
-            content,
-            isgroup=event.is_group,
-            msg=msg,
-            no_need_at=True,
-            wechat_desktop_evidence=event.evidence_path,
-            wechat_desktop_source_type=event.source_type,
-            wechat_desktop_auto_reply=True,
-        )
-        if context:
-            self._trace(
-                "09-produce",
-                "id=%s session=%s context_type=%s",
-                event.event_id[:10],
-                context.get("session_id"),
-                context.type,
-            )
-            context["wechat_desktop_reply_cycle"] = True
-            context["wechat_desktop_queue_token"] = queue_token
-            context["wechat_desktop_queue_terminal"] = "completed"
-            context["wechat_desktop_source_event_ids"] = list(
-                getattr(event, "_source_event_ids", None) or [event.event_id]
-            )
-            context["wechat_desktop_batch_id"] = str(
-                getattr(event, "_batch_id", "") or event.event_id
-            )
-            context["wechat_desktop_agent_notice_sent"] = bool(
-                getattr(event, "_preflight_attachment_notice_sent", False)
-            )
-            self._driver.begin_reply_cycle(
-                event.conversation_name, event.conversation_id
-            )
-            try:
-                # 附件物化阶段的进度通知可以提前发；Agent 侧等到真正开始
-                # 调用用户可理解的工具后再发，避免猜错下一步工具。
-                if bool(self.config.get("agent_preflight_notice_enabled", False)):
-                    notice_data = _preflight_tool_notice_data(event)
-                    if (
-                        notice_data
-                        and not context["wechat_desktop_agent_notice_sent"]
-                        and bool(self.config.get("agent_tool_notice_enabled", True))
-                        and self._is_user_visible_tool_notice(notice_data)
-                    ):
-                        try:
-                            context["wechat_desktop_agent_notice_sent"] = (
-                                self._send_agent_tool_notice(context, notice_data)
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "[WechatDesktop] Agent preflight notice failed: %s",
-                                exc,
-                            )
-                context["on_event"] = self._make_agent_event_callback(context)
-                self.produce(context)
-            except Exception:
-                context["wechat_desktop_reply_cycle"] = False
-                self._driver.end_reply_cycle()
-                raise
-            return True
-        self._trace(
-            "09-dropped",
-            "id=%s reason=context_filtered_by_plugin_or_empty",
-            event.event_id[:10],
-        )
-        return False
+        return AgentReplyCoordinator(self).dispatch(event, queue_token)
 
     def _make_agent_event_callback(self, context: Context):
-        """包装 Agent 流事件，记录首次工具调用并按配置发送一次进度通知。"""
-        downstream = context.get("on_event")
-        lock = threading.Lock()
-        seen_tool_calls: set[str] = set()
-        notice_sent = bool(context.get("wechat_desktop_agent_notice_sent", False))
-
-        def on_event(event: dict):
-            """处理通道关心的流事件后，保持原回调链继续向下传递。"""
-            nonlocal notice_sent
-            try:
-                if event.get("type") == "tool_execution_start":
-                    self._mark_lifecycle(
-                        context.get("wechat_desktop_source_event_ids", []),
-                        "first_tool",
-                    )
-                if (
-                    event.get("type") == "tool_execution_start"
-                    and bool(self.config.get("agent_tool_notice_enabled", True))
-                ):
-                    data = event.get("data", {})
-                    if self._is_user_visible_tool_notice(data):
-                        tool_call_id = str(
-                            data.get("tool_call_id") or data.get("tool_name") or "tool"
-                        )
-                        with lock:
-                            once = bool(
-                                self.config.get("agent_tool_notice_once_per_reply", True)
-                            )
-                            if tool_call_id not in seen_tool_calls and not (
-                                once and notice_sent
-                            ):
-                                seen_tool_calls.add(tool_call_id)
-                                notice_sent = self._send_agent_tool_notice(
-                                    context, data
-                                ) or notice_sent
-            except Exception as exc:
-                logger.warning(
-                    "[WechatDesktop] Agent tool notice failed: %s", exc
-                )
-            finally:
-                if downstream:
-                    downstream(event)
-
-        return on_event
+        return AgentReplyCoordinator(self).make_event_callback(context)
 
     def _is_user_visible_tool_notice(self, data: dict) -> bool:
-        """通道配置下，这次工具调用是否应向微信用户发进度通知。"""
-        return _is_user_visible_tool_notice(
-            data, self.config.get("agent_tool_notice_silent_tools")
-        )
+        return AgentReplyCoordinator(self).is_visible_notice(data)
 
     def _send_agent_tool_notice(self, context: Context, data: dict) -> bool:
-        """向当前微信会话发送工具/技能进度，并登记为不参与回复识别的临时文本。
-
-        发送前再次检查队列令牌、暂停状态、影子模式、白名单和底层工具过滤，
-        防止过期 Agent 周期、只观察模式或 bash/read 一类内部动作产生额外消息。
-        """
-        msg = context.get("msg")
-        target_name = (
-            getattr(msg, "other_user_nickname", "")
-            or context.get("receiver", "")
-        )
-        target_id = (
-            getattr(msg, "other_user_id", "")
-            or context.get("receiver", "")
-        )
-        event = getattr(msg, "event", None)
-        conversation_id = str(
-            getattr(event, "conversation_id", "") or target_id
-        )
-        queue_token = str(context.get("wechat_desktop_queue_token") or "")
-        if queue_token and not self._reply_queue.is_relevant(
-            queue_token, conversation_id
-        ):
-            return False
-        send_target = (
-            target_id
-            if str(target_id).startswith("uia-session:")
-            else target_name
-        )
-        is_group = bool(context.get("isgroup", False))
-        if (
-            bool(self._service.status().get("paused"))
-            or bool(self.config.get("shadow_mode", True))
-            or self._policy.is_blocked(target_name)
-            or not self._policy.is_allowlisted(target_name, is_group)
-        ):
-            return False
-        if not self._is_user_visible_tool_notice(data):
-            return False
-
-        kind, name = _tool_notice_subject(data)
-        name = re.sub(r"[\r\n`]+", " ", name).strip()[:80] or kind
-        template_key = str(data.get("notice_template_key") or "").strip()
-        if not template_key:
-            template_key = (
-                "agent_skill_notice_templates"
-                if kind == "skill"
-                else "agent_tool_notice_templates"
-            )
-        templates = [
-            str(item)
-            for item in self.config.get(template_key, [])
-            if str(item).strip()
-        ]
-        notice = _format_agent_notice(templates, kind, name)
-
-        self._driver.register_interim_text(conversation_id, notice)
-        try:
-            send_interim = getattr(self._driver, "send_interim_text", None)
-            result = (
-                send_interim(send_target, notice)
-                if send_interim
-                else self._driver.send_text(send_target, notice)
-            )
-            if not result.get("success"):
-                raise RuntimeError(str(result.get("message") or "send failed"))
-        except Exception:
-            self._driver.forget_interim_text(conversation_id, notice)
-            raise
-
-        self._store.append_conversation_history(
-            conversation_id=target_id,
-            conversation_name=target_name,
-            sender_name=str(self.config.get("self_display_name") or "我"),
-            direction="outgoing",
-            content_type="text",
-            content=notice,
-            source_type=str(
-                context.get("wechat_desktop_source_type", "unknown")
-            ),
-        )
-        self._store.audit(
-            "agent_tool_notice",
-            target_name,
-            "success" if result.get("verified") else "unverified",
-            self._content_hash(notice),
-            detail=f"{kind}={name}",
-        )
-        self._trace(
-            "10-tool-notice",
-            "target=%s kind=%s name=%s verified=%s",
-            target_name,
-            kind,
-            name,
-            bool(result.get("verified")),
-        )
-        return True
+        return AgentReplyCoordinator(self).send_tool_notice(context, data)
 
     def _compose_context(self, ctype: ContextType, content, **kwargs):
-        """创建 CowAgent Context，并允许插件在投递前修改或拦截。
-
-        微信桌面通道已经在自身策略层完成准入判断，因此这里不依赖其他 Channel 的
-        全局白名单；图片、语音等最终也会被规范为 Agent 可消费的文本上下文。
-        """
-        context = Context(ctype, content)
-        context.kwargs = kwargs
-        context["channel_type"] = "wechat_desktop"
-        context["origin_ctype"] = ctype
-        msg = context["msg"]
-        context["session_id"] = msg.other_user_id
-        context["receiver"] = msg.other_user_id
-
-        event_context = PluginManager().emit_event(
-            EventContext(
-                Event.ON_RECEIVE_MESSAGE,
-                {"channel": self, "context": context},
-            )
-        )
-        context = event_context["context"]
-        if event_context.is_pass() or context is None:
-            return context
-
-        if ctype == ContextType.TEXT:
-            text = str(content or "").strip()
-            if kwargs.get("isgroup"):
-                prefixes = self.config.get("group_command_prefixes", ["/cow"])
-                for prefix in prefixes:
-                    if prefix and text.startswith(prefix):
-                        text = text[len(prefix):].lstrip()
-                        break
-            context.type = ContextType.TEXT
-            context.content = text
-        return context
+        return AgentReplyCoordinator(self).compose_context(ctype, content, **kwargs)

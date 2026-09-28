@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Optional
+from channel.wechat_desktop.contracts import SendResult, TargetResolution
 
 from channel.wechat_desktop.models import (
     ReplyTargetValidation,
@@ -36,7 +37,15 @@ class WechatDesktopBackend(ABC):
 
     @abstractmethod
     def observe_events(self) -> tuple[dict, list[WechatDesktopEvent]]:
-        """读取可见会话并转换为统一事件。"""
+        """读取事件；未确认事件必须保留并重新交付，确认不等同于回复完成。"""
+
+    @abstractmethod
+    def acknowledge_events(self, event_ids: list[str]) -> None:
+        """仅在持久化接收成功后确认；重复确认幂等。"""
+
+    @abstractmethod
+    def resolve_target(self, conversation: str) -> TargetResolution:
+        """返回不透明会话 ID；失效 ID 不得悄悄降级为同名会话。"""
 
     @abstractmethod
     def validate_reply_target(self, event: WechatDesktopEvent) -> ReplyTargetValidation:
@@ -69,15 +78,15 @@ class WechatDesktopBackend(ABC):
         """移除已发送的进度提示记录。"""
 
     @abstractmethod
-    def send_text(self, conversation: str, text: str) -> dict:
+    def send_text(self, conversation: str, text: str) -> SendResult:
         """向指定会话发送普通文本。"""
 
-    def send_interim_text(self, conversation: str, text: str) -> dict:
+    def send_interim_text(self, conversation: str, text: str) -> SendResult:
         """发送进度提示；不支持加速的后端可退化为普通文本。"""
         return self.send_text(conversation, text)
 
     @abstractmethod
-    def send_image(self, conversation: str, image_path: str) -> dict:
+    def send_image(self, conversation: str, image_path: str) -> SendResult:
         """向指定会话发送图片文件。"""
 
 

@@ -35,8 +35,7 @@ class WechatDesktopScanMixin:
         首次扫描默认建立基线而不回复旧消息，但会按配置处理会话列表明确标记的
         未读消息。通过全部安全门的事件才会进入后续队列。
         """
-        with self._lifecycle_lock:
-            self._scan_count += 1
+        self._lifecycle.advance_scan()
         observation, events = self._driver.observe_events()
         now = time.time()
         if observation.get("error"):
@@ -58,7 +57,8 @@ class WechatDesktopScanMixin:
             owner_name=observation.get("owner_name", ""),
             owner_source=observation.get("owner_source", "unknown"),
             last_observation_at=now,
-            last_error="",
+            last_error="; ".join(item["error"] for item in observation.get("scan_errors", [])),
+            scan_errors=observation.get("scan_errors", []),
             **self._reply_queue.status(),
         )
 
@@ -73,121 +73,27 @@ class WechatDesktopScanMixin:
                 if event.kind == "message"
             }
         for event in events:
-            self._start_lifecycle(event)
-            recorded = self._store.record_event(event)
-            self._trace(
-                "07-event",
-                "id=%s recorded=%s kind=%s conversation=%s sender=%s source=%s group=%s at=%s type=%s chars=%s",
-                event.event_id[:10],
-                recorded,
-                event.kind,
-                event.conversation_name,
-                event.sender_name,
-                event.source_type,
-                event.is_group,
-                event.is_at,
-                event.content_type,
-                len(str(event.content or "")),
-            )
-            if not recorded:
-                # 事件账本指纹是最终去重门。UIA 快照可能在私聊回复尚未完成时再次
-                # 发出；绝不能把重复事件当成新入站消息，否则会触发自我回复循环。
-                # 私聊和群聊同样适用。
-                self._store.mark_event_processed(event.event_id)
-                self._finish_lifecycle([event.event_id], "duplicate")
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=duplicate_event_fingerprint",
-                    event.event_id[:10],
+            if first_poll and not self.config.get("bootstrap_existing_messages", False):
+                event.task.baseline_only = not (
+                    self.config.get("process_startup_unread_messages", True) and event.session_unread_count > 0
                 )
+            try:
+                receipt = self._store.receive_event(event)
+            except Exception as exc:
+                # 未持久化不 ACK：后端下轮交付同一个事件，不能提前抑制它。
+                self._service.update_status(last_error=f"event receipt failed: {exc}")
+                logger.exception("[WechatDesktop] event receipt failed")
                 continue
-            if event.kind == "message" and not (
-                first_poll
-                and baseline_history_exists.get(event.conversation_id, False)
-            ):
-                self._store.append_event_history(event)
-            if event.kind != "message":
-                self._trace(
-                    "08-request",
-                    "id=%s kind=%s ignored_no_approval_flow",
-                    event.event_id[:10],
-                    event.kind,
-                )
-                self._store.mark_event_processed(event.event_id)
-                self._finish_lifecycle([event.event_id], "skipped")
-                continue
-            process_startup_unread = bool(
-                self.config.get("process_startup_unread_messages", True)
-            )
-            startup_unread_event = bool(
-                process_startup_unread and event.session_unread_count > 0
-            )
-            if (
-                first_poll
-                and not bool(
-                    self.config.get("bootstrap_existing_messages", False)
-                )
-                and not startup_unread_event
-            ):
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=initial_baseline",
-                    event.event_id[:10],
-                )
-                self._store.mark_event_processed(event.event_id)
-                self._finish_lifecycle([event.event_id], "skipped")
-                continue
-            if (
-                self._policy.is_blocked(event.conversation_name)
-                or self._policy.is_blocked(event.sender_name)
-            ):
-                logger.info(
-                    "[WechatDesktop] ignored blacklisted sender/conversation: %s / %s",
-                    event.sender_name,
-                    event.conversation_name,
-                )
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=blacklist conversation=%s sender=%s",
-                    event.event_id[:10],
-                    event.conversation_name,
-                    event.sender_name,
-                )
-                self._store.mark_event_processed(event.event_id)
-                self._finish_lifecycle([event.event_id], "skipped")
-                continue
-            if event.source_type not in {"private", "group"}:
-                logger.info(
-                    "[WechatDesktop] ignored incoming message with source_type=%s",
-                    event.source_type,
-                )
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=unsupported_source_type source=%s",
-                    event.event_id[:10],
-                    event.source_type,
-                )
-                self._store.mark_event_processed(event.event_id)
-                self._finish_lifecycle([event.event_id], "skipped")
-                continue
-            if event.is_group and not self._policy.group_triggered(event):
-                self._trace(
-                    "08-skip",
-                    "id=%s reason=group_without_at conversation=%s",
-                    event.event_id[:10],
-                    event.conversation_name,
-                )
-                self._store.mark_event_processed(event.event_id)
-                self._finish_lifecycle([event.event_id], "skipped")
-                continue
-            self._trace(
-                "09-dispatch",
-                "id=%s conversation=%s source=%s",
-                event.event_id[:10],
-                event.conversation_name,
-                event.source_type,
-            )
-            self._route_reply_event(event)
+            if receipt.accepted:
+                self._start_lifecycle(event)
+                try:
+                    self._process_received_event(event, first_poll, baseline_history_exists)
+                except Exception as exc:
+                    self._store.mark_event_processed(event.event_id, "failed", "admission_failed")
+                    self._finish_lifecycle([event.event_id], "failed")
+                    logger.exception("[WechatDesktop] event admission failed")
+                    self._service.update_status(last_error=str(exc))
+            self._driver.acknowledge_events([receipt.observed_event_id])
         self._bootstrapped = True
 
         if now - self._last_cleanup_at > 86400:
@@ -200,6 +106,96 @@ class WechatDesktopScanMixin:
                 ),
             )
             self._last_cleanup_at = now
+
+    def _process_received_event(self, event, first_poll, baseline_history_exists):
+        """持久化接收后的单事件路由；所有拒绝也必须有可查询终态。"""
+        if event.kind == "message" and not (
+            (first_poll or event.task.baseline_only)
+            and baseline_history_exists.get(event.conversation_id, False)
+        ):
+            self._store.append_event_history(event)
+        if event.kind != "message":
+            self._trace(
+                "08-request",
+                "id=%s kind=%s ignored_no_approval_flow",
+                event.event_id[:10],
+                event.kind,
+            )
+            self._store.mark_event_processed(event.event_id)
+            self._finish_lifecycle([event.event_id], "skipped")
+            return
+        process_startup_unread = bool(
+            self.config.get("process_startup_unread_messages", True)
+        )
+        startup_unread_event = bool(
+            process_startup_unread and event.session_unread_count > 0
+        )
+        if (
+            (first_poll or event.task.baseline_only)
+            and not bool(
+                self.config.get("bootstrap_existing_messages", False)
+            )
+            and not startup_unread_event
+        ):
+            self._trace(
+                "08-skip",
+                "id=%s reason=initial_baseline",
+                event.event_id[:10],
+            )
+            self._store.mark_event_processed(event.event_id, "skipped", "startup_baseline")
+            self._finish_lifecycle([event.event_id], "skipped")
+            return
+        if (
+            self._policy.is_blocked(event.conversation_name)
+            or self._policy.is_blocked(event.sender_name)
+        ):
+            logger.info(
+                "[WechatDesktop] ignored blacklisted sender/conversation: %s / %s",
+                event.sender_name,
+                event.conversation_name,
+            )
+            self._trace(
+                "08-skip",
+                "id=%s reason=blacklist conversation=%s sender=%s",
+                event.event_id[:10],
+                event.conversation_name,
+                event.sender_name,
+            )
+            self._store.mark_event_processed(event.event_id)
+            self._finish_lifecycle([event.event_id], "skipped")
+            return
+        if event.source_type not in {"private", "group"}:
+            logger.info(
+                "[WechatDesktop] ignored incoming message with source_type=%s",
+                event.source_type,
+            )
+            self._trace(
+                "08-skip",
+                "id=%s reason=unsupported_source_type source=%s",
+                event.event_id[:10],
+                event.source_type,
+            )
+            self._store.mark_event_processed(event.event_id)
+            self._finish_lifecycle([event.event_id], "skipped")
+            return
+        if event.is_group and not self._policy.group_triggered(event):
+            self._trace(
+                "08-skip",
+                "id=%s reason=group_without_at conversation=%s",
+                event.event_id[:10],
+                event.conversation_name,
+            )
+            self._store.mark_event_processed(event.event_id)
+            self._finish_lifecycle([event.event_id], "skipped")
+            return
+        self._trace(
+            "09-dispatch",
+            "id=%s conversation=%s source=%s",
+            event.event_id[:10],
+            event.conversation_name,
+            event.source_type,
+        )
+        self._route_reply_event(event)
 
     def _route_reply_event(self, event: WechatDesktopEvent):
         """按事件形态选择最早可安全执行的下一阶段。
@@ -226,7 +222,7 @@ class WechatDesktopScanMixin:
 
     def _ignore_standalone_attachment(self, event: WechatDesktopEvent):
         """登记孤立图片但不主动分析，等待后续文字明确引用或提问。"""
-        self._store.mark_event_processed(event.event_id)
+        self._store.mark_event_processed(event.event_id, "observed", "standalone_attachment")
         self._trace(
             "09-attachment-observed",
             "id=%s conversation=%s type=%s action=identity_only",
@@ -267,7 +263,7 @@ class WechatDesktopScanMixin:
             except Exception:
                 terminal = "failed"
                 logger.exception("[WechatDesktop] control command dispatch failed")
-        self._store.mark_event_processed(event.event_id)
+        self._store.mark_event_processed(event.event_id, terminal, "control_command")
         self._finish_lifecycle([event.event_id], terminal)
 
     def _defer_private_event(self, event: WechatDesktopEvent):
@@ -380,7 +376,7 @@ class WechatDesktopScanMixin:
             ):
                 return
             events, _, _ = self._pending_private_batches.pop(conversation_id)
-        self._submit_materialization(events)
+            self._submit_materialization(events)
 
     def _clear_pending_private_batches(self) -> list[str]:
         """取消所有尚未释放的私聊定时器，返回受影响的事件 ID。"""
@@ -394,18 +390,13 @@ class WechatDesktopScanMixin:
 
     def _accept_replacement_event(self, event: WechatDesktopEvent):
         """发送前发现目标已更新时，用相同安全门重新接纳替代事件。"""
-        self._start_lifecycle(event)
-        recorded = self._store.record_event(event)
-        if recorded:
-            self._store.append_event_history(event)
-        if event.kind != "message" or event.source_type not in {"private", "group"}:
-            self._store.mark_event_processed(event.event_id)
-            return
-        if (
-            self._policy.is_blocked(event.conversation_name)
-            or self._policy.is_blocked(event.sender_name)
-            or (event.is_group and not self._policy.group_triggered(event))
-        ):
-            self._store.mark_event_processed(event.event_id)
-            return
-        self._route_reply_event(event)
+        receipt = self._store.receive_event(event)
+        if receipt.accepted:
+            self._start_lifecycle(event)
+            try:
+                self._process_received_event(event, False, {})
+            except Exception:
+                self._store.mark_event_processed(event.event_id, "failed", "replacement_admission_failed")
+                self._finish_lifecycle([event.event_id], "failed")
+                raise
+        self._driver.acknowledge_events([receipt.observed_event_id])

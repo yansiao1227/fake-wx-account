@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import queue
+import time
 import re
 import shutil
 import unicodedata
@@ -11,9 +12,9 @@ import uuid
 from pathlib import Path
 
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.config import DEFAULT_CONFIG
+from channel.wechat_desktop.contracts import EVENT_TERMINALS
 from common.log import logger
-from common.utils import expand_path
-from config import conf
 
 
 class WechatDesktopMaterializeMixin:
@@ -27,13 +28,19 @@ class WechatDesktopMaterializeMixin:
             if self._stop_event.is_set():
                 accepted = False
             else:
-                self._materialize_queue.put(events)
-                accepted = True
+                try:
+                    self._materialize_queue.put_nowait(events)
+                    accepted = True
+                except queue.Full:
+                    accepted = False
         if not accepted:
             event_ids = [event.event_id for event in events]
+            terminal = "stopped" if self._stop_event.is_set() else "full"
             for event_id in event_ids:
-                self._store.mark_event_processed(event_id)
-            self._finish_lifecycle(event_ids, "stopped")
+                self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id,
+                                  "rejected" if terminal == "full" else "stopped", "materialize_queue_" + terminal)
+            self._finish_lifecycle(event_ids, terminal)
+            self._service.update_status(materialize_last_rejection=terminal)
         return accepted
 
     def _clear_pending_materializations(self) -> list[str]:
@@ -115,7 +122,7 @@ class WechatDesktopMaterializeMixin:
 
         target = resolved_events[-1]
         batch_id = str(
-            getattr(events[-1], "_batch_id", "") or uuid.uuid4().hex
+            events[-1].task.batch_id or uuid.uuid4().hex
         )
         source_event_ids = [event.event_id for event in resolved_events]
         history = list(target.history)
@@ -162,22 +169,10 @@ class WechatDesktopMaterializeMixin:
                 if str(item.get("content_type") or "") not in {"file", "image"}
             ]
         target.history = history
-        setattr(target, "_source_event_ids", source_event_ids)
-        setattr(target, "_batch_id", batch_id)
-        setattr(
-            target,
-            "_cache_only",
-            bool(resolved_events)
-            and all(
-                event.content_type == "file" and not event.reference
-                for event in resolved_events
-            ),
-        )
-        setattr(
-            target,
-            "_attachment_reference_required",
-            self._requires_attachment_reference(target),
-        )
+        target.task.source_event_ids = source_event_ids
+        target.task.batch_id = batch_id
+        target.task.cache_only = bool(resolved_events) and all((event.content_type == 'file' and (not event.reference) for event in resolved_events))
+        target.task.attachment_reference_required = self._requires_attachment_reference(target)
         self._mark_lifecycle(
             source_event_ids,
             "materialized",
@@ -207,10 +202,10 @@ class WechatDesktopMaterializeMixin:
         target = events[-1]
         source_event_ids = [event.event_id for event in events]
         batch_id = uuid.uuid4().hex
-        setattr(target, "_source_event_ids", source_event_ids)
-        setattr(target, "_batch_id", batch_id)
-        setattr(target, "_deferred_materialization_events", list(events))
-        setattr(target, "_attachment_reference_required", False)
+        target.task.source_event_ids = source_event_ids
+        target.task.batch_id = batch_id
+        target.task.deferred_materialization_events = list(events)
+        target.task.attachment_reference_required = False
         return target
 
     def _consume_materialization_queue(self):
@@ -230,17 +225,27 @@ class WechatDesktopMaterializeMixin:
             if materialization_active is not None:
                 materialization_active.set()
             try:
+                config = getattr(self, "config", None) or DEFAULT_CONFIG
+                max_wait = config.get(
+                    "reply_queue_max_wait_seconds",
+                    DEFAULT_CONFIG["reply_queue_max_wait_seconds"],
+                )
+                if time.monotonic() - events[-1].task.created_at >= max_wait:
+                    for event_id in event_ids:
+                        self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, "expired", "materialization_wait_expired")
+                    self._finish_lifecycle(event_ids, "expired")
+                    continue
                 if self._has_referenced_attachment(events[-1]):
                     materialized = self._prepare_deferred_materialization(events)
                 else:
                     materialized = self._materialize_batch(events)
                 if self._stop_event.is_set():
                     for event_id in event_ids:
-                        self._store.mark_event_processed(event_id)
+                        self._store.mark_event_processed(event_id, "stopped")
                     self._finish_lifecycle(event_ids, "stopped")
-                elif bool(getattr(materialized, "_cache_only", False)):
+                elif bool(materialized.task.cache_only):
                     for event_id in event_ids:
-                        self._store.mark_event_processed(event_id)
+                        self._store.mark_event_processed(event_id, "cached")
                     self._trace(
                         "09-file-cached",
                         "conversation=%s messages=%s",
@@ -253,8 +258,8 @@ class WechatDesktopMaterializeMixin:
             except Exception:
                 logger.exception("[WechatDesktop] message materialization failed")
                 for event_id in event_ids:
-                    self._store.mark_event_processed(event_id)
-                self._finish_lifecycle(event_ids, "failed")
+                    self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, "failed", "materialization_failed")
+                self._best_effort("finish_lifecycle", self._finish_lifecycle, event_ids, "failed")
             finally:
                 if materialization_active is not None:
                     materialization_active.clear()
@@ -262,19 +267,31 @@ class WechatDesktopMaterializeMixin:
 
     def _enqueue_reply_event(self, event: WechatDesktopEvent):
         """把稳定事件写入全局回复 FIFO，并标记其生命周期进入排队阶段。"""
-        enqueue_result = self._reply_queue.enqueue(event)
         source_event_ids = list(
-            getattr(event, "_source_event_ids", None) or [event.event_id]
+            event.task.source_event_ids or [event.event_id]
         )
-        if not enqueue_result:
-            for event_id in source_event_ids:
-                self._store.mark_event_processed(event_id)
+        if not event.task.proactive_send and any(
+            self._store.event_state(event_id).get("state") in EVENT_TERMINALS
+            for event_id in source_event_ids
+        ):
             self._finish_lifecycle(source_event_ids, "duplicate")
-            return
+            return False
+        self._store.set_event_state(source_event_ids, "queued")
+        enqueue_result = self._reply_queue.enqueue(event)
+        if not enqueue_result:
+            if enqueue_result.action == "duplicate":
+                return False  # 已有活跃任务，不改写其状态。
+            for event_id in source_event_ids:
+                self._store.mark_event_processed(event_id,
+                                                 "rejected" if enqueue_result.action == "full" else "stopped",
+                                                 "reply_queue_" + enqueue_result.action)
+            self._finish_lifecycle(source_event_ids, enqueue_result.action)
+            self._service.update_status(queue_last_rejection=enqueue_result.action, **self._reply_queue.status())
+            return False
         self._mark_lifecycle(
             source_event_ids,
             "queued",
-            batch_id=str(getattr(event, "_batch_id", "") or event.event_id),
+            batch_id=str(event.task.batch_id or event.event_id),
         )
         self._trace(
             "09-queued",
@@ -285,19 +302,29 @@ class WechatDesktopMaterializeMixin:
             self._reply_queue.status()["queue_depth"],
         )
         self._service.update_status(**self._reply_queue.status())
+        return True
 
     def _preserve_event_evidence(self, event: WechatDesktopEvent):
         """把临时截图/附件复制到 Agent 工作区，避免微信缓存清理后路径失效。"""
         source = str(event.evidence_path or "")
         if not source or not os.path.isfile(source):
             return
-        workspace = Path(expand_path(conf().get("agent_workspace", "~/cow")))
-        evidence_dir = workspace / "wechat_evidence"
+        evidence_dir = self._store.evidence_dir
         evidence_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(source).suffix or ".png"
         target = evidence_dir / f"{event.event_id}{suffix}"
+        if target.resolve().parent != evidence_dir.resolve():
+            raise ValueError("invalid evidence event identifier")
         try:
+            if Path(source).resolve() == target.resolve():
+                return
             shutil.copy2(source, target)
+            try:
+                self._store.set_event_evidence(event.event_id, source, str(target))
+            except Exception:
+                # 复制成功但登记失败，不能留下数据库无法追踪的副本。
+                target.unlink(missing_ok=True)
+                raise
             old_source = event.evidence_path
             event.evidence_path = str(target)
             if event.content_type == "image" and event.content == old_source:

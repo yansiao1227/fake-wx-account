@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.config import DEFAULT_CONFIG
 
 
 @dataclass
@@ -19,6 +20,7 @@ class ReplyQueueItem:
     context_history: list[dict] = field(default_factory=list)
     token: str = field(default_factory=lambda: uuid.uuid4().hex)
     done: threading.Event = field(default_factory=threading.Event)
+    enqueued_at: float = field(default_factory=time.monotonic)
     terminal: str = ""
     expired: bool = False
     started_at: float = 0.0
@@ -45,11 +47,15 @@ class WechatReplyQueue:
 
     _STOP = object()
 
-    def __init__(self, conversation_burst_limit: int = 5):
+    def __init__(self, conversation_burst_limit=None, *, capacity=None, max_wait_seconds=None):
         # ``conversation_burst_limit`` remains accepted for config
         # compatibility. Strict FIFO no longer has a continuation lane.
         del conversation_burst_limit
-        self._queue: queue.Queue = queue.Queue()
+        self._capacity = int(capacity if capacity is not None else DEFAULT_CONFIG["reply_queue_capacity"])
+        self._max_wait = float(max_wait_seconds if max_wait_seconds is not None else DEFAULT_CONFIG["reply_queue_max_wait_seconds"])
+        if self._capacity <= 0 or self._max_wait <= 0:
+            raise ValueError("queue capacity and max wait must be positive")
+        self._queue: queue.Queue = queue.Queue(maxsize=self._capacity)
         self._lock = threading.RLock()
         self._pending_ids: set[str] = set()
         self._active: Optional[ReplyQueueItem] = None
@@ -58,8 +64,12 @@ class WechatReplyQueue:
             "completed": 0,
             "skipped": 0,
             "failed": 0,
+            "partial": 0,
+            "uncertain": 0,
             "timeout": 0,
             "stopped": 0,
+            "expired": 0,
+            "rejected": 0,
             # Retained in status payloads for compatibility. New work never
             # produces this terminal state.
             "superseded": 0,
@@ -68,25 +78,42 @@ class WechatReplyQueue:
 
     @staticmethod
     def _source_event_ids(event: WechatDesktopEvent) -> list[str]:
-        values = getattr(event, "_source_event_ids", None) or [event.event_id]
+        values = event.task.source_event_ids or [event.event_id]
         return list(dict.fromkeys(str(value) for value in values if str(value)))
 
     def enqueue(self, event: WechatDesktopEvent) -> QueueEnqueueResult:
         source_event_ids = self._source_event_ids(event)
         with self._lock:
-            if self._stopped or any(
+            if self._stopped:
+                return QueueEnqueueResult(False, "stopped")
+            if any(
                 event_id in self._pending_ids for event_id in source_event_ids
             ):
                 return QueueEnqueueResult(False)
             item = ReplyQueueItem(
                 event=event,
+                enqueued_at=event.task.created_at,
                 context_history=deepcopy(event.history),
                 source_event_ids=source_event_ids,
-                batch_id=str(getattr(event, "_batch_id", "") or event.event_id),
+                batch_id=str(event.task.batch_id or event.event_id),
             )
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                self._counts["rejected"] += 1
+                return QueueEnqueueResult(False, "full")
             self._pending_ids.update(source_event_ids)
-            self._queue.put(item)
             return QueueEnqueueResult(True, "added")
+
+    def contains(self, event_id: str) -> bool:
+        with self._lock:
+            return event_id in self._pending_ids
+
+    def source_event_ids(self, token: str) -> list[str]:
+        with self._lock:
+            if self._active and self._active.token == token:
+                return list(self._active.source_event_ids)
+            return []
 
     def enqueue_many(self, events: list[WechatDesktopEvent]) -> int:
         return sum(
@@ -104,6 +131,10 @@ class WechatReplyQueue:
             return None
         with self._lock:
             item.started_at = time.time()
+            if self._stopped:
+                item.expired, item.terminal = True, "stopped"
+            elif time.monotonic() - item.enqueued_at >= self._max_wait:
+                item.expired, item.terminal = True, "expired"
             self._active = item
         return item
 
@@ -135,7 +166,7 @@ class WechatReplyQueue:
                 self._active.done.set()
 
     def finish(self, item: ReplyQueueItem, terminal: str):
-        terminal = terminal if terminal in self._counts else "completed"
+        terminal = terminal if terminal in self._counts and terminal != "rejected" else "failed"
         with self._lock:
             if terminal == "timeout":
                 item.expired = True
@@ -154,6 +185,7 @@ class WechatReplyQueue:
             active = self._active
             return {
                 "queue_depth": self._queue.qsize(),
+                "queue_capacity": self._capacity,
                 "queue_active_event": active.event.event_id if active else "",
                 "queue_active_conversation": (
                     active.event.conversation_name if active else ""
@@ -185,6 +217,8 @@ class WechatReplyQueue:
     def stop(self) -> int:
         discarded = 0
         with self._lock:
+            if self._stopped:
+                return 0
             self._stopped = True
             if self._active:
                 self._active.expired = True

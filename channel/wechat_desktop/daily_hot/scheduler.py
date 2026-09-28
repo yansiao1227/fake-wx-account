@@ -62,10 +62,12 @@ class DailyHotScheduler:
         tick_seconds: float = 15.0,
         now_factory: Optional[Callable[[], datetime]] = None,
         prepare_factory: Optional[Callable[..., dict]] = None,
+        enqueue_dated_callback: Optional[Callable[[str, str], int]] = None,
     ):
         self.config = config
         self.store = store
         self.enqueue_callback = enqueue_callback
+        self.enqueue_dated_callback = enqueue_dated_callback
         self.is_paused = is_paused or (lambda: False)
         self.tick_seconds = max(1.0, float(tick_seconds or 15.0))
         self.now_factory = now_factory or datetime.now
@@ -140,6 +142,7 @@ class DailyHotScheduler:
             "daily_hot_last_error": self.store.get_state(STATE_LAST_ERROR, ""),
             "daily_hot_last_status": self.store.get_state(STATE_LAST_STATUS, ""),
             "daily_hot_preparing": preparing,
+            "daily_hot_delivery_counts": self.store.broadcast_status_counts(self.now_factory().strftime("%Y-%m-%d")),
         }
 
     def _run_loop(self):
@@ -158,7 +161,9 @@ class DailyHotScheduler:
             return
         now = self.now_factory()
         last_date = str(self.store.get_state(STATE_LAST_DATE, "") or "")
-        if not is_due(now, self.schedule_time, last_date):
+        retry_pending = (last_date == now.strftime("%Y-%m-%d")
+                         and self.store.has_pending_broadcasts(last_date))
+        if not retry_pending and not is_due(now, self.schedule_time, last_date):
             return
         with self._lock:
             if self._preparing:
@@ -173,17 +178,17 @@ class DailyHotScheduler:
             self._prepare_thread.start()
 
     def _prepare_and_enqueue(self, fire_date: str):
-        claimed = False
         try:
             if self._stop_event.is_set():
                 return
             self.store.set_state(STATE_LAST_STATUS, "preparing")
             self.store.set_state(STATE_LAST_ERROR, "")
 
-            payload = self.prepare_factory(
-                tab=self.tab,
-                prefix=self.message_prefix,
-            )
+            cached = self.store.get_state("daily_hot_prepared", {})
+            if cached.get("date") == fire_date:
+                payload = {"ok": True, "message": cached["message"]}
+            else:
+                payload = self.prepare_factory(tab=self.tab, prefix=self.message_prefix)
             if self._stop_event.is_set():
                 self.store.set_state(STATE_LAST_STATUS, "stopped")
                 return
@@ -204,10 +209,7 @@ class DailyHotScheduler:
                 self.store.set_state(STATE_LAST_ERROR, "empty message")
                 return
 
-            # Claim the day only after content is ready, so transient API failures
-            # can retry on the next tick within the same day.
-            self.store.set_state(STATE_LAST_DATE, fire_date)
-            claimed = True
+            self.store.set_state("daily_hot_prepared", {"date": fire_date, "message": message})
 
             if bool(self.config.get("shadow_mode", True)) or self.is_paused():
                 self.store.set_state(STATE_LAST_STATUS, "skipped")
@@ -221,7 +223,12 @@ class DailyHotScheduler:
                 )
                 return
 
-            queued = int(self.enqueue_callback(message) or 0)
+            if self.enqueue_dated_callback is not None:
+                queued = int(self.enqueue_dated_callback(message, fire_date) or 0)
+            else:
+                queued = int(self.enqueue_callback(message) or 0)
+            # 仅在完整入队回调成功后占用当天；失败时复用已准备文案重试。
+            self.store.set_state(STATE_LAST_DATE, fire_date)
             self.store.set_state(
                 STATE_LAST_STATUS,
                 "queued" if queued > 0 else "no_targets",
@@ -234,9 +241,6 @@ class DailyHotScheduler:
         except Exception as exc:
             self.store.set_state(STATE_LAST_STATUS, "failed")
             self.store.set_state(STATE_LAST_ERROR, str(exc))
-            if not claimed:
-                # Leave last_date untouched so the day can retry.
-                pass
             logger.exception(
                 "[WechatDesktop][DailyHot] prepare worker crashed date=%s",
                 fire_date,
@@ -253,3 +257,8 @@ class DailyHotScheduler:
             return True
         prepare.join(timeout=timeout)
         return not prepare.is_alive()
+
+    def is_alive(self) -> bool:
+        with self._lock:
+            return any(worker is not None and worker.is_alive()
+                       for worker in (self._thread, self._prepare_thread))
