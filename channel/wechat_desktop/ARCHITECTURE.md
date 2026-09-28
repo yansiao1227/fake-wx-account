@@ -194,6 +194,8 @@ UIA 不是微信服务端消息 ID，不能将上述契约理解为跨所有 UI 
 避免重启后集中发送过时回复；需要重新处理时由用户发送一条新消息。
 每日热点仍使用独立 `broadcast_jobs`：仅明确没有提交气泡的取消可回到 `pending`，
 `partial`、`unverified`、`uncertain` 均不自动重发。
+调度器只使用 `enqueue_callback(message, fire_date)`，重试沿用准备日期和缓存文案。
+时间解析与配置校验共用 `config.parse_hhmm`。
 
 ### 发送结果与防重放
 

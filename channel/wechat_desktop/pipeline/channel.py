@@ -279,7 +279,6 @@ class WechatDesktopChannel(
             config=self.config,
             store=self._store,
             enqueue_callback=self.enqueue_daily_hot_broadcast,
-            enqueue_dated_callback=self.enqueue_daily_hot_broadcast,
             is_paused=lambda: bool(self._service.status().get("paused")),
         )
         self._daily_hot_scheduler.start()

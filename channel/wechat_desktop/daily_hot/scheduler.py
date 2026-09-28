@@ -11,25 +11,13 @@ import threading
 from datetime import datetime
 from typing import Callable, Optional
 
+from channel.wechat_desktop.config import parse_hhmm
 from channel.wechat_desktop.daily_hot.baidu_hot import build_daily_hot_message
 from common.log import logger
 
 STATE_LAST_DATE = "daily_hot_last_date"
 STATE_LAST_ERROR = "daily_hot_last_error"
 STATE_LAST_STATUS = "daily_hot_last_status"
-
-
-def parse_hhmm(value: str) -> tuple[int, int]:
-    """Parse ``HH:MM`` into hour/minute. Raises ValueError on invalid input."""
-    text = str(value or "").strip()
-    parts = text.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"invalid daily hot time: {value!r}")
-    hour = int(parts[0])
-    minute = int(parts[1])
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(f"invalid daily hot time: {value!r}")
-    return hour, minute
 
 
 def is_due(
@@ -57,17 +45,15 @@ class DailyHotScheduler:
         *,
         config: dict,
         store,
-        enqueue_callback: Callable[[str], int],
+        enqueue_callback: Callable[[str, str], int],
         is_paused: Optional[Callable[[], bool]] = None,
         tick_seconds: float = 15.0,
         now_factory: Optional[Callable[[], datetime]] = None,
         prepare_factory: Optional[Callable[..., dict]] = None,
-        enqueue_dated_callback: Optional[Callable[[str, str], int]] = None,
     ):
         self.config = config
         self.store = store
         self.enqueue_callback = enqueue_callback
-        self.enqueue_dated_callback = enqueue_dated_callback
         self.is_paused = is_paused or (lambda: False)
         self.tick_seconds = max(1.0, float(tick_seconds or 15.0))
         self.now_factory = now_factory or datetime.now
@@ -223,10 +209,7 @@ class DailyHotScheduler:
                 )
                 return
 
-            if self.enqueue_dated_callback is not None:
-                queued = int(self.enqueue_dated_callback(message, fire_date) or 0)
-            else:
-                queued = int(self.enqueue_callback(message) or 0)
+            queued = int(self.enqueue_callback(message, fire_date) or 0)
             # 仅在完整入队回调成功后占用当天；失败时复用已准备文案重试。
             self.store.set_state(STATE_LAST_DATE, fire_date)
             self.store.set_state(

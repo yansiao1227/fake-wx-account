@@ -212,9 +212,11 @@ def test_baseline_history_does_not_match_arbitrarily_later_records(channel):
 
 
 def test_scheduler_retries_enqueue_with_cached_content(channel):
+    channel.config["daily_hot_broadcast_enabled"] = True
     attempts, preparations = [], []
 
-    def enqueue(message):
+    def enqueue(message, fire_date):
+        assert fire_date == "2026-09-20"
         attempts.append(message)
         if len(attempts) == 1:
             raise RuntimeError("queue unavailable")

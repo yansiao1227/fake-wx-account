@@ -1,7 +1,6 @@
 """Tests for wechat_desktop daily Baidu-hot broadcast."""
 
 from __future__ import annotations
-import threading
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 import pytest
@@ -350,11 +349,10 @@ def test_build_daily_hot_message_falls_back_when_llm_fails():
 def test_scheduler_prepares_and_enqueues_once_per_day(tmp_path):
     store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
     enqueued = []
-    ready = threading.Event()
 
-    def enqueue(message: str) -> int:
+    def enqueue(message: str, fire_date: str) -> int:
+        assert fire_date == "2026-08-03"
         enqueued.append(message)
-        ready.set()
         return 2
 
     config = {
@@ -388,7 +386,6 @@ def test_scheduler_prepares_and_enqueues_once_per_day(tmp_path):
 
     # Same day should not fire again.
     enqueued.clear()
-    ready.clear()
     scheduler._tick()
     assert scheduler.wait_prepare(timeout=0.5)
     assert enqueued == []
@@ -405,7 +402,7 @@ def test_scheduler_skips_when_disabled_or_shadow(tmp_path):
             "shadow_mode": False,
         },
         store=store,
-        enqueue_callback=lambda message: called.append(message) or 1,
+        enqueue_callback=lambda message, fire_date: called.append(message) or 1,
         prepare_factory=lambda **kwargs: (_ for _ in ()).throw(
             AssertionError("should not prepare")
         ),
@@ -438,7 +435,7 @@ def test_scheduler_retries_after_prepare_failure(tmp_path):
             "shadow_mode": False,
         },
         store=store,
-        enqueue_callback=lambda message: enqueued.append(message) or 1,
+        enqueue_callback=lambda message, fire_date: enqueued.append(message) or 1,
         prepare_factory=prepare,
     )
     scheduler.now_factory = lambda: datetime(2026, 8, 3, 19, 0, 0)
