@@ -48,7 +48,6 @@ def channel(tmp_path):
     channel._pending_private_batches = {}
     channel._materialize_submit_lock = threading.RLock()
     channel._materialize_queue = queue.Queue(maxsize=1)
-    channel._materialize_stop = object()
     channel._materialization_active = threading.Event()
     channel._lifecycle = LifecycleRecorder()
     channel._scan_count = 0
@@ -131,8 +130,10 @@ def test_queue_capacity_and_expiration(channel):
     assert not channel._reply_queue.is_active(item.token)
     channel._reply_queue.finish(item, "expired")
     assert channel._reply_queue.enqueue(second)
-    channel._reply_queue.stop()
-    channel._reply_queue.stop()  # 必须幂等，不因满哨兵队列阻塞。
+    assert channel._reply_queue.stop() == [second.event_id]
+    assert channel._reply_queue.stop() == []
+    assert channel._reply_queue.status()["queue_depth"] == 0
+    assert channel._reply_queue._queue.unfinished_tasks == 0
     assert channel._reply_queue.enqueue(event()).action == "stopped"
 
 

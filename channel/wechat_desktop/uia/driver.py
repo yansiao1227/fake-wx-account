@@ -14,7 +14,7 @@ from dataclasses import replace
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from common.log import file_logger, logger
 from channel.wechat_desktop.config import DEFAULT_CONFIG
@@ -335,17 +335,6 @@ class WechatUiaDriver(WechatDesktopBackend):
         }
         result.update(updates)
         return result
-
-    def observe(self, focus: bool = False) -> dict:
-        try:
-            if focus:
-                self.client.focus_window()
-            return self._observation(
-                process_id=self.client.get_owner_window_process_id(),
-                node_count=self.client.probe_tree(),
-            )
-        except Exception as exc:
-            return self._observation(error=f"WeChat UI Automation unavailable: {exc}", uia_available=False)
 
     def _message_limit(self) -> int:
         # Zero asks the UIA client for every message node currently visible.
@@ -728,33 +717,6 @@ class WechatUiaDriver(WechatDesktopBackend):
                 }
             )
         return history
-
-    def _resolve_message_files(
-        self,
-        messages: list[UiaChatMessage],
-        prefer_image_viewer: bool = False,
-    ) -> list[UiaChatMessage]:
-        resolved_messages = []
-        for visible_message in messages:
-            if visible_message.message_type == "file":
-                file_path = self.client.fetch_message_file(visible_message)
-                if file_path:
-                    visible_message = replace(visible_message, file_path=file_path)
-            elif visible_message.message_type == "image":
-                fetch_image = getattr(self.client, "fetch_message_image", None)
-                image_path = ""
-                if fetch_image:
-                    try:
-                        image_path = fetch_image(
-                            visible_message,
-                            prefer_viewer=prefer_image_viewer,
-                        )
-                    except TypeError:
-                        image_path = fetch_image(visible_message)
-                if image_path:
-                    visible_message = replace(visible_message, file_path=image_path)
-            resolved_messages.append(visible_message)
-        return resolved_messages
 
     def _resolve_reply_target_message(
         self,
@@ -1384,12 +1346,6 @@ class WechatUiaDriver(WechatDesktopBackend):
             selectors = dict(self._conversation_selectors)
         return resolve_conversation_selector(selectors, conversation)
 
-    def _selector(self, conversation: str):
-        """兼容旧的三元组调用；新代码应使用 ``_resolve_selector``。"""
-
-        selector = self._resolve_selector(conversation)
-        return selector.title, selector.runtime_id, selector.row_index
-
     def validate_reply_target(self, event: WechatDesktopEvent) -> ReplyTargetValidation:
         """Re-read the UI and return a replacement event when the target changed."""
         try:
@@ -1411,12 +1367,13 @@ class WechatUiaDriver(WechatDesktopBackend):
             # already-running reply. The stored UIA session selector is enough
             # to verify the destination still exists.
             return ReplyTargetValidation(True)
-        title, runtime_id, row_index = self._selector(event.conversation_id)
+        selector = self._resolve_selector(event.conversation_id)
+        title = selector.title
         messages = self.client.get_chat_history(
             title,
             self._message_limit(),
-            runtime_id=runtime_id,
-            row_index=row_index,
+            runtime_id=selector.runtime_id,
+            row_index=selector.row_index,
         )
         messages = self._exclude_private_outgoing_messages(
             messages, title, event.is_group

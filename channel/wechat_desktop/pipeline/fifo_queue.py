@@ -24,7 +24,6 @@ class ReplyQueueItem:
     terminal: str = ""
     expired: bool = False
     started_at: float = 0.0
-    global_queue_task: bool = True
     source_event_ids: list[str] = field(default_factory=list)
     batch_id: str = ""
 
@@ -45,12 +44,7 @@ class QueueEnqueueResult:
 class WechatReplyQueue:
     """只追加的全局 FIFO；已排队和正在处理的任务不会被新消息替换。"""
 
-    _STOP = object()
-
-    def __init__(self, conversation_burst_limit=None, *, capacity=None, max_wait_seconds=None):
-        # ``conversation_burst_limit`` remains accepted for config
-        # compatibility. Strict FIFO no longer has a continuation lane.
-        del conversation_burst_limit
+    def __init__(self, *, capacity=None, max_wait_seconds=None):
         self._capacity = int(capacity if capacity is not None else DEFAULT_CONFIG["reply_queue_capacity"])
         self._max_wait = float(max_wait_seconds if max_wait_seconds is not None else DEFAULT_CONFIG["reply_queue_max_wait_seconds"])
         if self._capacity <= 0 or self._max_wait <= 0:
@@ -70,9 +64,6 @@ class WechatReplyQueue:
             "stopped": 0,
             "expired": 0,
             "rejected": 0,
-            # Retained in status payloads for compatibility. New work never
-            # produces this terminal state.
-            "superseded": 0,
         }
         self._last_terminal = ""
 
@@ -115,19 +106,13 @@ class WechatReplyQueue:
                 return list(self._active.source_event_ids)
             return []
 
-    def enqueue_many(self, events: list[WechatDesktopEvent]) -> int:
-        return sum(
-            int(bool(self.enqueue(event)))
-            for event in sorted(events, key=lambda item: item.observed_at)
-        )
-
     def get(self, timeout: float = 0.25) -> Optional[ReplyQueueItem]:
+        with self._lock:
+            if self._stopped:
+                return None
         try:
             item = self._queue.get(timeout=max(0.0, timeout))
         except queue.Empty:
-            return None
-        if item is self._STOP:
-            self._queue.task_done()
             return None
         with self._lock:
             item.started_at = time.time()
@@ -145,10 +130,6 @@ class WechatReplyQueue:
                 and self._active.token == str(token or "")
                 and not self._active.expired
             )
-
-    def is_relevant(self, token: str, conversation_id: str) -> bool:
-        del conversation_id
-        return self.is_active(token)
 
     def signal(self, token: str, terminal: str):
         with self._lock:
@@ -177,8 +158,7 @@ class WechatReplyQueue:
                 self._pending_ids.discard(event_id)
             if self._active is item:
                 self._active = None
-        if item.global_queue_task:
-            self._queue.task_done()
+        self._queue.task_done()
 
     def status(self) -> dict:
         with self._lock:
@@ -204,36 +184,20 @@ class WechatReplyQueue:
                     item = self._queue.get_nowait()
                 except queue.Empty:
                     break
-                if item is self._STOP:
-                    self._queue.put(self._STOP)
-                    self._queue.task_done()
-                    break
                 discarded_event_ids.extend(item.source_event_ids)
                 for event_id in item.source_event_ids:
                     self._pending_ids.discard(event_id)
                 self._queue.task_done()
         return list(dict.fromkeys(discarded_event_ids))
 
-    def stop(self) -> int:
-        discarded = 0
+    def stop(self) -> list[str]:
+        """使当前令牌失效并返回丢弃的事件；消费者通过短轮询退出。"""
         with self._lock:
             if self._stopped:
-                return 0
+                return []
             self._stopped = True
             if self._active:
                 self._active.expired = True
                 self._active.terminal = "stopped"
                 self._active.done.set()
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is not self._STOP:
-                discarded += 1
-                with self._lock:
-                    for event_id in item.source_event_ids:
-                        self._pending_ids.discard(event_id)
-            self._queue.task_done()
-        self._queue.put(self._STOP)
-        return discarded
+            return self.clear_pending()

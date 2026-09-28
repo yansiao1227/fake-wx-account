@@ -45,7 +45,6 @@ class LifecycleRecorder:
                     "send_result": "-",
                     "detected_scan": self._scan_count,
                     "attachment_resolve_count": 0,
-                    "superseded_by": "",
                 },
             )
 
@@ -98,7 +97,7 @@ class LifecycleRecorder:
                 "event_id=%s batch_id=%s conversation=%s terminal=%s "
                 "detected=0 materialized=%s queued=%s agent_started=%s "
                 "first_tool=%s agent_done=%s send_started=%s send_verified=%s "
-                "scan_count=%s attachment_resolve_count=%s superseded_by=%s "
+                "scan_count=%s attachment_resolve_count=%s "
                 "send_result=%s",
                 lifecycle["event_id"],
                 lifecycle["batch_id"] or "-",
@@ -113,6 +112,5 @@ class LifecycleRecorder:
                 elapsed("send_verified"),
                 max(1, scan_count - int(lifecycle["detected_scan"]) + 1),
                 lifecycle["attachment_resolve_count"],
-                lifecycle["superseded_by"] or "-",
                 lifecycle["send_result"],
             )

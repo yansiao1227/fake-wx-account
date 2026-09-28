@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.contracts import EventReceipt, EVENT_TERMINALS, SendResult
@@ -291,13 +291,6 @@ class WechatDesktopStore:
             row = db.execute("SELECT * FROM event_runs WHERE event_id=?", (event_id,)).fetchone()
             return dict(row) if row else {}
 
-    def begin_delivery(self, event_ids: list[str], target: str, content_hash: str) -> str:
-        delivery_id = uuid.uuid4().hex
-        with self._lock, self._connect() as db:
-            db.execute("INSERT INTO deliveries(delivery_id,event_ids,target,content_hash,status,result,updated_at) VALUES (?,?,?,?, 'sending', '{}', ?)",
-                       (delivery_id, json.dumps(event_ids), target, content_hash, time.time()))
-        return delivery_id
-
     def claim_delivery(self, event_ids: list[str], target: str, content_hash: str, *, retry_not_sent: bool = False) -> tuple[str, SendResult | None]:
         """同一入站任务的同一输出只提交一次，日志不完整也不自动重放。"""
         ids = json.dumps(sorted(set(event_ids)))
@@ -492,23 +485,6 @@ class WechatDesktopStore:
                     (str(conversation_id), safe_limit),
                 ).fetchall()
         return [dict(row) for row in reversed(rows)]
-
-    def list_outgoing_texts_by_name(
-        self, conversation_name: str, limit: int = 20
-    ) -> List[str]:
-        with self._lock, self._connect() as db:
-            rows = db.execute(
-                """
-                SELECT content FROM conversation_history
-                 WHERE conversation_name=?
-                   AND direction='outgoing'
-                   AND content_type='text'
-                 ORDER BY created_at DESC
-                 LIMIT ?
-                """,
-                (str(conversation_name), max(1, min(int(limit), 100))),
-            ).fetchall()
-        return [str(row["content"]) for row in rows if row["content"]]
 
     def normalize_outgoing_history(self, normalizer) -> int:
         """Rewrite previously stored outgoing drafting wrappers in place."""

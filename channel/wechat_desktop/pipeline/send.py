@@ -83,13 +83,10 @@ class WechatDesktopSendMixin:
         queue_token = str(
             context.get("wechat_desktop_queue_token", "") if context else ""
         )
-        conversation_id = str(
-            getattr(event, "conversation_id", "") or target_id
-        )
         if (
             require_active
             and queue_token
-            and not self._reply_queue.is_relevant(queue_token, conversation_id)
+            and not self._reply_queue.is_active(queue_token)
         ):
             return False
 
@@ -356,8 +353,7 @@ class WechatDesktopSendMixin:
                     event = getattr(msg, "event", None)
                     if event is not None:
                         validation = self._driver.validate_reply_target(event)
-                        valid, reason = validation
-                        if not valid:
+                        if not validation.valid:
                             if validation.replacement_event is not None:
                                 self._accept_replacement_event(
                                     validation.replacement_event
@@ -367,14 +363,14 @@ class WechatDesktopSendMixin:
                                 "11-send-target-invalid",
                                 "target=%s reason=%s",
                                 target_name,
-                                reason,
+                                validation.reason,
                             )
                             self._store.audit(
                                 "send_text",
                                 target_name,
                                 "stale_target",
                                 self._content_hash(reply_text),
-                                detail=reason,
+                                detail=validation.reason,
                             )
                             return
                     self._mark_lifecycle(source_event_ids, "send_started")

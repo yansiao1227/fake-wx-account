@@ -24,7 +24,7 @@ def test_agent_timeout_invalidates_token_before_cancel_request(monkeypatch):
     cancelled = []
 
     def cancel(event_id):
-        assert not queue.is_relevant(item.token, event.conversation_id)
+        assert not queue.is_active(item.token)
         cancelled.append(event_id)
 
     monkeypatch.setattr(agent.protocol, "get_cancel_registry", lambda: SimpleNamespace(cancel_request=cancel))

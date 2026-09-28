@@ -46,7 +46,7 @@ from common.singleton import singleton
 
 
 # 通道工厂入口；纯函数直接从 prompts 模块导入。
-__all__ = ["WechatDesktopChannel", "DEFAULT_CONFIG"]
+__all__ = ["WechatDesktopChannel"]
 
 
 @singleton
@@ -99,7 +99,6 @@ class WechatDesktopChannel(
         # 在独立线程执行，不持有该锁。
         self._materialize_submit_lock = threading.RLock()
         self._materialize_queue: queue.Queue = queue.Queue(maxsize=self.config["materialize_queue_capacity"])
-        self._materialize_stop = object()
         self._materialization_active = threading.Event()
         self._queue_thread = None
         self._scan_thread = None
@@ -306,8 +305,7 @@ class WechatDesktopChannel(
             self._runtime_state = "stopping"
             self._stop_event.set()
             self._service.set_agent_executor(None)
-            queued_ids = self._reply_queue.clear_pending()
-            self._reply_queue.stop()
+            queued_ids = self._reply_queue.stop()
             self._best_effort("driver_close", self._driver.close)
             timeout = self.config["worker_join_timeout_seconds"]
             if self._daily_hot_scheduler is not None:

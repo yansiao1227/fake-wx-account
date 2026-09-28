@@ -128,7 +128,10 @@ class WechatDesktopReplyMixin:
         for event_id in item.source_event_ids:
             self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, terminal)
         self._best_effort("finish_lifecycle", self._finish_lifecycle, item.source_event_ids, terminal)
-        self._service.update_status(reply_in_flight=False, reply_conversation="", **self._reply_queue.status())
+        status = self._reply_queue.status()
+        if self._daily_hot_scheduler is not None:
+            status.update(self._daily_hot_scheduler.status())
+        self._service.update_status(reply_in_flight=False, reply_conversation="", **status)
 
     def _process_reply_item(self, item: ReplyQueueItem) -> str:
         self._store.set_event_state(item.source_event_ids, "running")
@@ -187,23 +190,14 @@ class WechatDesktopReplyMixin:
             )
         try:
             if deferred_failed:
-                dispatched = False
+                terminal = "failed"
             elif item.expired:
                 terminal = item.terminal or "skipped"
-                dispatched = False
             elif reference_required:
                 terminal = self._send_attachment_reference_prompt(item)
-                dispatched = False
             elif proactive_send:
                 terminal = self._send_precomposed_reply(item)
-                dispatched = False
-            else:
-                dispatched = self._dispatch_message(item.event, item.token)
-            if reference_required or proactive_send:
-                pass
-            elif deferred_failed:
-                terminal = "failed"
-            elif not dispatched:
+            elif not self._dispatch_message(item.event, item.token):
                 terminal = item.terminal or "skipped"
             else:
                 terminal = AgentReplyCoordinator(self).wait_for_reply(item)
@@ -240,16 +234,6 @@ class WechatDesktopReplyMixin:
                 terminal,
                 detail=f"event_id={item.event.event_id}",
             )
-            status_updates = {
-                "reply_in_flight": False,
-                "reply_conversation": "",
-                **self._reply_queue.status(),
-            }
-            scheduler = getattr(self, "_daily_hot_scheduler", None)
-            if scheduler is not None:
-                status_updates.update(scheduler.status())
-            self._service.update_status(**status_updates)
-
         return terminal
 
     def _image_agent_prompt(self, event: WechatDesktopEvent) -> str:

@@ -5,7 +5,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import dataclass, field, fields
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -239,8 +239,3 @@ class ReplyTargetValidation:
     valid: bool
     reason: str = ""
     replacement_event: Optional[WechatDesktopEvent] = None
-
-    def __iter__(self):
-        # 保留旧的 ``valid, reason = ...`` 解包方式，避免调用方迁移时破坏兼容性。
-        yield self.valid
-        yield self.reason

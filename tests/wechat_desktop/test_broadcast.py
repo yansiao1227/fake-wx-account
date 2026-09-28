@@ -153,11 +153,11 @@ def test_policy_daily_hot_target_is_independent_from_auto_reply(tmp_path):
         store,
     )
     assert policy.is_allowlisted("热点群", True) is False
-    assert policy.can_auto_send("热点群", True, "text") is False
+    assert policy.allows_send("热点群", True, "text") is False
     assert policy.is_daily_hot_target("热点群") is True
-    assert policy.can_broadcast_daily_hot("热点群") is True
+    assert policy.allows_send("热点群", True, "text", daily_hot=True) is True
     assert policy.is_daily_hot_target("自动回复群") is False
-    assert policy.can_broadcast_daily_hot("自动回复群") is False
+    assert policy.allows_send("自动回复群", True, "text", daily_hot=True) is False
 
 
 def test_send_precomposed_reply(tmp_path):

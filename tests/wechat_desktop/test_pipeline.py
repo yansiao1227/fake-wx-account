@@ -386,7 +386,6 @@ def test_materialization_worker_defers_referenced_attachment_until_fifo():
     channel = _bare_wechat_channel()
     channel._stop_event = threading.Event()
     channel._materialize_queue = queue.Queue()
-    channel._materialize_stop = object()
     enqueued = []
     channel._prepare_deferred_materialization = (
         WechatDesktopChannel.__closure__[0].cell_contents._prepare_deferred_materialization.__get__(
@@ -399,7 +398,11 @@ def test_materialization_worker_defers_referenced_attachment_until_fifo():
     channel._materialize_batch = lambda _events: (_ for _ in ()).throw(
         AssertionError("referenced attachment must wait for its FIFO turn")
     )
-    channel._enqueue_reply_event = lambda event: enqueued.append(event)
+    def enqueue_and_stop(event):
+        enqueued.append(event)
+        channel._stop_event.set()
+
+    channel._enqueue_reply_event = enqueue_and_stop
     event = WechatDesktopEvent(
         "message",
         "a",
@@ -411,7 +414,6 @@ def test_materialization_worker_defers_referenced_attachment_until_fifo():
         reference={"content_type": "image"},
     )
     channel._materialize_queue.put([event])
-    channel._materialize_queue.put(channel._materialize_stop)
 
     channel._consume_materialization_queue()
 

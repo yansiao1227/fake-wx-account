@@ -191,7 +191,7 @@ def test_restart_terminalizes_old_work_without_replay(store, stage, expected):
     store.receive_event(message)
     store.set_event_state([message.event_id], stage)
     if stage == "sending":
-        store.begin_delivery([message.event_id], "Alice", "hash")
+        store.claim_delivery([message.event_id], "Alice", "hash")
     reopened = WechatDesktopStore(store.path)
     try:
         reopened.recover_interrupted_events()
@@ -251,7 +251,7 @@ def test_timeout_with_possible_submission_is_not_reported_as_safe_failure(store,
     notices = []
     channel._send_agent_failure_notice = lambda **kwargs: notices.append(kwargs)
     if pending_send:
-        store.begin_delivery([message.event_id], "Alice", "hash")
+        store.claim_delivery([message.event_id], "Alice", "hash")
     outcome = channel._process_reply_item(item)
     channel._on_reply_worker_finish(item, outcome)
     assert outcome == expected

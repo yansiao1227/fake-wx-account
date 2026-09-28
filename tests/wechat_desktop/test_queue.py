@@ -1,6 +1,37 @@
 """微信桌面 queue 回归测试。"""
+import pytest
+
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.models import WechatDesktopEvent
+
+
+@pytest.mark.parametrize("is_group", [False, True], ids=["private", "group"])
+@pytest.mark.parametrize("already_running", [False, True], ids=["pending", "running"])
+def test_followups_preserve_fifo_and_active_token(is_group, already_running):
+    reply_queue = WechatReplyQueue()
+    events = [
+        WechatDesktopEvent(
+            "message", "chat", "会话", str(index), "成员", "text", content,
+            is_group=is_group, is_at=is_group,
+        )
+        for index, content in enumerate(("first", "second", "third"))
+    ]
+    assert reply_queue.enqueue(events[0]).action == "added"
+    active = reply_queue.get() if already_running else None
+    for event in events[1:]:
+        assert reply_queue.enqueue(event).action == "added"
+    if active is not None:
+        assert reply_queue.is_active(active.token)
+        assert not active.expired
+        assert not active.done.is_set()
+        assert active.terminal == ""
+    for index, event in enumerate(events):
+        item = active if index == 0 and active is not None else reply_queue.get()
+        assert item.event is event
+        reply_queue.finish(item, "completed")
+    assert reply_queue.status()["queue_depth"] == 0
+    assert reply_queue.status()["queue_completed"] == 3
+    assert reply_queue._queue.unfinished_tasks == 0
 
 
 def test_reply_queue_is_global_fifo_and_rejects_duplicates():
@@ -11,7 +42,9 @@ def test_reply_queue_is_global_fifo_and_rejects_duplicates():
     first = WechatDesktopEvent(
         "message", "a", "Alice", "a", "Alice", "text", "first", observed_at=1
     )
-    assert reply_queue.enqueue_many([second, first, first]) == 2
+    assert reply_queue.enqueue(first)
+    assert reply_queue.enqueue(second)
+    assert reply_queue.enqueue(first).action == "duplicate"
     first_item = reply_queue.get()
     assert first_item.event.content == "first"
     reply_queue.finish(first_item, "completed")
@@ -20,23 +53,6 @@ def test_reply_queue_is_global_fifo_and_rejects_duplicates():
     reply_queue.finish(second_item, "completed")
     assert reply_queue.status()["queue_completed"] == 2
     assert "queue_approval" not in reply_queue.status()
-
-
-def test_reply_queue_appends_pending_target_from_same_conversation():
-    reply_queue = WechatReplyQueue()
-    old = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "old"
-    )
-    new = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "new"
-    )
-
-    assert reply_queue.enqueue(old).action == "added"
-    assert reply_queue.enqueue(new).action == "added"
-    first = reply_queue.get()
-    assert first.event is old
-    reply_queue.finish(first, "completed")
-    assert reply_queue.get().event is new
 
 
 def test_reply_queue_captures_enqueue_time_context_independently():
@@ -68,80 +84,8 @@ def test_reply_queue_captures_enqueue_time_context_independently():
     ]
 
 
-def test_reply_queue_private_followup_does_not_expire_active():
+def test_reply_queue_keeps_global_fifo_when_new_followups_arrive():
     reply_queue = WechatReplyQueue()
-    old = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "old"
-    )
-    new = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "new"
-    )
-    reply_queue.enqueue(old)
-    active = reply_queue.get()
-
-    result = reply_queue.enqueue(new)
-
-    assert result.action == "added"
-    assert active.expired is False
-    assert active.terminal == ""
-    assert reply_queue.is_relevant(active.token, "a") is True
-    assert reply_queue.is_relevant(active.token, "b") is True
-    reply_queue.finish(active, "completed")
-    assert reply_queue.get().event.content == "new"
-    assert reply_queue.status()["queue_superseded"] == 0
-
-
-def test_reply_queue_preserves_multiple_private_followups():
-    reply_queue = WechatReplyQueue()
-    first = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "first"
-    )
-    second = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "second"
-    )
-    third = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "third"
-    )
-    reply_queue.enqueue(first)
-    active = reply_queue.get()
-
-    assert reply_queue.enqueue(second).action == "added"
-    assert reply_queue.enqueue(third).action == "added"
-    reply_queue.finish(active, "completed")
-    second_item = reply_queue.get()
-    assert second_item.event is second
-    reply_queue.finish(second_item, "completed")
-    assert reply_queue.get().event is third
-
-
-def test_reply_queue_appends_group_mentions_without_canceling_active():
-    reply_queue = WechatReplyQueue()
-    first = WechatDesktopEvent(
-        "message", "g", "项目群", "a", "成员A", "text", "@小牛 first", is_group=True
-    )
-    second = WechatDesktopEvent(
-        "message", "g", "项目群", "b", "成员B", "text", "@小牛 second", is_group=True
-    )
-    third = WechatDesktopEvent(
-        "message", "g", "项目群", "c", "成员C", "text", "@小牛 third", is_group=True
-    )
-    reply_queue.enqueue(first)
-    active = reply_queue.get()
-
-    assert reply_queue.enqueue(second).action == "added"
-    assert reply_queue.enqueue(third).action == "added"
-    assert active.expired is False
-    assert active.done.is_set() is False
-    reply_queue.finish(active, "completed")
-
-    next_item = reply_queue.get()
-    assert next_item.event.content == "@小牛 second"
-    reply_queue.finish(next_item, "completed")
-    assert reply_queue.get().event.content == "@小牛 third"
-
-
-def test_reply_queue_ignores_legacy_burst_limit_and_keeps_global_fifo():
-    reply_queue = WechatReplyQueue(conversation_burst_limit=2)
     first = WechatDesktopEvent(
         "message", "g", "项目群", "a", "成员A", "text", "@小牛 1", is_group=True
     )

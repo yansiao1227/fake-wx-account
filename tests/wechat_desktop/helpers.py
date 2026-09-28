@@ -92,7 +92,6 @@ class FakeClient:
         self.history_ensure_conversation = []
         self.focus_calls = 0
         self.owner_calls = 0
-        self.seeded_outgoing = {}
         self.file_paths = {}
         self.file_fetches = []
         self.image_paths = {}
@@ -151,9 +150,6 @@ class FakeClient:
     def fetch_message_image(self, message):
         self.image_fetches.append(message.content)
         return self.image_paths.get(message.content, "")
-
-    def seed_outgoing_texts(self, conversation, texts):
-        self.seeded_outgoing[conversation] = list(texts)
 
     def send_message(self, who, text, runtime_id="", row_index=-1):
         return {"success": True, "verified": True}
@@ -215,7 +211,9 @@ def outgoing(content, runtime_id):
 
 def _bare_wechat_channel():
     implementation = WechatDesktopChannel.__closure__[0].cell_contents
-    return object.__new__(implementation)
+    channel = object.__new__(implementation)
+    channel._daily_hot_scheduler = None
+    return channel
 
 
 class FakeTimer:

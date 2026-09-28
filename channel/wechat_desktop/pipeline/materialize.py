@@ -52,8 +52,7 @@ class WechatDesktopMaterializeMixin:
                     events = self._materialize_queue.get_nowait()
                 except queue.Empty:
                     break
-                if events is not self._materialize_stop:
-                    event_ids.extend(event.event_id for event in events)
+                event_ids.extend(event.event_id for event in events)
                 self._materialize_queue.task_done()
         return list(dict.fromkeys(event_ids))
 
@@ -215,9 +214,6 @@ class WechatDesktopMaterializeMixin:
                 events = self._materialize_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
-            if events is self._materialize_stop:
-                self._materialize_queue.task_done()
-                return
             event_ids = [event.event_id for event in events]
             materialization_active = getattr(
                 self, "_materialization_active", None

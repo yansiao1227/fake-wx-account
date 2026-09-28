@@ -241,21 +241,6 @@ class RapidOcrGroupSenderResolver:
             return ""
         return best.text.strip()
 
-    def _match_sender(
-        self,
-        message: UiaChatMessage,
-        lines: list[OcrTextLine],
-    ) -> str:
-        """Compatibility helper used by focused sender-matching tests."""
-
-        if (
-            not self._sender_is_unknown(message.sender_name)
-            or message.direction == "outgoing"
-        ):
-            return ""
-        body = self._match_body(message, lines)
-        return self._sender_above_body(body, lines) if body is not None else ""
-
     def assign_senders(
         self,
         messages: list[UiaChatMessage],

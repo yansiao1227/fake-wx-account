@@ -73,11 +73,12 @@ def test_policy_requires_allowlist_and_non_shadow(tmp_path):
         "max_send_per_hour": 10,
     }
     policy = WechatDesktopPolicy(config, store)
-    assert policy.can_auto_send("Alice", False, "text") is True
-    assert policy.can_auto_send("Mallory", False, "text") is False
-    assert policy.can_auto_send("Alice", False, "image") is False
-    assert policy.can_auto_send("Alice", False, "text") is True
-    assert policy.can_auto_send("Alice", False, "text") is False
+    assert policy.allows_send("Alice", False, "text") is True
+    assert policy.allows_send("Mallory", False, "text") is False
+    assert policy.allows_send("Alice", False, "image") is False
+    assert policy.reserve_send(units=2) is True
+    assert policy.reserve_send() is False
+    assert policy.allows_send("Alice", False, "text") is True
 
 
 def test_policy_can_allow_all_private_and_group_conversations(tmp_path):
@@ -96,8 +97,8 @@ def test_policy_can_allow_all_private_and_group_conversations(tmp_path):
     )
     assert policy.is_allowlisted("Any contact", False) is True
     assert policy.is_allowlisted("Any group", True) is True
-    assert policy.can_auto_send("Any contact", False, "text") is True
-    assert policy.can_auto_send("Any group", True, "text") is True
+    assert policy.allows_send("Any contact", False, "text") is True
+    assert policy.allows_send("Any group", True, "text") is True
 
 
 def test_policy_blacklist_overrides_allow_all(tmp_path):
@@ -113,8 +114,8 @@ def test_policy_blacklist_overrides_allow_all(tmp_path):
         store,
     )
     assert policy.is_blocked("腾讯新闻") is True
-    assert policy.can_auto_send("腾讯新闻", False, "text") is False
-    assert policy.can_auto_send("Alice", False, "text") is True
+    assert policy.allows_send("腾讯新闻", False, "text") is False
+    assert policy.allows_send("Alice", False, "text") is True
 
 
 def test_conversation_history_persists_and_deduplicates_recent_outgoing(tmp_path):
@@ -157,24 +158,6 @@ def test_conversation_history_persists_and_deduplicates_recent_outgoing(tmp_path
         "alice", exclude_source_event_id=event.event_id
     )
     assert [item["content"] for item in history_without_event] == ["hi", "see you"]
-
-
-def test_outgoing_text_anchors_are_scoped_to_conversation_name(tmp_path):
-    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
-    store.append_conversation_history(
-        "group-1", "同名群", "我", "outgoing", "text", "第一条回复", "group"
-    )
-    store.append_conversation_history(
-        "group-1", "同名群", "我", "outgoing", "text", "第二条回复", "group"
-    )
-    store.append_conversation_history(
-        "group-2", "另一个群", "我", "outgoing", "text", "不应返回", "group"
-    )
-
-    assert store.list_outgoing_texts_by_name("同名群") == [
-        "第二条回复",
-        "第一条回复",
-    ]
 
 
 @pytest.mark.parametrize(

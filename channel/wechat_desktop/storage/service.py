@@ -43,7 +43,6 @@ class WechatDesktopService:
             "queue_skipped": 0,
             "queue_failed": 0,
             "queue_timeout": 0,
-            "queue_superseded": 0,
             "auto_reply_contacts": [],
             "auto_reply_groups": [],
             "daily_hot_broadcast_groups": [],

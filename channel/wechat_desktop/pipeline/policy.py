@@ -67,10 +67,3 @@ class WechatDesktopPolicy:
             int(self.config.get("max_send_per_hour", DEFAULT_CONFIG["max_send_per_hour"])),
             units=units,
         )
-
-    def can_auto_send(self, target: str, is_group: bool, content_type: str) -> bool:
-        """兼容旧调用：检查策略并预留一条消息的额度。"""
-        return self.allows_send(target, is_group, content_type) and self.reserve_send()
-
-    def can_broadcast_daily_hot(self, target: str) -> bool:
-        return self.allows_send(target, True, "text", daily_hot=True) and self.reserve_send()

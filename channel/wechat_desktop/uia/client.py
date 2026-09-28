@@ -210,10 +210,6 @@ class WechatUiaClient:
         items.append(value)
         del items[:-20]
 
-    def seed_outgoing_texts(self, conversation: str, texts: Iterable[str]) -> None:
-        for text in texts:
-            self.remember_outgoing_text(conversation, text)
-
     def remember_outgoing_message(
         self, conversation: str, text: str = "", runtime_id: str = ""
     ) -> None:

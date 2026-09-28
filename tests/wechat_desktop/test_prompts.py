@@ -29,10 +29,9 @@ def test_driver_private_revalidation_keeps_started_target_relevant():
     client.histories["Alice"] = [incoming("old", "1"), incoming("new", "2")]
 
     validation = driver.validate_reply_target(events[0])
-    valid, reason = validation
 
-    assert valid is True
-    assert reason == ""
+    assert validation.valid is True
+    assert validation.reason == ""
     assert validation.replacement_event is None
 
 
@@ -536,10 +535,10 @@ def test_group_revalidation_uses_first_visible_at_message_without_direction():
 
     _, events = driver.observe_events()
     driver.acknowledge_events([event.event_id for event in events])
-    valid, reason = driver.validate_reply_target(events[0])
+    validation = driver.validate_reply_target(events[0])
 
-    assert valid is True
-    assert reason == ""
+    assert validation.valid is True
+    assert validation.reason == ""
 
 
 def test_group_revalidation_keeps_older_visible_at_target_valid():

@@ -350,13 +350,8 @@ class AgentReplyCoordinator:
             or context.get("receiver", "")
         )
         event = getattr(msg, "event", None)
-        conversation_id = str(
-            getattr(event, "conversation_id", "") or target_id
-        )
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
-        if queue_token and not channel._reply_queue.is_relevant(
-            queue_token, conversation_id
-        ):
+        if queue_token and not channel._reply_queue.is_active(queue_token):
             return False
         send_target = (target_id or target_name)
         is_group = bool(context.get("isgroup", False))

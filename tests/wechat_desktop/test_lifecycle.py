@@ -75,4 +75,3 @@ def test_lifecycle_summary_is_one_info_line_per_source_message():
     assert len(lifecycle_lines) == 1
     assert "event_id=" + event.event_id in lifecycle_lines[0]
     assert "attachment_resolve_count=1" in lifecycle_lines[0]
-    assert "superseded_by=-" in lifecycle_lines[0]

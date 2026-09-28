@@ -168,7 +168,6 @@ class WechatSendOperations:
     ):
         self._client = client
         self._selector_resolver = selector_resolver
-        self._reply_session = reply_session
         self._observation_reader = observation_reader
         # The client performs its own bounded UI work under this per-section
         # reply-priority lease. Acquiring it per send section (instead of
