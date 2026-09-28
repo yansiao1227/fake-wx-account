@@ -1,5 +1,6 @@
 """微信桌面 uia_sending 回归测试。"""
 import time
+import pytest
 from contextlib import contextmanager
 from types import SimpleNamespace
 from channel.wechat_desktop.models import HeaderInfo, UiaChatMessage
@@ -7,6 +8,25 @@ from channel.wechat_desktop.uia.client import WechatUiaClient
 from channel.wechat_desktop.uia.controls import _encode_cf_hdrop
 from channel.wechat_desktop.uia.driver import WechatUiaDriver
 from .helpers import FakeClient, FakeHook, GeometryControl, row
+
+
+@pytest.mark.parametrize("override, expected_seconds", [({}, 0.017), (
+    {"uia_key_event_settle_ms_min": 31, "uia_key_event_settle_ms_max": 31}, 0.031,
+)])
+def test_pacing_uses_channel_defaults_and_explicit_overrides(monkeypatch, override, expected_seconds):
+    from channel.wechat_desktop.config import DEFAULT_CONFIG
+
+    monkeypatch.setitem(DEFAULT_CONFIG, "uia_key_event_settle_ms_min", 13)
+    monkeypatch.setitem(DEFAULT_CONFIG, "uia_key_event_settle_ms_max", 17)
+    monkeypatch.setattr("channel.wechat_desktop.uia.client.random.randint", lambda low, high: high)
+    waits = []
+    monkeypatch.setattr(
+        "channel.wechat_desktop.uia.client.wait_send_delay",
+        lambda seconds, stop_event: waits.append((seconds, stop_event)),
+    )
+    client = WechatUiaClient(override)
+    client._paced_wait("uia_key_event_settle_ms_min", "uia_key_event_settle_ms_max")
+    assert waits == [(expected_seconds, client._stop_event)]
 
 
 def test_cf_hdrop_payload_is_wide_dropfiles_data():

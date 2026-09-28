@@ -1,6 +1,7 @@
 """Synchronous WeChat 4.1.9.30 client built on Windows UI Automation."""
 
 from __future__ import annotations
+from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.uia.reference_resolver import WechatReferenceResolver
 from channel.wechat_desktop.uia.image_viewer import WechatImageViewer
 from channel.wechat_desktop.uia.attachments import WechatAttachmentReader
@@ -167,13 +168,11 @@ class WechatUiaClient:
         self,
         minimum_key: str,
         maximum_key: str,
-        default_minimum: int,
-        default_maximum: int,
     ) -> None:
-        minimum = max(0, min(int(self.config.get(minimum_key, default_minimum)), 10000))
+        minimum = max(0, min(int(self.config.get(minimum_key, DEFAULT_CONFIG[minimum_key])), 10000))
         maximum = max(
             minimum,
-            min(int(self.config.get(maximum_key, default_maximum)), 10000),
+            min(int(self.config.get(maximum_key, DEFAULT_CONFIG[maximum_key])), 10000),
         )
         delay_ms = random.randint(minimum, maximum) if maximum > minimum else minimum
         wait_send_delay(delay_ms / 1000.0, self._stop_event)
@@ -404,8 +403,6 @@ class WechatUiaClient:
         self._paced_wait(
             "uia_focus_settle_ms_min",
             "uia_focus_settle_ms_max",
-            int(self.config.get("uia_focus_settle_ms", 350)),
-            700,
         )
         foreground = win32gui.GetForegroundWindow()
         try:
@@ -907,8 +904,6 @@ class WechatUiaClient:
                     self._paced_wait(
                         "uia_selection_settle_ms_min",
                         "uia_selection_settle_ms_max",
-                        int(self.config.get("uia_selection_settle_ms", 250)),
-                        500,
                     )
                     if identity_matches() and self._active_conversation_matches(root, target):
                         return True

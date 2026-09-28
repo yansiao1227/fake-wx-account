@@ -75,8 +75,6 @@ class WechatReferenceResolver:
         client._paced_wait(
             "uia_reference_return_settle_ms_min",
             "uia_reference_return_settle_ms_max",
-            300,
-            600,
         )
         return True
 
@@ -111,8 +109,6 @@ class WechatReferenceResolver:
                 client._paced_wait(
                     "uia_reference_menu_settle_ms_min",
                     "uia_reference_menu_settle_ms_max",
-                    250,
-                    450,
                 )
                 menu_item = client._find_desktop_control(
                     "定位到原文位置", "mmui::XMenuView"
@@ -129,8 +125,6 @@ class WechatReferenceResolver:
                 client._paced_wait(
                     "uia_reference_locate_settle_ms_min",
                     "uia_reference_locate_settle_ms_max",
-                    500,
-                    900,
                 )
                 message_list = next(
                     (
@@ -230,8 +224,6 @@ class WechatReferenceResolver:
                         client._paced_wait(
                             "uia_reference_return_settle_ms_min",
                             "uia_reference_return_settle_ms_max",
-                            300,
-                            600,
                         )
                         restored = True
                 except Exception as exc:

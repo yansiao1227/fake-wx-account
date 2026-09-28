@@ -67,6 +67,10 @@ channel/wechat_desktop/
    只回调 Channel 入队。千帆 Key 从 `~/.cow/.env` 读取；概括优先用全局
    `custom_api_*` 模型。
 
+UIA 随机等待统一调用 `_paced_wait(minimum_key, maximum_key)`；节拍默认值只定义在
+`config.DEFAULT_CONFIG`，调用点不再附带另一组默认数字。测试通过显式配置覆盖节拍和
+业务开关，避免白名单、广播开关等本机配置变化影响回归结果。
+
 `uia/operations.py` 存放可复用的微信动作。目前包含会话选择器解析、文本/图片发送和
 统一发送结果。新增微信动作时优先放在这里，通过小而明确的方法暴露给 Driver，
 不要把 UIA 定位细节带回 Channel。

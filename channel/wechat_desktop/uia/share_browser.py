@@ -295,8 +295,6 @@ class WechatShareBrowser:
             client._paced_wait(
                 "uia_share_browser_direct_read_settle_ms_min",
                 "uia_share_browser_direct_read_settle_ms_max",
-                300,
-                600,
             )
 
             def copy_page():
@@ -305,8 +303,6 @@ class WechatShareBrowser:
                 client._paced_wait(
                     "uia_share_browser_clipboard_settle_ms_min",
                     "uia_share_browser_clipboard_settle_ms_max",
-                    200,
-                    450,
                 )
 
             value = client._normalize_share_browser_content(
@@ -553,8 +549,6 @@ class WechatShareBrowser:
             client._paced_wait(
                 "uia_share_browser_open_settle_ms_min",
                 "uia_share_browser_open_settle_ms_max",
-                600,
-                1200,
             )
             browser_hwnd = client._find_opened_share_browser(
                 main_hwnd, visible_before
@@ -596,16 +590,12 @@ class WechatShareBrowser:
                 client._paced_wait(
                     "uia_share_browser_menu_settle_ms_min",
                     "uia_share_browser_menu_settle_ms_max",
-                    250,
-                    500,
                 )
                 if not client._click_copy_link_menu(browser_hwnd):
                     return
                 client._paced_wait(
                     "uia_share_browser_clipboard_settle_ms_min",
                     "uia_share_browser_clipboard_settle_ms_max",
-                    200,
-                    450,
                 )
 
             value = client._clipboard_unicode_after(copy_action)
@@ -630,5 +620,3 @@ class WechatShareBrowser:
                 client._recover_foreground_after_dependency_failure(
                     "share browser detection failure", main_hwnd
                 )
-
-

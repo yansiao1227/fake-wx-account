@@ -213,15 +213,13 @@ def test_image_viewer_waits_for_configured_stability_before_close(
     monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
     monkeypatch.setattr(client, "_left_click_point", lambda _point: None)
 
-    def paced_wait(minimum_key, maximum_key, default_minimum, default_maximum):
+    def paced_wait(minimum_key, maximum_key):
         if minimum_key == "uia_image_viewer_before_close_ms_min":
             calls.append(
                 (
                     "before_close_wait",
                     client.config[minimum_key],
                     client.config[maximum_key],
-                    default_minimum,
-                    default_maximum,
                 )
             )
 
@@ -241,7 +239,7 @@ def test_image_viewer_waits_for_configured_stability_before_close(
     monkeypatch.setattr(client, "_restore_main_window_after_viewer", lambda _hwnd: True)
 
     assert client._capture_image_viewer_from_point((100, 200), target) == str(target)
-    assert calls == [("before_close_wait", 420, 420, 300, 500), "close"]
+    assert calls == [("before_close_wait", 420, 420), "close"]
 
 
 def test_image_viewer_capture_is_not_successful_until_viewer_closes(

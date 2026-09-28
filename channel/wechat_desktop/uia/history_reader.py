@@ -171,8 +171,6 @@ class WechatHistoryReader:
                 client._paced_wait(
                     "wechat_history_scroll_settle_ms_min",
                     "wechat_history_scroll_settle_ms_max",
-                    250,
-                    500,
                 )
                 refreshed = client._find_history_window(main_hwnd, process_id)
                 if refreshed is None or int(refreshed[0]) != int(history_hwnd):
@@ -223,5 +221,3 @@ class WechatHistoryReader:
                     "[WechatDesktop][history] verified history window could not be closed: hwnd=%s",
                     history_hwnd,
                 )
-
-

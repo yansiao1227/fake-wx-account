@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from typing import Any, Mapping, Optional
 
@@ -19,7 +20,6 @@ from config import conf
 DEFAULT_CONFIG: dict[str, Any] = {
     # 后端与 UI 操作节奏。后端名称是迁移扩展点，当前实现为 Windows UIA。
     "desktop_backend": "uia",
-    "uia_focus_settle_ms": 350,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
     "uia_selection_settle_ms": 150,
@@ -33,6 +33,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "uia_paste_settle_ms_max": 300,
     "uia_pre_send_settle_ms_min": 100,
     "uia_pre_send_settle_ms_max": 250,
+    "uia_file_menu_settle_ms_min": 250,
+    "uia_file_menu_settle_ms_max": 450,
+    "uia_file_save_dialog_settle_ms_min": 400,
+    "uia_file_save_dialog_settle_ms_max": 700,
+    "uia_image_viewer_settle_ms_min": 500,
+    "uia_image_viewer_settle_ms_max": 900,
+    "uia_file_selection_settle_ms_min": 100,
+    "uia_file_selection_settle_ms_max": 200,
+    "uia_file_clipboard_settle_ms_min": 200,
+    "uia_file_clipboard_settle_ms_max": 400,
+    "uia_image_viewer_close_settle_ms_min": 200,
+    "uia_image_viewer_close_settle_ms_max": 400,
+    "uia_key_event_settle_ms_min": 20,
+    "uia_key_event_settle_ms_max": 40,
+    "uia_input_focus_settle_ms_min": 50,
+    "uia_input_focus_settle_ms_max": 100,
+    "uia_paste_retry_ms_min": 150,
+    "uia_paste_retry_ms_max": 300,
+    "uia_reference_return_settle_ms_min": 300,
+    "uia_reference_return_settle_ms_max": 600,
+    "uia_reference_menu_settle_ms_min": 250,
+    "uia_reference_menu_settle_ms_max": 450,
+    "uia_reference_locate_settle_ms_min": 500,
+    "uia_reference_locate_settle_ms_max": 900,
     # 全局两次发送间隔（毫秒，随机区间）
     "uia_send_interval_ms_min": 1000,
     "uia_send_interval_ms_max": 2000,
@@ -166,8 +190,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "uia_share_browser_menu_settle_ms_max": 500,
     "uia_share_browser_clipboard_settle_ms_min": 200,
     "uia_share_browser_clipboard_settle_ms_max": 450,
-    "uia_share_browser_close_settle_ms_min": 250,
-    "uia_share_browser_close_settle_ms_max": 500,
     "uia_share_browser_close_timeout_seconds": 2,
     # 回复期间微信 UI 重建/滚动后，同一消息可能短暂消失再出现；按其 UIA runtime
     # 身份抑制重复入队。新气泡会获得新的 runtime id，不影响用户重复追问。
@@ -225,6 +247,20 @@ def load_wechat_desktop_config(
     return validate_config(merged)
 
 
+def parse_hhmm(value: str) -> tuple[int, int]:
+    """Parse ``HH:MM`` into hour/minute. Raises ValueError on invalid input."""
+    text = str(value or "").strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"invalid daily hot time: {value!r}")
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"invalid daily hot time: {value!r}")
+    return hour, minute
+
+
+
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     """在启动前报告配置错误，业务层无需维护另一套默认值。"""
     for key, default in DEFAULT_CONFIG.items():
@@ -233,7 +269,6 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be a boolean")
         elif isinstance(default, (int, float)):
-            import math
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{key} must be a finite non-negative number")
             if isinstance(default, int) and not isinstance(value, int):
@@ -252,10 +287,5 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("uia_text_chunk_chars must be between 100 and 4000")
     if config["group_reply_mode"] not in {"all", "at_only", "prefix", "at_or_prefix"}:
         raise ValueError("invalid group_reply_mode")
-    try:
-        hour, minute = map(int, config["daily_hot_broadcast_time"].split(":"))
-        if not (0 <= hour < 24 and 0 <= minute < 60):
-            raise ValueError()
-    except (AttributeError, TypeError, ValueError):
-        raise ValueError("daily_hot_broadcast_time must be HH:MM") from None
+    parse_hhmm(config["daily_hot_broadcast_time"])
     return config

@@ -43,15 +43,11 @@ class WechatAttachmentReader:
             client._paced_wait(
                 "uia_file_selection_settle_ms_min",
                 "uia_file_selection_settle_ms_max",
-                100,
-                200,
             )
             client._press_shortcut(win32api, win32con, ord("C"))
             client._paced_wait(
                 "uia_file_clipboard_settle_ms_min",
                 "uia_file_clipboard_settle_ms_max",
-                200,
-                400,
             )
             win32clipboard.OpenClipboard()
             try:
@@ -261,8 +257,6 @@ class WechatAttachmentReader:
         client._paced_wait(
             "uia_file_menu_settle_ms_min",
             "uia_file_menu_settle_ms_max",
-            250,
-            450,
         )
         menu_item = client._find_desktop_control("另存为...", "mmui::XMenuView")
         if menu_item is None:
@@ -274,8 +268,6 @@ class WechatAttachmentReader:
         client._paced_wait(
             "uia_file_save_dialog_settle_ms_min",
             "uia_file_save_dialog_settle_ms_max",
-            400,
-            700,
         )
         dialog_hwnd = 0
         saved = False
@@ -481,8 +473,6 @@ class WechatAttachmentReader:
         client._paced_wait(
             "uia_image_viewer_settle_ms_min",
             "uia_image_viewer_settle_ms_max",
-            500,
-            900,
         )
         viewer_hwnd = client._find_opened_image_viewer(main_hwnd, visible_before)
         if not viewer_hwnd:
@@ -518,8 +508,6 @@ class WechatAttachmentReader:
             client._paced_wait(
                 "uia_image_viewer_before_close_ms_min",
                 "uia_image_viewer_before_close_ms_max",
-                300,
-                500,
             )
             viewer_closed = client._close_image_viewer(viewer_hwnd, main_hwnd)
             # Qt may keep the closed viewer HWND alive while asynchronously
@@ -529,8 +517,6 @@ class WechatAttachmentReader:
             client._paced_wait(
                 "uia_image_viewer_close_settle_ms_min",
                 "uia_image_viewer_close_settle_ms_max",
-                200,
-                400,
             )
             if not viewer_closed:
                 logger.warning(

@@ -116,13 +116,15 @@ class WechatMessageSender:
         win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
         try:
             client._paced_wait(
-                "uia_key_event_settle_ms_min", "uia_key_event_settle_ms_max", 20, 40,
+                "uia_key_event_settle_ms_min",
+                "uia_key_event_settle_ms_max",
             )
             check_send_allowed()
             win32api.keybd_event(key, 0, 0, 0)
             win32api.keybd_event(key, 0, win32con.KEYEVENTF_KEYUP, 0)
             client._paced_wait(
-                "uia_key_event_settle_ms_min", "uia_key_event_settle_ms_max", 20, 40,
+                "uia_key_event_settle_ms_min",
+                "uia_key_event_settle_ms_max",
             )
         finally:
             win32api.keybd_event(
@@ -166,8 +168,6 @@ class WechatMessageSender:
             client._paced_wait(
                 "uia_input_focus_settle_ms_min",
                 "uia_input_focus_settle_ms_max",
-                50,
-                100,
             )
             focus_state = client._wait_for_keyboard_focus(control)
             if focus_state is False:
@@ -179,8 +179,6 @@ class WechatMessageSender:
                 client._paced_wait(
                     "uia_input_focus_settle_ms_min",
                     "uia_input_focus_settle_ms_max",
-                    50,
-                    100,
                 )
             client._press_shortcut(win32api, win32con, ord("A"))
             client._press_shortcut(win32api, win32con, ord("V"))
@@ -242,8 +240,6 @@ class WechatMessageSender:
                         client._paced_wait(
                             "uia_paste_retry_ms_min",
                             "uia_paste_retry_ms_max",
-                            150,
-                            300,
                         )
                     continue
 
@@ -262,8 +258,6 @@ class WechatMessageSender:
                 client._paced_wait(
                     "uia_paste_settle_ms_min",
                     "uia_paste_settle_ms_max",
-                    150,
-                    300,
                 )
                 send_button = next(
                     (
@@ -278,8 +272,6 @@ class WechatMessageSender:
                     client._paced_wait(
                         "uia_pre_send_settle_ms_min",
                         "uia_pre_send_settle_ms_max",
-                        100,
-                        250,
                     )
                     client._click_send_button(send_button)
                 else:
@@ -524,5 +516,3 @@ class WechatMessageSender:
             "verified": False,
             "message": "UI action completed but the outgoing bubble was not verified",
         }
-
-
