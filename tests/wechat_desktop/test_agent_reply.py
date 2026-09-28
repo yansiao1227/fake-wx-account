@@ -3,6 +3,7 @@
 from channel.wechat_desktop.pipeline.agent_reply import AgentReplyCoordinator
 import threading
 import queue
+import pytest
 from types import SimpleNamespace
 from .helpers import PipelineStoreStub
 from bridge.reply import Reply, ReplyType
@@ -237,3 +238,70 @@ def test_agent_callback_notifies_first_visible_tool_and_skips_bash():
     assert [item["tool_name"] for item in sent] == ["web_search"]
     assert downstream == ["bash", "ls", "web_search", "vision"]
     assert lifecycle[0][1] == "first_tool"
+
+
+@pytest.mark.parametrize("has_event", [True, False])
+@pytest.mark.parametrize("send_fails", [False, True])
+def test_tool_notice_callback_sends_and_tracks_conversation(has_event, send_fails, caplog):
+    channel = _bare_wechat_channel()
+    event = WechatDesktopEvent(
+        "message", "uia-session:a", "Alice", "a", "Alice", "text", "hello"
+    )
+    channel.config = {
+        "shadow_mode": False,
+        "agent_tool_notice_enabled": True,
+        "agent_tool_notice_once_per_reply": True,
+        "agent_tool_notice_templates": ["正在调用 {tool_name}"],
+    }
+    channel._reply_queue = WechatReplyQueue()
+    channel._reply_queue.enqueue(event)
+    item = channel._reply_queue.get()
+    registered, forgotten, sent, history, audits, downstream = [], [], [], [], [], []
+
+    def send(target, text):
+        sent.append((target, text))
+        if send_fails:
+            raise RuntimeError("injected notice failure")
+        return {"success": True, "verified": True}
+
+    channel._driver = SimpleNamespace(
+        register_interim_text=lambda *args: registered.append(args),
+        forget_interim_text=lambda *args: forgotten.append(args),
+        send_interim_text=send,
+    )
+    channel._service = SimpleNamespace(status=lambda: {"paused": False})
+    channel._policy = SimpleNamespace(
+        is_blocked=lambda target: False,
+        is_allowlisted=lambda *args: True,
+        allows_send=lambda *args, **kwargs: True,
+        reserve_send=lambda units: True,
+    )
+    channel._store = PipelineStoreStub(
+        append_conversation_history=lambda **kwargs: history.append(kwargs),
+        audit=lambda *args, **kwargs: audits.append(args),
+    )
+    channel._mark_lifecycle = lambda *args, **kwargs: None
+    channel._trace = lambda *args, **kwargs: None
+    context = {
+        "msg": WechatDesktopMessage(event) if has_event else None,
+        "receiver": event.conversation_id,
+        "wechat_desktop_queue_token": item.token,
+        "wechat_desktop_source_event_ids": [event.event_id],
+        "on_event": downstream.append,
+    }
+    callback = AgentReplyCoordinator(channel).make_event_callback(context)
+    payload = {"type": "tool_execution_start", "data": {
+        "tool_name": "web_search", "tool_call_id": "search-1",
+    }}
+    callback(payload)
+    callback(payload)
+
+    expected = [(event.conversation_id, "正在调用 web_search")]
+    assert registered == sent == expected
+    assert forgotten == (expected if send_fails else [])
+    assert len(history) == len(audits) == (0 if send_fails else 1)
+    assert downstream == [payload, payload]
+    assert "name 'conversation_id' is not defined" not in caplog.text
+    if not send_fails:
+        assert "Agent tool notice failed" not in caplog.text
+    channel._reply_queue.finish(item, "completed")

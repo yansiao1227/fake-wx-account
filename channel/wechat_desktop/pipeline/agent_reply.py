@@ -350,6 +350,7 @@ class AgentReplyCoordinator:
             or context.get("receiver", "")
         )
         event = getattr(msg, "event", None)
+        conversation_id = str(getattr(event, "conversation_id", "") or target_id)
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
         if queue_token and not channel._reply_queue.is_active(queue_token):
             return False
