@@ -4,8 +4,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from channel.wechat_desktop.models import OwnerInfo, UiaChatMessage, WechatHistoryMessage, WechatHistoryReadResult
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
-from .helpers import FakeClient, FakeHook, GeometryControl, _history_row
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway
+from .helpers import FakeClient, GeometryControl, _history_row
 
 
 def test_history_row_parser_extracts_content_and_timestamp():
@@ -68,7 +68,7 @@ def test_history_scroll_uses_verified_list_wheel_down_when_no_scroll_pattern():
     ]
 
 
-def test_driver_reads_history_under_reply_priority_lease(monkeypatch):
+def test_explicit_attachment_history_read_uses_gateway_lease(monkeypatch):
     client = FakeClient()
     expected = WechatHistoryReadResult(
         conversation_title="颜料盒",
@@ -85,21 +85,22 @@ def test_driver_reads_history_under_reply_priority_lease(monkeypatch):
         returned_count=1,
     )
     client.read_current_chat_history = lambda limit: expected
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    gateway = WechatUiaGateway({}, client=client)
     states = []
 
     def read(limit):
-        states.append(driver._reply_ui_pending.is_set())
+        states.append(gateway.reply_pending.is_set())
         return expected
 
     client.read_current_chat_history = read
 
-    assert driver.read_current_chat_history(5) == expected
-    assert states == [True]
+    assert gateway.scan(client.read_current_chat_history, 5) == expected
+    assert states == [False]
 
 
 def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):
     client = WechatUiaClient({"uia_owner_failure_cache_seconds": 0})
+    monkeypatch.setattr(client, "_window", lambda: (100, 42))
     root = GeometryControl((0, 0, 1000, 800))
     popup_results = iter([("", ""), ("颜料盒bot", "wxid_bot")])
     popup_calls = []
@@ -127,6 +128,7 @@ def test_owner_discovery_retries_after_transient_empty_result(monkeypatch):
 
 def test_owner_discovery_failure_is_cached_until_retry_window(monkeypatch):
     client = WechatUiaClient({"uia_owner_failure_cache_seconds": 60})
+    monkeypatch.setattr(client, "_window", lambda: (100, 42))
     root = GeometryControl((0, 0, 1000, 800))
     now = [100.0]
     popup_calls = []
@@ -155,6 +157,7 @@ def test_owner_discovery_failure_is_cached_until_retry_window(monkeypatch):
 
 def test_configured_owner_is_still_verified_through_uia(monkeypatch):
     client = WechatUiaClient({"self_display_name": "颜料盒bot"})
+    monkeypatch.setattr(client, "_window", lambda: (100, 42))
     root = GeometryControl((0, 0, 1000, 800))
     popup_calls = []
 

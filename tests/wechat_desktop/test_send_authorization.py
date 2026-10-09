@@ -11,14 +11,14 @@ import pytest
 from channel.wechat_desktop.config import load_wechat_desktop_config
 from channel.wechat_desktop.contracts import ConversationTarget, SendStatus, TargetResolution, TargetStatus
 from channel.wechat_desktop.hybrid import WechatDatabaseBackend
-from channel.wechat_desktop.models import HeaderInfo
+from channel.wechat_desktop.models import HeaderInfo, OwnerInfo
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
 from channel.wechat_desktop.pipeline.send import WechatDesktopSendMixin
 from channel.wechat_desktop.storage.store import WechatDesktopStore
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from .helpers import FakeClient, FakeHook, row
+from .helpers import FakeClient, row
 from .test_db_backend import Gateway
 from .test_db_reader import make_reader
 
@@ -58,6 +58,7 @@ def test_database_stable_id_cannot_bypass_display_name_blacklist(tmp_path, store
 
     assert result["status"] == "blocked"
     assert gateway.client.sent == []
+    assert gateway.client.ui_calls == []
 
 
 def test_database_group_cannot_use_private_allow_all_by_omitting_kind(tmp_path, store):
@@ -70,6 +71,7 @@ def test_database_group_cannot_use_private_allow_all_by_omitting_kind(tmp_path, 
 
     assert result["status"] == "blocked"
     assert gateway.client.sent == []
+    assert gateway.client.ui_calls == []
 
 
 @pytest.mark.parametrize("group", [False, True])
@@ -85,7 +87,7 @@ def test_database_allowlist_uses_canonical_name_and_real_kind(tmp_path, store, g
     result = channel._execute_agent_action("send_text", conversation=conversation,
                                            text="合成消息", is_group=not group)
 
-    assert result["status"] == "sent"
+    assert result["status"] == "sent", result
     assert gateway.client.sent == [(cid, "合成消息", "row-1")]
     history = store.list_conversation_history(cid, limit=1)
     assert history[0]["conversation_name"] == "Synthetic"
@@ -111,6 +113,7 @@ def test_database_unverified_identity_never_submits(tmp_path, store, failure):
 
     assert result["status"] == "blocked"
     assert gateway.client.sent == []
+    assert gateway.client.ui_calls == []
 
 
 def test_database_rechecks_authorized_name_immediately_before_submission(tmp_path, store):
@@ -150,89 +153,61 @@ class SendingClient(FakeClient):
         return {"success": True, "verified": True}
 
 
-def uia_backend(*, kind="private"):
+def database_backend_with_real_gateway(tmp_path, store, *, group=False):
+    reader, talker = make_reader(tmp_path, group=group)
     client = SendingClient()
-    selector = row("Synthetic", runtime_id="synthetic-row")
-    client.rows = [selector]
-    client.headers["synthetic-row"] = HeaderInfo("Synthetic", kind)
-    backend = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-    backend._conversation_selectors = {"uia-session:synthetic-row": selector}
-    return backend, client
+    client.rows = [row("Synthetic", runtime_id="synthetic-row")]
+    client.headers["synthetic-row"] = HeaderInfo("Synthetic", "group" if group else "private")
+    client.get_owner_window_process_id = lambda: 42
+    client.get_owner_window_handle = lambda: 4242
+    client.get_owner_info_passive = lambda: OwnerInfo("Owner", "synthetic-owner")
+    gateway = WechatUiaGateway({}, client=client)
+    backend = WechatDatabaseBackend({}, db_reader=reader, store=store, uia_gateway=gateway)
+    return backend, reader, client, reader.conversation_id(talker)
 
 
 @pytest.mark.parametrize("kind", ["private", "group"])
-@pytest.mark.parametrize("identifier", ["Synthetic", "uia-session:synthetic-row"])
-def test_uia_send_authorization_supports_name_and_identity(store, kind, identifier):
-    backend, client = uia_backend(kind=kind)
+@pytest.mark.parametrize("identifier", ["Synthetic", "stable_id"])
+def test_database_authorized_identity_reaches_real_uia_gateway(tmp_path, store, kind, identifier):
     group = kind == "group"
+    backend, _, client, cid = database_backend_with_real_gateway(tmp_path, store, group=group)
+    conversation = "Synthetic" if identifier == "Synthetic" else cid
     channel = channel_for(backend, store, auto_reply_private_all=False, auto_reply_groups_all=False,
                           auto_reply_contacts=[] if group else ["Synthetic"],
                           auto_reply_groups=["Synthetic"] if group else [])
-
-    result = channel._execute_agent_action("send_text", conversation=identifier,
+    result = channel._execute_agent_action("send_text", conversation=conversation,
                                            text="合成消息", is_group=not group)
-
-    assert result["status"] == "sent"
+    assert result["status"] == "sent", result
     assert len(client.sent) == 1
     assert client.sent[0][0] == "Synthetic"
     assert client.sent[0][2]["runtime_id"] == "synthetic-row"
 
 
-def test_uia_group_cannot_impersonate_private_allow_all(store):
-    backend, client = uia_backend(kind="group")
-    channel = channel_for(backend, store, auto_reply_private_all=True,
-                          auto_reply_groups_all=False, auto_reply_groups=[])
-
-    result = channel._execute_agent_action("send_text", conversation="Synthetic",
-                                           text="合成消息", is_group=False)
-
-    assert result["status"] == "blocked"
-    assert client.sent == []
-
-
 @pytest.mark.parametrize("indicator", ["count_label", "title_suffix", "invalid_count_label", "private_title"])
-def test_real_uia_header_parser_enforces_group_policy(store, monkeypatch, indicator):
-    backend, client = uia_backend()
+def test_real_uia_header_parser_keeps_group_type_evidence(monkeypatch, indicator):
     controls = [SimpleNamespace(AutomationId="current_chat_name_label",
                                 Name="Synthetic(1)" if indicator == "title_suffix" else "Synthetic")]
     if indicator in {"count_label", "invalid_count_label"}:
         controls.append(SimpleNamespace(AutomationId="current_chat_count_label",
                                         Name="unavailable" if indicator == "invalid_count_label" else "1"))
-    # 使用真实 UIA 标题解析，只替换控件树；不操作真实微信。
-    monkeypatch.setattr(client, "operation_lock", threading.RLock(), raising=False)
-    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(controls), raising=False)
-    monkeypatch.setattr(client, "_walk", lambda root: iter(root), raising=False)
-    monkeypatch.setattr(client, "get_title", lambda: WechatUiaClient.get_title(client))
-    channel = channel_for(backend, store, auto_reply_private_all=True,
-                          auto_reply_groups_all=False, auto_reply_groups=[])
-
-    result = channel._execute_agent_action("send_text", conversation="Synthetic",
-                                           text="合成消息", is_group=False)
-
-    assert result["status"] == ("sent" if indicator == "private_title" else "blocked")
-    assert len(client.sent) == (1 if indicator == "private_title" else 0)
+    client = WechatUiaClient({})
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(controls))
+    monkeypatch.setattr(client, "_walk", lambda root: iter(root))
+    header = client.get_title()
+    expected = {"count_label": "group", "title_suffix": "unknown",
+                "invalid_count_label": "unknown", "private_title": "private"}[indicator]
+    assert header.header_type == expected
 
 
 @pytest.mark.parametrize("title", ["Synthetic(1)", "Synthetic（1）", "Synthetic(25)"])
-def test_user_controlled_numeric_title_suffix_cannot_prove_group(store, monkeypatch, title):
-    backend, client = uia_backend()
-    selector = row(title, runtime_id="synthetic-row")
-    client.rows = [selector]
-    backend._conversation_selectors = {"uia-session:synthetic-row": selector}
+def test_user_controlled_numeric_title_suffix_cannot_prove_group(monkeypatch, title):
     controls = [SimpleNamespace(AutomationId="current_chat_name_label", Name=title)]
-    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(controls), raising=False)
-    monkeypatch.setattr(client, "_walk", lambda root: iter(root), raising=False)
-    monkeypatch.setattr(client, "get_title", lambda: WechatUiaClient.get_title(client))
-    channel = channel_for(backend, store, auto_reply_private_all=False,
-                          auto_reply_groups_all=True)
-
+    client = WechatUiaClient({})
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(controls))
+    monkeypatch.setattr(client, "_walk", lambda root: iter(root))
     header = client.get_title()
-    result = channel._execute_agent_action("send_text", conversation=title, text="合成消息")
-
     assert header.header_type == "unknown"
     assert header.title == title
-    assert result["status"] == "blocked"
-    assert client.sent == []
 
 
 def test_one_member_group_requires_independent_count_control(monkeypatch):
@@ -245,44 +220,27 @@ def test_one_member_group_requires_independent_count_control(monkeypatch):
     assert client.get_title() == HeaderInfo("Synthetic", "group", 1)
 
 
-@pytest.mark.parametrize("failure", ["unknown_kind", "wrong_header", "stale", "ambiguous"])
-def test_uia_unverified_identity_or_type_never_submits(store, failure):
-    backend, client = uia_backend()
-    conversation = "Synthetic"
-    if failure == "unknown_kind":
-        client.headers["synthetic-row"] = HeaderInfo("Synthetic", "unknown")
-    elif failure == "wrong_header":
-        client.headers["synthetic-row"] = HeaderInfo("SomeoneElse", "private")
-    elif failure == "stale":
-        conversation = "uia-session:missing"
-    else:
-        backend._conversation_selectors["uia-session:duplicate"] = row("Synthetic", runtime_id="another-row")
-    channel = channel_for(backend, store, auto_reply_private_all=True)
-
-    result = channel._execute_agent_action("send_text", conversation=conversation, text="合成消息")
-
-    assert result["status"] == "blocked"
-    assert client.sent == []
-
-
-@pytest.mark.parametrize("change", ["type", "name", "identity"])
-def test_uia_rechecks_authorized_target_before_submission(store, change):
-    backend, client = uia_backend()
+@pytest.mark.parametrize("change", ["deleted", "name", "identity"])
+def test_database_rechecks_identity_inside_real_uia_submission(tmp_path, store, change):
+    backend, reader, client, cid = database_backend_with_real_gateway(tmp_path, store)
     channel = channel_for(backend, store, auto_reply_private_all=True,
                           auto_reply_groups_all=False, auto_reply_blacklist=["Blocked"])
-
     def change_before_submit():
-        if change == "type":
-            client.headers["synthetic-row"] = HeaderInfo("Synthetic", "group")
+        if change == "deleted":
+            cache = reader.caches["contact/contact.db"]
+            with sqlite3.connect(cache.path) as connection:
+                connection.execute("DELETE FROM contact WHERE username='synthetic-user'")
+            cache.changed = True
         elif change == "name":
-            backend._conversation_selectors["uia-session:synthetic-row"] = row("Blocked", runtime_id="synthetic-row")
-            client.headers["synthetic-row"] = HeaderInfo("Blocked", "private")
+            cache = reader.caches["contact/contact.db"]
+            with sqlite3.connect(cache.path) as connection:
+                connection.execute("UPDATE contact SET remark='Blocked' WHERE username='synthetic-user'")
+            cache.changed = True
+            client.rows = [row("Blocked", runtime_id="synthetic-row")]
         else:
-            backend._conversation_selectors.clear()
-
+            client.rows = [row("Synthetic", runtime_id="changed-row")]
     client.before_submit = change_before_submit
-    result = channel._execute_agent_action("send_text", conversation="Synthetic", text="合成消息")
-
+    result = channel._execute_agent_action("send_text", conversation=cid, text="合成消息")
     assert result["status"] == "failed"
     assert result["delivery"]["status"] == SendStatus.NOT_SENT
     assert client.sent == []

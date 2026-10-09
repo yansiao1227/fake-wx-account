@@ -1,11 +1,18 @@
 """微信桌面 prompts 回归测试。"""
-import threading
-import time
-from channel.wechat_desktop.models import HeaderInfo, UiaChatMessage, WechatDesktopEvent
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
+from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.config import DEFAULT_CONFIG
-from channel.wechat_desktop.pipeline.prompts import _format_agent_notice, _format_failure_notice, _is_network_reply_error, _is_user_visible_tool_notice, _preflight_tool_notice_data, _tool_notice_subject
-from .helpers import FakeClient, FakeHook, incoming, outgoing, row
+from channel.wechat_desktop.pipeline.prompts import (
+    _format_agent_notice,
+    _format_failure_notice,
+    _is_network_reply_error,
+    _is_user_visible_tool_notice,
+    _link_reading_instruction,
+    _link_reading_urls,
+    _preflight_tool_notice_data,
+    _render_event_context_lines,
+    _tool_notice_subject,
+)
+import pytest
 
 
 def test_network_reply_error_detection():
@@ -14,109 +21,6 @@ def test_network_reply_error_detection():
     )
     assert _is_network_reply_error("request timed out")
     assert not _is_network_reply_error("invalid tool arguments")
-
-
-def test_driver_private_revalidation_keeps_started_target_relevant():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [incoming("old", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    client.histories["Alice"] = [incoming("old", "1"), incoming("new", "2")]
-
-    validation = driver.validate_reply_target(events[0])
-
-    assert validation.valid is True
-    assert validation.reason == ""
-    assert validation.replacement_event is None
-
-
-def test_reply_cycle_monitors_private_conversation_without_unread_marker():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [incoming("old", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    discovery_focus_calls = client.focus_calls
-    driver.begin_reply_cycle("Alice", first_events[0].conversation_id)
-    client.rows = [row("Alice", unread=0, signature="unchanged")]
-    client.histories["Alice"] = [incoming("old", "1"), incoming("new", "2")]
-
-    _, monitored_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in monitored_events])
-
-    assert [event.content for event in monitored_events] == ["new"]
-    assert client.focus_calls == discovery_focus_calls
-    assert client.history_ensure_conversation[-1] is False
-
-
-def test_discovery_focus_failure_backs_off_without_failing_observation():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-
-    def deny_foreground():
-        client.focus_calls += 1
-        raise OSError(5, "SetForegroundWindow", "拒绝访问。")
-
-    client.focus_window = deny_foreground
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-
-    first_observation, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    second_observation, second_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in second_events])
-
-    assert first_observation["error"] == ""
-    assert second_observation["error"] == ""
-    assert first_events == []
-    assert second_events == []
-    assert client.focus_calls == 1
-    assert client.history_calls == []
-
-
-def test_reply_cycle_ignores_interim_tool_notice_but_still_finds_followup():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [incoming("old", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    original = first_events[0]
-    driver.begin_reply_cycle("Alice", original.conversation_id)
-    notice = "我准备调用 `web_search` tool 查一查，稍等一下 🔧"
-    driver.register_interim_text(original.conversation_id, notice)
-    client.rows = [row("Alice", unread=0, signature="unchanged")]
-    client.histories["Alice"] = [
-        incoming("old", "1"),
-        outgoing(notice, "2"),
-    ]
-
-    _, notice_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in notice_events])
-
-    assert notice_events == []
-    assert driver.validate_reply_target(original).valid is True
-
-    client.histories["Alice"].append(incoming("new", "3"))
-    _, followup_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in followup_events])
-
-    assert [event.content for event in followup_events] == ["new"]
-    assert notice not in [
-        item["content"] for item in followup_events[0].history
-    ]
 
 
 def test_tool_notice_subject_recognizes_skill_reads_and_regular_tools():
@@ -193,12 +97,8 @@ def test_user_visible_tool_notice_skips_internal_tools_but_keeps_skills():
             },
         }
     ) is True
-    assert _is_user_visible_tool_notice(
-        {"tool_name": "微信内置浏览器", "notice_template_key": "share_browser_notice_templates"}
-    ) is False
-    assert _is_user_visible_tool_notice(
-        {"tool_name": "web_fetch", "notice_template_key": "share_content_fetch_notice_templates"}
-    ) is True
+    assert _is_user_visible_tool_notice({"tool_name": "browser"}) is True
+    assert _is_user_visible_tool_notice({"tool_name": "web_fetch"}) is True
     assert _is_user_visible_tool_notice(
         {"tool_name": "web_search"}, silent_tools=["web_search"]
     ) is False
@@ -282,299 +182,178 @@ def test_preflight_notice_predicts_attachment_tools_before_llm_turn():
     assert _preflight_tool_notice_data(text_event) is None
 
 
-def test_reply_cycle_monitors_group_without_session_mention_marker():
-    client = FakeClient()
-    client.rows = [row("项目群", unread=1, mention=True)]
-    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
-    client.histories["项目群"] = [incoming("@小牛 old", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    driver.begin_reply_cycle("项目群", first_events[0].conversation_id)
-    client.rows = [row("项目群", unread=0, mention=False, signature="unchanged")]
-    client.histories["项目群"] = [
-        incoming("@小牛 old", "1"),
-        incoming("@小牛 new", "2"),
-    ]
-
-    _, monitored_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in monitored_events])
-
-    assert [event.content for event in monitored_events] == ["@小牛 new"]
-
-
-def test_reply_cycle_changes_wait_deadline_to_monitor_interval():
-    class IdleHook(FakeHook):
-        def wait(self, timeout):
-            return False
-
-    driver = WechatUiaDriver(
-        {
-            "shell_hook_reconcile_seconds": 15,
-            "reply_monitor_interval_seconds": 0.25,
-        },
-        client=FakeClient(),
-        shell_hook=IdleHook(),
-    )
-    driver.begin_reply_cycle("Alice", "uia-session:alice")
-
-    started = time.monotonic()
-    reason = driver.wait_for_changes(threading.Event())
-
-    assert reason == "reply-monitor"
-    assert time.monotonic() - started < 1.0
-
-
-def test_global_reconcile_scan_is_disabled_by_default(monkeypatch):
-    stop_event = threading.Event()
-
-    class StopHook(FakeHook):
-        def wait(self, timeout):
-            stop_event.set()
-            return False
-
-    driver = WechatUiaDriver(
-        {"shell_hook_reconcile_seconds": 1},
-        client=FakeClient(),
-        shell_hook=StopHook(),
-    )
-    monkeypatch.setattr(
-        "channel.wechat_desktop.uia.driver.time.monotonic", lambda: 1000.0
-    )
-
-    assert driver.wait_for_changes(stop_event) == "stopped"
-
-
-def test_global_reconcile_scan_can_be_enabled(monkeypatch):
-    class IdleHook(FakeHook):
-        def wait(self, timeout):
-            return False
-
-    ticks = iter([0.0, 2.0, 2.0])
-    monkeypatch.setattr(
-        "channel.wechat_desktop.uia.driver.time.monotonic", lambda: next(ticks)
-    )
-    driver = WechatUiaDriver(
-        {
-            "shell_hook_reconcile_enabled": True,
-            "shell_hook_reconcile_seconds": 1,
-        },
-        client=FakeClient(),
-        shell_hook=IdleHook(),
-    )
-
-    assert driver.wait_for_changes(threading.Event()) == "reconcile"
-
-
-def test_reply_target_key_ignores_bounds_changes():
-    first = UiaChatMessage(
-        "Alice", "same", bounds=(10, 20, 100, 60), runtime_id="1"
-    )
-    moved = UiaChatMessage(
-        "Alice", "same", bounds=(30, 40, 120, 80), runtime_id="1"
-    )
-
-    assert WechatUiaDriver._target_key(first, 3) == WechatUiaDriver._target_key(
-        moved, 3
+def _link_event(content="看看这个", **kwargs):
+    return WechatDesktopEvent(
+        "message", "synthetic-session", "Alice", "alice", "Alice", "text", content,
+        **kwargs,
     )
 
 
-def test_reply_target_key_ignores_visible_index_changes():
-    message = UiaChatMessage("Alice", "same", runtime_id="42.1")
-
-    assert WechatUiaDriver._target_key(message, 4) == WechatUiaDriver._target_key(
-        message, 0
+def test_link_targets_include_current_text_and_direct_quote_preserving_query():
+    first = "https://example.invalid/post?a=1&xsec_token=synthetic%2Fvalue%3D&mode=share"
+    second = "https://example.invalid/file.pdf?signature=synthetic+value=="
+    event = _link_event(
+        f"看看{first}。另一个是 [{second}]({second})",
+        reference={"content_type": "text", "content": f"引用链接：{first}"},
+        history=[{"content": "https://example.invalid/unrelated-history"}],
     )
 
+    assert _link_reading_urls(event) == [first, second]
+    instruction = _link_reading_instruction(event)
+    assert first in instruction and second in instruction
+    assert "unrelated-history" not in instruction
 
-def test_reply_target_key_distinguishes_identical_messages_by_stable_id():
-    first = UiaChatMessage("Alice", "same", runtime_id="42.1", stable_id="first")
-    second = UiaChatMessage("Alice", "same", runtime_id="42.2", stable_id="second")
 
-    assert WechatUiaDriver._target_key(first, 4) != WechatUiaDriver._target_key(
-        second, 4
+@pytest.mark.parametrize("reference", [
+    {"content_type": "text", "content": "链接：https://example.invalid/post"},
+    {"content_type": "text", "text": "https://example.invalid/post"},
+    {"content_type": "share_card", "content": "合成卡片", "url": "https://example.invalid/post"},
+    {"content_type": "share_card", "content": "[第三方分享卡片] 合成卡片\n链接：https://example.invalid/post"},
+])
+def test_direct_reference_links_use_common_reader(reference):
+    event = _link_event(reference=reference)
+
+    assert _link_reading_urls(event) == ["https://example.invalid/post"]
+    instruction = _link_reading_instruction(event)
+    assert "<available_skills> 中查找 analyze-url" in instruction
+    assert "<location> 绝对路径" in instruction
+    assert "skills/analyze-url/SKILL.md" not in instruction
+    assert "navigate" in instruction and "snapshot" in instruction and "get_text" in instruction
+
+
+def test_link_skill_catalog_path_is_readable_outside_agent_workspace(tmp_path):
+    from xml.etree import ElementTree
+
+    from agent.skills.formatter import format_skills_for_prompt
+    from agent.skills.loader import SkillLoader
+    from agent.tools.read.read import Read
+
+    workspace = tmp_path / "agent workspace"
+    workspace.mkdir()
+    skill_dir = tmp_path / "project skills" / "analyze-url"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: analyze-url\ndescription: Synthetic URL reader\n---\n"
+        "Synthetic reader instructions outside the workspace.\n", encoding="utf-8")
+    skills = SkillLoader().load_skills_from_dir(str(skill_dir.parent), source="custom").skills
+    catalog = ElementTree.fromstring(format_skills_for_prompt(skills).strip())
+    location = catalog.find("skill/location").text
+    reader = Read({"cwd": str(workspace)})
+
+    # Reproduce the reported error even though the skill is installed.
+    assert reader.execute({"path": "skills/analyze-url/SKILL.md"}).status == "error"
+    result = reader.execute({"path": location})
+    assert result.status == "success"
+    assert "Synthetic reader instructions outside the workspace." in result.result["content"]
+    assert location == str(skill_file)
+    instruction = _link_reading_instruction(_link_event("读取 https://example.invalid/post"))
+    assert "<available_skills> 中查找 analyze-url" in instruction
+    assert "<location> 绝对路径" in instruction
+    assert "skills/analyze-url/SKILL.md" not in instruction
+
+
+@pytest.mark.parametrize("content,expected", [
+    ("[文章](https://example.invalid/post?a=1&a=2&token=synthetic%2Bbase64==)",
+     "https://example.invalid/post?a=1&a=2&token=synthetic%2Bbase64=="),
+    ("（https://example.invalid/post?token=synthetic=）。",
+     "https://example.invalid/post?token=synthetic="),
+    ("看看 https://example.invalid/article_(part)?key=synthetic==。",
+     "https://example.invalid/article_(part)?key=synthetic=="),
+])
+def test_link_query_is_kept_while_prose_and_markdown_wrappers_are_removed(content, expected):
+    assert _link_reading_urls(_link_event(content)) == [expected]
+
+
+@pytest.mark.parametrize("body", [
+    {"browser_content": "合成页面正文", "fetch_status": "direct_browser"},
+    {"fetched_content": "合成页面正文", "fetch_status": "success"},
+])
+def test_read_reference_body_excludes_same_url_but_keeps_other_current_link(body):
+    quote_url = "https://example.invalid/read?token=synthetic"
+    other_url = "https://example.invalid/new"
+    event = _link_event(
+        f"结合 {quote_url} 和 {other_url} 看看",
+        reference={"content_type": "share_card", "url": quote_url, **body},
     )
 
-
-def test_message_snapshot_keeps_identity_when_runtime_id_changes():
-    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
-    first = driver._stabilize_messages(
-        "conversation", [incoming("same", "runtime-a")]
-    )
-    recreated = driver._stabilize_messages(
-        "conversation", [incoming("same", "runtime-b")]
-    )
-
-    assert recreated[0].stable_id == first[0].stable_id
+    assert _link_reading_urls(event) == [other_url]
+    _heading, lines = _render_event_context_lines(event)
+    assert "合成页面正文" in "\n".join(lines)
 
 
-def test_message_snapshot_distinguishes_new_identical_message():
-    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
-    first = driver._stabilize_messages(
-        "conversation", [incoming("same", "runtime-a")]
-    )
-    next_snapshot = driver._stabilize_messages(
-        "conversation",
-        [incoming("same", "runtime-a"), incoming("same", "runtime-b")],
-    )
+@pytest.mark.parametrize("fetch_status", ["error", "pending_tool", "link_available"])
+def test_failed_or_pending_share_body_still_requires_tools(fetch_status):
+    event = _link_event(reference={
+        "content_type": "share_card", "content": "合成卡片",
+        "url": "https://example.invalid/post", "fetch_status": fetch_status,
+        "fetched_content": "synthetic request error; not page body",
+    })
 
-    assert next_snapshot[0].stable_id == first[0].stable_id
-    assert next_snapshot[1].stable_id != first[0].stable_id
-
-
-def test_recent_runtime_identity_prevents_reemit_after_target_temporarily_disappears():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1, signature="first")]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [
-        incoming("一条临时可见的旧消息", "old-runtime"),
-        incoming("讲了啥", "question-runtime"),
-    ]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-
-    _, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    driver.begin_reply_cycle("Alice", first_events[0].conversation_id)
-    client.histories["Alice"] = [incoming("一条临时可见的旧消息", "old-runtime")]
-    _, transient_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in transient_events])
-    client.histories["Alice"] = [incoming("讲了啥", "question-runtime")]
-    _, reappeared_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in reappeared_events])
-
-    assert transient_events == []
-    assert reappeared_events == []
+    assert _link_reading_urls(event) == ["https://example.invalid/post"]
+    _heading, lines = _render_event_context_lines(event)
+    rendered = "\n".join(lines)
+    assert "synthetic request error" not in rendered
+    assert "页面正文尚未读取" in rendered
+    instruction = _link_reading_instruction(event)
+    assert "技能不可用时，直接使用现有 browser 或 web_fetch" in instruction
 
 
-def test_same_text_with_new_runtime_identity_is_a_new_message():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1, signature="first")]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [incoming("讲了啥", "first-runtime")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
+def test_source_invalid_reference_does_not_schedule_any_links():
+    event = _link_event("https://example.invalid/current", reference={
+        "content_type": "share_card", "url": "https://example.invalid/quote",
+        "fetch_status": "source_invalid", "browser_content": "旧的正文",
+    })
 
-    _, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    driver.begin_reply_cycle("Alice", first_events[0].conversation_id)
-    client.histories["Alice"] = [
-        incoming("讲了啥", "first-runtime"),
-        incoming("讲了啥", "second-runtime"),
-    ]
-    _, second_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in second_events])
-
-    assert [event.content for event in second_events] == ["讲了啥"]
+    assert _link_reading_instruction(event) == ""
+    _heading, lines = _render_event_context_lines(event)
+    assert "来源校验失败" in "\n".join(lines)
+    assert "旧的正文" not in "\n".join(lines)
 
 
-def test_group_reply_monitor_does_not_reemit_target_when_visible_index_shifts():
-    client = FakeClient()
-    client.rows = [row("项目群", unread=1, mention=True)]
-    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
-    client.histories["项目群"] = [
-        incoming("普通消息 1", "1"),
-        incoming("普通消息 2", "2"),
-        incoming("@小牛 你还存活吗", "target"),
-    ]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, first_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in first_events])
-    driver.begin_reply_cycle("项目群", first_events[0].conversation_id)
-    client.rows = [row("项目群", unread=0, mention=False, signature="shifted")]
-    client.histories["项目群"] = [
-        incoming("普通消息 2", "2"),
-        incoming("@小牛 你还存活吗", "target"),
-    ]
+@pytest.mark.parametrize("content,reference", [
+    ("普通提问", {"content_type": "text", "content": "普通引用"}),
+    ("普通提问", {"content_type": "share_card", "content": "标题 https://example.invalid/title"}),
+    (r"C:\uia\https://example.invalid/local", None),
+    ('<msg><appmsg><url>https://example.invalid/raw</url></appmsg></msg>', None),
+    ("普通提问", {"content_type": "text", "content": '<msg><url>https://example.invalid/raw</url></msg>'}),
+])
+def test_non_links_xml_and_card_titles_do_not_schedule_browser(content, reference):
+    event = _link_event(content, reference=reference, history=[
+        {"content": "https://example.invalid/history"},
+    ])
 
-    _, shifted_events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in shifted_events])
-
-    assert shifted_events == []
+    assert _link_reading_instruction(event) == ""
 
 
-def test_revalidation_accepts_same_target_after_layout_moves():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [
-        UiaChatMessage("Alice", "same", bounds=(10, 20, 100, 60))
-    ]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    client.histories["Alice"] = [
-        UiaChatMessage("Alice", "same", bounds=(30, 40, 120, 80))
-    ]
+def test_local_attachment_path_is_not_a_text_link_target():
+    event = _link_event("https://example.invalid/not-user-text")
+    event.content_type = "file"
 
-    validation = driver.validate_reply_target(events[0])
-
-    assert validation.valid is True
-    assert validation.replacement_event is None
+    assert _link_reading_urls(event) == []
 
 
-def test_group_revalidation_uses_first_visible_at_message_without_direction():
-    client = FakeClient()
-    client.rows = [row("项目群", unread=1, mention=True, preview_prefix=True)]
-    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
-    unknown_message = UiaChatMessage(
-        "", "@小牛 请确认", direction="unknown", runtime_id="1"
-    )
-    client.histories["项目群"] = [unknown_message]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
+def test_existing_page_result_still_requires_article_content_check():
+    event = _link_event(reference={
+        "content_type": "share_card", "url": "https://example.invalid/post",
+        "browser_content": "synthetic page text", "browser_status": "success",
+    })
 
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    validation = driver.validate_reply_target(events[0])
-
-    assert validation.valid is True
-    assert validation.reason == ""
+    assert _link_reading_urls(event) == []
+    instruction = _link_reading_instruction(event)
+    assert "[网页正文核验]" in instruction
+    assert "登录、验证码、访问错误" in instruction
+    assert "继续读取一次" in instruction
+    assert "实际正文可以直接复用" in instruction
 
 
-def test_group_revalidation_keeps_older_visible_at_target_valid():
-    client = FakeClient()
-    client.rows = [row("项目群", unread=1, mention=True, preview_prefix=True)]
-    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
-    client.histories["项目群"] = [incoming("@小牛 first", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    client.histories["项目群"] = [
-        incoming("@小牛 first", "1"),
-        incoming("@小牛 second", "2"),
-    ]
+def test_explicit_failed_browser_body_is_not_reused_and_url_is_scheduled():
+    event = _link_event(reference={
+        "content_type": "share_card", "url": "https://example.invalid/post",
+        "browser_content": "synthetic error text", "browser_status": "error",
+        "fetch_status": "link_available",
+    })
 
-    validation = driver.validate_reply_target(events[0])
-
-    assert validation.valid is True
-    assert validation.replacement_event is None
-
-
-def test_sending_does_not_clear_a_collected_group_target():
-    client = FakeClient()
-    client.rows = [row("项目群", unread=1, mention=True)]
-    client.headers["项目群"] = HeaderInfo("项目群", "group", 8)
-    client.histories["项目群"] = [incoming("@小牛 first", "1")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    conversation_id = events[0].conversation_id
-    emitted_target = driver._emitted_targets[conversation_id]
-
-    driver.send_text(conversation_id, "reply")
-
-    assert driver._emitted_targets[conversation_id] == emitted_target
+    assert _link_reading_urls(event) == ["https://example.invalid/post"]
+    assert "synthetic error text" not in "\n".join(_render_event_context_lines(event)[1])
+    assert "[链接读取要求]" in _link_reading_instruction(event)

@@ -1,7 +1,8 @@
 # 微信桌面通道结构
 
 本目录把业务编排与微信客户端操作分层，后续替换微信版本或自动化方案时，
-应尽量保持上层不变。
+应尽量保持上层不变。当前唯一后端为 `db_uia`：数据库产生入站事件，UIA 只负责动作、
+发送验证和必要附件的物化，不提供聊天接收后备。
 
 ## 目录
 
@@ -12,6 +13,7 @@ channel/wechat_desktop/
   contracts.py              发送结果、接收回执、公开目标解析契约
   backend.py                稳定后端接口与工厂
   conversation.py           会话标题匹配纯函数
+  references.py             引用能力判断与 UIA 按需边界
   hybrid.py                 数据库接收与 UIA 操作的组合后端
   binding.py                数据库账号/会话与 UIA 目标绑定
   send_control.py           发送调用作用域、取消与提交边界
@@ -29,10 +31,9 @@ channel/wechat_desktop/
     policy.py               白名单、@、影子模式
     delivery.py             发送门禁、持久化占位与结果归一化
     worker.py               单消费者执行和终态收尾
-  uia/                      微信界面操作与可选 UIA 接收
-    backend.py              旧导入路径的兼容转导出
-    driver.py               UIA 观察结果 → 统一事件；组合发送网关
+  uia/                      微信界面动作、发送验证和诊断
     gateway.py              公共 UI 操作、优先级租约、会话定位和发送
+    materializer.py         已验证消息的文件、一层媒体引用与分享正文物化
     client.py               会话身份、基础窗口/控件操作和组件门面
     attachments.py          文件缓存、另存为、附件图片截取
     image_viewer.py         查看器归属验证、安全关闭与主窗口恢复
@@ -42,10 +43,8 @@ channel/wechat_desktop/
     message_sender.py       剪贴板、粘贴提交、分段及发送验证
     controls.py             控件常量与基础转换函数
     operations.py           可复用动作：选会话、发文本/图
-    shell_hook.py           任务栏闪烁唤醒
-    group_sender_ocr.py     群聊发送者 OCR
+    group_sender_ocr.py      显式 UI 诊断和复制链接菜单的按需 OCR
   db/                       纯数据库接收与查询
-    backend.py              旧导入路径的兼容转导出
     source.py               账号生命周期、启动基线、分页与 ACK
     reader.py               数据库结构识别、正文解析和独立来源流分页
     cache.py / crypto.py    认证解密副本与已提交 WAL 增量刷新
@@ -62,17 +61,17 @@ channel/wechat_desktop/
    `config.json` / `config.py` 只放通用项，不要写 `wechat_desktop` 段；密钥不放这里。
 2. `pipeline/`：通道编排层。负责事件聚合、回复队列、Agent 调用、策略检查和
    生命周期记录，不应直接访问 UIA 控件。不维护默认配置字典。
-3. 根 `backend.py`：稳定后端接口和创建工厂。新增实现时实现
-   `WechatDesktopBackend`，并在 `create_wechat_desktop_backend()` 注册。
+3. 根 `backend.py`：稳定后端接口和创建工厂，只接受 `desktop_backend="db_uia"`。
+   其他后端配置明确报错，不退回界面接收。
 4. `db/source.py` 与 `db/reader.py`：纯数据库来源。Source 管理账号进程生命周期、
    固定启动基线、独立来源分页和接收回执；Reader 管理数据库结构、认证缓存和字段解析。
    两者不导入 UIA，不负责窗口可用性、会话定位或发送。
 5. `hybrid.py` 与 `binding.py`：通道组合层。组合数据库来源与延迟创建的 UIA 网关，
    Binder 通过网关公开接口核验账号、唯一会话、窗口身份与绑定失效。数据库查询不访问
-   UIA 驱动的锁、选择器或接收状态。
-6. `uia/driver.py` 与 `uia/gateway.py`：默认 UIA 后端把观察结果转换为统一事件，
-   发送交给网关；网关持有共享 UI 优先级租约、绑定选择器和发送操作，不创建接收扫描、
-   出站回声去重、任务栏钩子或 OCR 预热状态。
+   界面组件的私有锁、选择器或接收状态。
+6. `uia/gateway.py` 与 `uia/materializer.py`：网关持有共享 UI 优先级租约、绑定选择器和
+   发送操作；Materializer 只补充已验证消息的附件与一层引用，不发现新消息。
+   UIA 不维护接收扫描、出站回声去重、任务栏钩子或 OCR 预热状态。
 7. `uia/client.py`：Windows UIA 基础设施层。只处理窗口、控件、剪贴板、键鼠和
    微信 UI 结构，不承担 Agent 或自动回复策略。
 UIA 随机等待统一调用 `_paced_wait(minimum_key, maximum_key)`；节拍默认值只定义在
@@ -80,7 +79,7 @@ UIA 随机等待统一调用 `_paced_wait(minimum_key, maximum_key)`；节拍默
 业务开关，避免白名单等本机配置变化影响回归结果。
 
 `uia/operations.py` 存放可复用的微信动作。目前包含会话选择器解析、文本/图片发送和
-统一发送结果。新增微信动作时优先放在这里，通过网关的公开方法提供给各后端，
+统一发送结果。新增微信动作时优先放在这里，通过网关的公开方法提供给组合后端，
 不要把 UIA 定位细节带回 Channel。
 
 ## 依赖方向
@@ -95,18 +94,17 @@ pipeline/channel.py
    +-> config.py / models.py / contracts.py
    |
    +-> backend.py 接口与工厂
-   |      +-> uia/driver -> uia/gateway -> uia/operations -> uia/client
-   |      |
    |      +-> hybrid.py -> db/source -> db/reader -> db/{cache, discovery, keys}
    |            +-> binding.py -> 数据库来源 + 网关公开接口
-   |            +-> uia/gateway（按需创建；不创建 uia/driver）
+   |            +-> uia/gateway（按需创建）-> uia/operations -> uia/client
+   |                  +-> uia/materializer（必要附件）-> uia/client
    |
    +-> storage/{store, service}
 ```
 
 `conversation.py` 只提供标题匹配纯函数，数据库和 UIA 均可依赖它。
-旧 `uia/backend.py`、`db/backend.py` 仅维持已有导入兼容，不承载第二份接口或实现。
 `db/` 内部不依赖 UIA、Binder 或 Hybrid；跨来源身份核验始终位于通道组合层。
+旧界面接收驱动、Shell Hook 和分包后端兼容入口已删除，公共入口统一使用根 `backend.py`。
 
 ## 组件职责与协作边界
 
@@ -134,22 +132,25 @@ UIA Client 持有附件读取、图片查看器和引用解析组件，与原有
 
 | 组件 | 职责 | 不承担的职责 |
 | --- | --- | --- |
-| `WechatDatabaseReader` | 解密缓存、结构识别、联系人/历史/原生消息查询 | UIA 可用性、会话定位、接收 ACK |
+| `WechatDatabaseReader` | 解密缓存、结构识别、原生事件与同会话上文、联系人/历史查询 | UIA 可用性、会话定位、接收 ACK |
 | `WechatDatabaseSource` | 账号生命周期、启动基线、来源分页、待确认批次与 ACK | UIA 发送和跨来源目标绑定 |
 | `DatabaseUiaTargetBinder` | 数据库账号/会话与 UIA 窗口、RuntimeId 的核验和绑定 | 聊天消息读取与接收游标 |
 | `WechatUiaGateway` | 公开界面检查、定位和发送；共享优先级与逐 UI 段校验 | UIA 接收扫描、消息去重、数据库读取 |
+| `WechatUiaMaterializer` | 已验证单消息的文件、媒体引用、分享正文与路径缓存 | 入站发现、FIFO、原生消息身份推断 |
 | `WechatDatabaseBackend` | 组合来源与网关，提供通道统一入口与组合状态 | 复制数据库分页或 UIA 发送实现 |
-| `WechatUiaDriver` | 默认 UIA 接收、可见消息身份和回声去重；复用网关发送 | 数据库读取 |
 
-`desktop_backend="db_uia"` 时，消息接收、联系人及指定会话历史仅由 `db/` 读取，
-不启动 UIA 接收扫描、任务栏钩子或群发送者 OCR。回复周期和进度提示登记是可选接收钩子：
-UIA 实现用它们监控可见气泡，数据库后端沿用接口的空实现，依靠原生消息方向过滤出站消息。
-数据库批次在一个事务中提交事件、过滤记录、历史和游标，流水线只为 UIA 快照另行追加历史。
+消息接收、联系人及指定会话历史仅由 `db/` 读取，不启动 UIA 接收扫描、任务栏钩子或
+群发送者 OCR。数据库方向过滤负责排除出站事件，不需要登记回复周期、进度气泡或
+回声抑制钩子。数据库批次在一个事务中提交事件、过滤记录、历史和游标，
+流水线不另建 UIA 快照历史或单事件接收链。
 
 首次启用在同一事务中提交全部来源基线和账号初始化标记；中断后整批回滚，重启重新初始化，
 不会将半批游标误认为初始化已完成。旧账本的账号游标在迁移事务中补记初始化状态；
 已初始化账号新发现的分片从起点补读。
 启动时固定各流高水位，高水位以内的恢复记录按 `offline_backfill` 写入账本和历史，不触发回复。
+`live` 和可信 `startup_unread` 事件在同一批次快照内补充同会话的有界原生上文：
+各会话分片复用倒序查询，排除当前/后续消息，按原生顺序合并，不额外消费游标。
+明确引用事件只携带一层引用片段；离线补账不生成自动回复上下文或任务。
 
 全量解密重建保留 SQLite `quick_check`；WAL 增量发布依赖页 HMAC、WAL 校验和及提交边界验证，
 只额外读取首页检查文件头与根页结构边界，避免在源锁内扫描整库。结构或写入失败仍回滚受影响页，
@@ -170,21 +171,57 @@ UIA 网关、不推进接收游标。Reader 的状态只描述数据库读取与
 已有发送链。关闭幂等，关闭后的查询和发送不隐式恢复；通道启动显式调用 `resume()`，
 恢复生命周期后才能重新使用后端。
 
+数据库后端的发送授权解析和原生消息复核仅访问数据库，实体窗口绑定留在发送门禁后的
+实际发送段。网关账号检查只被动读取当前窗口可见控件与同一窗口的缓存，不点击头像补全
+资料；当前会话历史查询也不激活窗口。实际发送中的目标定位和提交仍可恢复前台。
+
 Agent 主动发送先由后端解析可信显示名和真实群类型，再执行黑白名单授权；工具传入的
 `is_group` 仅保留为兼容参数。授权绑定稳定会话 ID，逐段提交前再次核对 ID、显示名和类型，
 身份不明、同名歧义或授权后目标变化时拒绝发送。
 
-UIA 仅凭独立群人数控件确认群类型，数字括号昵称不能授予群权限。文本和图片提交前均复核
-原消息；失效任务先记为跳过，再独立接纳替代事件。发送回执去重先于额度预留，可读草稿
+群权限使用数据库解析的真实群类型，工具传入类型和数字括号昵称不能授予群权限。
+文本和图片提交前均复核原消息；失效任务记为跳过，不生成 UIA 替代事件。发送回执去重先于额度预留，可读草稿
 必须与预期内容一致才提交。气泡验证要求出站方向和可证明的新增身份；无稳定身份时须证明
 快照数量及同正文气泡计数增加，且旧气泡签名仍完整保留；满窗口无法证明新增时保留为
-未验证，不自动重发。点击发送后的 Enter 回退也必须再次确认可读草稿和焦点。
+未验证，不自动重发。发送按钮已尝试执行后，输入框旧值或未知气泡不能证明未提交，
+因此禁止自动 Enter 重试，按未确认结果收尾。
 
-UIA 可见聊天解析仍供默认 `uia` 后端及两个后端共用的发送前后气泡验证使用；独立历史窗口
-读取仍供默认 `uia` 的历史工具使用。引用与附件组件继续供默认 UIA 后端使用。
-数据库消息目前无法可靠绑定到 UIA 原生气泡身份，非文本消息只保留类型、来源和降级状态，
-不通过正文、姓名或坐标猜测附件归属，不启动下载或媒体解密。
-出站回声抑制只维护带时间和 RuntimeId 的消息缓存，不保留另一份只含文本的缓存。
+UIA 发送校验快照和显式历史诊断共用基础控件解析，发送快照不调用 OCR 或截图。方向只使用可信
+正文或头像子控件的语义与位置证据，整行消息边界不能作为方向证据；未知方向不能验证出站。
+完整 UIA 历史读取仅供显式诊断使用；生产历史工具读取数据库。
+OCR 只在显式 UI 诊断与分享卡片复制链接菜单后备中按需加载，启动不预热。
+
+独立文件、明确的图片/文件引用及缺少链接的分享引用按需进入附件流程；独立图片与分享卡片只观察。
+原生分享 URL 先验证数据库来源，随后直接交给 Agent，跳过 UIA 会话绑定和气泡关联。
+引用优先按 `svrid` 在同账号、同会话全部分片唯一回查原文，补齐文字、文件名及分享元数据。
+查询复用批次快照并按引用 ID 缓存，不推进接收游标；记录原文的原生身份、世代与内容摘要，
+在物化和 Agent 执行、发送前复核。原文被删除、修改、替换或出现重复 ID 时拒绝继续。
+聚合时剔除已失效前序事件及其对应历史，只保留来源 ID 用于账本与生命周期；引用任务不混入前序聚合内容。
+普通聚合保留前序原生事件的轻量快照，FIFO 恢复入队历史后、投递 Agent 前再次复核并剔除失效前序。
+完整文字无需 UIA；原文仍缺失或应用类型未识别时，在安全关联条件下保留 UIA 定位备用。
+当前文本与一层引用内的 HTTP/HTTPS 链接由通用 `analyze-url` 技能或工具读取；动态分享网页
+使用 `browser`，静态页面可用 `web_fetch`，已有可信正文不重复读取。通道不另行预取网页。
+必要物化可恢复前台或定位会话，普通接收、授权、原生行复核和当前会话查询不得激活窗口。
+`hybrid.py` 在操作前必须取得下列关联证据：
+
+- `ScrollPattern` 可证明当前可见聊天在底部，读取前后证据不变。
+- 数据库最近最多 50 条与 UIA 最多 20 条唯一匹配为尾部序列，且至少包含两种不同的非空
+  类型/内容锚点；方向或发送者已知时也必须一致。
+- 目标类型与内容外观在两端分别唯一，目标 RuntimeId 唯一；引用正文和已知发送者一致。
+- 物化前再次检查账号、窗口句柄/进程、会话 RuntimeId、原生行和两端完整序列。
+
+缺少底部证据、重复附件标题、目标不可见或序列变化时标记 `attachment_identity_unavailable`，
+拒绝附件点击并保留降级信息。关联成功后才交给 Materializer 下载/查看及补充事件；
+物化器仅补充 URL 或已读取的微信内置浏览器正文；后续通用网页读取由 Agent 执行。
+真实微信 `ScrollPattern` 覆盖尚未实机验收，不能保证
+所有附件可获取。数据库媒体解密、朋友圈读取和写入未接入。
+数据库附件流程禁止按文件名/大小/修改时间跨账号搜索缓存，只接受已验证气泡复制的路径
+或下载/另存为结果；等待时继续复核账号、窗口、当前会话与 RuntimeId。
+原生正文签名包含完整引用/分享 XML，联系人显示名和物化路径不参与原生内容复核；
+已物化路径缓存按原生消息身份隔离。
+`WechatUiaMaterializer` 只接受已验证的原生事件，删除旧 `resolve_message` 入口和文件名/
+前缀缓存。数据库已知类型、发送者与来源证据不被 UIA 快照覆盖；未识别类型才允许补充准确
+分类。严格定位在焦点恢复后重新取 RuntimeId 与当前位置，返回引用位置及 End 前复核上下文。
 
 ## 测试组织
 
@@ -199,9 +236,14 @@ UIA 可见聊天解析仍供默认 `uia` 后端及两个后端共用的发送前
 | `test_uia_image_viewer.py` / `test_uia_reference.py` | 查看器安全恢复与引用解析 |
 | `test_contracts.py` / `test_correctness.py` | 接收确认、持久化占位、重启防重放与正确性约束 |
 | `test_uia_gateway.py` | 共享租约、逐 UI 段目标复核、并发验证回调与发送操作委托 |
+| `test_database_only_backend.py` | 唯一数据库后端、配置拒绝与启动接收职责 |
+| `test_db_passive_ui.py` / `test_uia_passive_reads.py` | 普通接收、授权、原生复核与被动界面读取不激活窗口 |
+| `test_db_reply_context.py` | 原生上文顺序、跨分片与分页、离线隔离和批次查询复用 |
+| `test_db_uia_attachment_bridge.py` | 底部/唯一尾部关联、同名附件拒绝、窗口与序列变更拒绝 |
+| `test_uia_materializer.py` | 独立物化组件、文件/引用/分享正文与路径缓存 |
 
 架构回归还需验证数据库包无 UIA 依赖、数据库观察与指定 ID 查询不创建 UIA 网关、
-旧导入路径为兼容转导出，以及关闭/显式恢复时不复用失效窗口绑定。
+禁止 UIA 入站后备，以及关闭/显式恢复时不复用失效窗口绑定。
 
 Windows 回归命令使用项目指定解释器：
 
@@ -214,14 +256,14 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pytest tests/wechat_desktop test
 - 上层统一使用 `WechatDesktopEvent` 和 `ReplyTargetValidation`，后端不要泄漏控件对象。
 - 会话优先使用内部 `conversation_id`；只有在操作边界才解析为标题、runtime ID 和行号。
 - 所有发送动作都返回统一的 `accepted_by`、`verification` 和 `observation` 字段。
-- UIA 操作必须经过 Gateway 的共享优先级租约，避免后台扫描抢占正在发送的回复。
+- UIA 操作必须经过 Gateway 的共享优先级租约，附件物化不可抢占正在发送的回复。
 - 新增解析函数和动作类时应先写不依赖真实微信窗口的单元测试。
 - 通道配置只改 `channel/wechat_desktop/config.py` 的 `DEFAULT_CONFIG`；不要在 `pipeline/`、`uia/` 里再维护平行默认配置字典。
 
 ## 正确性约束
 
 - 精确会话标识必须在已打开会话的快路径中同样校验；同名会话不通过行号或标题猜测目标。
-- 单个会话扫描失败保留其他会话已读取的事件，并通过 `uia_scan_retry_seconds` 主动重试失败会话。
+- 读取或来源认证失败保留游标，暂停新批次并按数据库轮询节拍重试，不能改用可见聊天接收。
 - `triggers.py` 为扫描和策略判断提供同一套群触发规则；只有 `at_only` 可凭缺少 @ 标记提前跳过。
 - `send_control.py` 为同步发送链建立独立取消作用域，等待锁、节拍和实际提交前都检查任务状态。
   已有分段提交后中断时返回 `partial` / `uncertain`，不自动重放整条消息。
@@ -232,28 +274,23 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pytest tests/wechat_desktop test
 
 ### 事件接收确认
 
-`observe_events()` 返回的事件在 `acknowledge_events(event_ids)` 前保留在后端内存收件箱。
-下一轮首先重交付未确认批次，保持原事件 ID；不继续无限积累新快照。
-UIA 接收通过 `event_receipt_capacity` 限制单批量，失败及剩余可见消息按
-`uia_scan_retry_seconds` 重试；数据库来源按 `db_batch_size` 独立分页。
-
-流水线调用 `store.receive_event(event)` 原子写入 `events` 与 `event_runs`，获得
-`EventReceipt(observed_event_id, canonical_event_id, accepted, state)`。
-只有 `accepted=True` 才首次路由到 Agent/队列；重复快照返回已存事件的身份。
-确认丢失后再次接收不会改写原任务状态，也不会再投递 Agent。存储失败不确认。
-ACK 表示已持久化接收或已知重复，不表示已回复成功。事件接收后的路由异常单独记录为 `failed`。
+`observe_events()` 返回 `source_batch` 和其中的统一事件，来源按 `db_batch_size` 分页。
+待确认批次在后端内存中保留，下一轮先重交付原批次和事件 ID。
+流水线调用 `store.receive_source_batch(batch)`，一次事务写入来源去重、事件、运行阶段、
+过滤记录、业务历史和各来源游标；成功后通过批次 ID 调用 `acknowledge_events()`。
+只有接收回执 `accepted=True` 才首次路由到 Agent/队列；重复接收不改写原任务状态，
+也不再次投递 Agent。事务失败不 ACK、不推进游标，整批重交付；没有逐事件接收旁路。
+ACK 表示已持久化接收或已知重复，不表示回复成功；路由异常单独记录为 `failed`。
 
 回复队列只提供单项入队、活动令牌校验和全局 FIFO，不再维护会话插队参数、
 `superseded` 状态或另一套“相关任务”判断。停止时原子失效活动令牌并清空待处理项，
 返回被丢弃的事件 ID 供通道持久化收尾；回复与物化消费者均通过短轮询退出，
 不向有容量限制的队列塞入停止哨兵。回复结束状态在消费者完成队列记账后统一发布。
 
-UIA 收件箱不是持久化消息队列：进程退出时，尚未落库的快照只能依赖后续 UI 观察重新发现。
-UIA 不是微信服务端消息 ID，不能将上述契约理解为跨所有 UI 重建和历史清理的 exactly-once 保证。
-
-数据库接收以来源批次为单位，流水线先调用 `receive_source_batch`，将来源去重、事件、
-过滤、历史和游标一次提交，成功后才 ACK 批次。失败保持原游标并重交付整批；ACK 丢失后
-使用已提交的来源记录确认重复，不再次路由。Source 管理接收状态，账本事务仍归 Store。
+Source 管理待 ACK 状态，游标和接收事务归 Store。消息身份由账号、来源分片、消息表和
+原生主键组成，不包含显示名、正文或坐标。ACK 丢失后使用已提交来源记录确认重复；
+进程中断后的未接收记录依据持久游标从数据库补账，前提是微信本机仍保留原生行。
+可靠落账不等于重启后重放回复，也不保证微信服务端未同步到本机的数据。
 
 ### 普通消息的处置规则
 
@@ -300,8 +337,9 @@ UIA 不是微信服务端消息 ID，不能将上述契约理解为跨所有 UI 
 
 ### 目标解析
 
-后端公开 `resolve_target(conversation) -> TargetResolution`，状态为 `resolved`、
+后端公开 `resolve_send_target(conversation) -> TargetResolution` 供数据库授权解析，
+`resolve_target(conversation)` 仅在实际动作边界绑定 UI 目标。状态为 `resolved`、
 `not_found`、`ambiguous` 或 `stale`；成功时返回 `ConversationTarget` 的不透明 ID 和显示名。
-业务层不再读取 `_resolve_selector`、runtime ID 或分析 `uia-session:` 前缀。
+业务层不读取私有选择器或 RuntimeId，也不从显示标签推断原生消息身份。
 失效 ID 不自动退回显示名，同名歧义不猜测，发送前仍由实际 UI 操作验证精确会话。
 新后端必须同时实现目标解析与接收确认接口，不能仅实现发送方法。

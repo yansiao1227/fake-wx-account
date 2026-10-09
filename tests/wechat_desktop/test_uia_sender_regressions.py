@@ -55,7 +55,11 @@ def input_client(monkeypatch, paste_values, *, send_button=True):
         state["submitted"].append(state["value"])
         index = len(state["submitted"])
         bounds = (680, index * 60 + 110, 860, index * 60 + 150)
-        message = GeometryControl(bounds, state["value"], "mmui::ChatTextItemView")
+        body = GeometryControl(bounds, state["value"], "mmui::ChatTextBubble")
+        message = GeometryControl(
+            (0, bounds[1], 900, bounds[3]), state["value"],
+            "mmui::ChatTextItemView", children=[body],
+        )
         message.GetRuntimeId = lambda: (42, index)
         if state.get("expose_bubble_on_submit", True):
             message_list._children.append(message)
@@ -104,9 +108,33 @@ def input_client(monkeypatch, paste_values, *, send_button=True):
     monkeypatch.setattr(client, "_wait_for_input_value",
                         lambda item, predicate, _: predicate(client._input_value(item)))
     monkeypatch.setattr(client._group_sender_ocr, "enrich",
-                        lambda messages, bounds, **kwargs:
-                        client._group_sender_ocr.assign_senders(messages, lines, bounds, **kwargs))
+                        lambda *args, **kwargs: pytest.fail("发送不得触发 OCR"))
+    monkeypatch.setattr(client._group_sender_ocr, "_get_engine",
+                        lambda: pytest.fail("发送不得初始化 OCR 模型"))
     return client, state
+
+
+def test_real_sender_reads_before_and_after_through_non_ocr_snapshot(monkeypatch, fast_sender_clock):
+    client, state = input_client(monkeypatch, ["合成回复"])
+    monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
+    monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
+    monkeypatch.setattr(client, "get_chat_history",
+                        lambda **kwargs: pytest.fail("发送不得调用接收历史/OCR入口"))
+    snapshots = []
+    read_snapshot = client.get_send_bubble_snapshot
+
+    def read(**kwargs):
+        result = read_snapshot(**kwargs)
+        snapshots.append((kwargs, len(result)))
+        return result
+
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", read)
+    result = client.send_message("Synthetic", "合成回复", expedited=True)
+
+    assert result["verified"] is True
+    assert state["submitted"] == ["合成回复"]
+    assert snapshots == [({"conversation": "Synthetic", "limit": 5}, 0),
+                         ({"conversation": "Synthetic", "limit": 5}, 1)]
 
 
 @pytest.mark.parametrize("send_button", [True, False])
@@ -212,46 +240,14 @@ def test_previously_readable_pattern_loss_stays_rejected_across_retries(monkeypa
     assert state["submitted"] == []
 
 
-@pytest.mark.parametrize("failure", ["unavailable", "changed", "unreadable_after_focus", "unfocused"])
-def test_enter_fallback_requires_readable_matching_focused_draft(monkeypatch, fast_sender_clock, failure):
-    client, state = input_client(monkeypatch, [])
-    state["value"] = "正确文本"
-    control = state["input_control"]
-    if failure == "unavailable":
-        state["unavailable_pattern_reads"] = "all"
-    elif failure == "changed":
-        monkeypatch.setattr(control, "SetFocus", lambda: state.update(value="错误草稿"))
-    elif failure == "unreadable_after_focus":
-        state["unavailable_pattern_reads"] = {2}
-    else:
-        monkeypatch.setattr(control, "HasKeyboardFocus", False)
-
-    with track_send_attempt() as attempt:
-        assert client._send_existing_input_with_enter("正确文本") is False
-
-    assert attempt.submitted is False
-    assert state["submitted"] == []
-
-
-def test_enter_fallback_sends_readable_matching_focused_draft(monkeypatch):
-    client, state = input_client(monkeypatch, [])
-    state["value"] = "正确文本"
-
-    with track_send_attempt() as attempt:
-        assert client._send_existing_input_with_enter("正确文本") is True
-
-    assert attempt.submitted is True
-    assert state["submitted"] == ["正确文本"]
-
-
-@pytest.mark.parametrize("failure", ["unreadable", "changed"])
-def test_declined_real_enter_fallback_preserves_original_uncertain_click(monkeypatch, fast_sender_clock, failure):
+@pytest.mark.parametrize("failure", ["unreadable", "changed", "stale_matching_draft"])
+def test_uncertain_click_never_repeats_enter_submission(monkeypatch, fast_sender_clock, failure):
     client, state = input_client(monkeypatch, ["正确文本"])
     state["clear_input_on_submit"] = False
     state["expose_bubble_on_submit"] = False
     if failure == "unreadable":
         state["unavailable_after_submit"] = True
-    else:
+    elif failure == "changed":
         def change_on_fallback_focus():
             if state["submitted"]:
                 state["value"] = "错误草稿"
@@ -307,14 +303,16 @@ def test_real_chunk_sender_keeps_partial_submission_semantics(monkeypatch, fast_
 
 
 def history_client(monkeypatch, entries):
-    """保留真实 get_chat_history 与 OCR 方向解析，仅替换控件和截图结果。"""
+    """使用真实发送快照和可信子控件；OCR 入口调用会使测试失败。"""
     controls = []
     lines = []
     for index, (text, direction, runtime) in enumerate(entries):
         horizontal = {"incoming": (40, 220), "outgoing": (680, 860), "unknown": (420, 480)}
         left, right = horizontal[direction]
         bounds = (left, index * 60 + 10, right, index * 60 + 50)
-        item = GeometryControl(bounds, text, "mmui::ChatTextItemView")
+        body = GeometryControl(bounds, text, "mmui::ChatTextBubble")
+        item = GeometryControl((0, bounds[1], 900, bounds[3]), text,
+                               "mmui::ChatTextItemView", children=[body])
         item.GetRuntimeId = lambda value=runtime: value
         controls.append(item)
         lines.append(OcrTextLine(text, 0.99, bounds))
@@ -326,15 +324,14 @@ def history_client(monkeypatch, entries):
     client = WechatUiaClient({})
     monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(root))
     monkeypatch.setattr(client._group_sender_ocr, "enrich",
-                        lambda messages, bounds, **kwargs:
-                        client._group_sender_ocr.assign_senders(messages, lines, bounds, **kwargs))
+                        lambda *args, **kwargs: pytest.fail("发送快照不得触发 OCR"))
     return client, message_list, lines
 
 
 @pytest.mark.parametrize("runtime", [(), (42, 1)])
 def test_existing_identical_outgoing_bubble_is_unverified(monkeypatch, fast_sender_clock, runtime):
     client, _, _ = history_client(monkeypatch, [("重复文本", "outgoing", runtime)])
-    before = client.get_chat_history(limit=5)
+    before = client.get_send_bubble_snapshot(limit=5)
 
     assert client._verify_send("Synthetic", before, text="重复文本")["verified"] is False
 
@@ -357,7 +354,7 @@ def test_new_outgoing_text_is_verified(monkeypatch, fast_sender_clock, runtime):
 def test_no_id_duplicate_requires_increased_outgoing_count(monkeypatch, fast_sender_clock):
     client, _, _ = history_client(monkeypatch, [("重复文本", "outgoing", ()),
                                               ("重复文本", "incoming", ())])
-    after = client.get_chat_history(limit=5)
+    after = client.get_send_bubble_snapshot(limit=5)
 
     assert client._verify_send("Synthetic", after[:1], text="重复文本")["verified"] is False
     assert client._verify_send("Synthetic", after[1:], text="重复文本")["verified"] is True
@@ -366,21 +363,21 @@ def test_no_id_duplicate_requires_increased_outgoing_count(monkeypatch, fast_sen
 def test_no_id_identical_outgoing_append_is_verified(monkeypatch, fast_sender_clock):
     client, _, _ = history_client(monkeypatch, [("重复文本", "outgoing", ()),
                                               ("重复文本", "outgoing", ())])
-    before = client.get_chat_history(limit=5)[:1]
+    before = client.get_send_bubble_snapshot(limit=5)[:1]
 
     assert client._verify_send("Synthetic", before, text="重复文本")["verified"] is True
 
 
 def test_anonymous_old_bubble_gaining_id_is_unverified(monkeypatch, fast_sender_clock):
     client, _, _ = history_client(monkeypatch, [("旧文本", "outgoing", (42, 2))])
-    before = [replace(client.get_chat_history(limit=5)[0], runtime_id="")]
+    before = [replace(client.get_send_bubble_snapshot(limit=5)[0], runtime_id="")]
 
     assert client._verify_send("Synthetic", before, text="旧文本")["verified"] is False
 
 
 def test_anonymous_old_bubble_resolving_direction_is_unverified(monkeypatch, fast_sender_clock):
     client, _, _ = history_client(monkeypatch, [("旧文本", "outgoing", ())])
-    before = [replace(client.get_chat_history(limit=5)[0], direction="unknown")]
+    before = [replace(client.get_send_bubble_snapshot(limit=5)[0], direction="unknown")]
 
     assert client._verify_send("Synthetic", before, text="旧文本")["verified"] is False
 
@@ -389,14 +386,14 @@ def test_anonymous_old_bubble_resolving_direction_is_unverified(monkeypatch, fas
 def test_old_unknown_direction_and_identical_new_incoming_do_not_prove_submission(monkeypatch, fast_sender_clock, runtime):
     client, _, _ = history_client(monkeypatch, [("匹配文本", "outgoing", runtime),
                                               ("匹配文本", "incoming", ())])
-    before = [replace(client.get_chat_history(limit=5)[0], runtime_id="", direction="unknown")]
+    before = [replace(client.get_send_bubble_snapshot(limit=5)[0], runtime_id="", direction="unknown")]
 
     assert client._verify_send("Synthetic", before, text="匹配文本")["verified"] is False
 
 
 def test_anonymous_old_reference_metadata_improvement_is_unverified(monkeypatch, fast_sender_clock):
     client, _, _ = history_client(monkeypatch, [("回复文本 引用 合成成员 的消息：旧消息", "outgoing", ())])
-    read_history = client.get_chat_history
+    read_history = client.get_send_bubble_snapshot
     before = read_history(limit=5)
     assert before[0].reference is not None
 
@@ -405,7 +402,7 @@ def test_anonymous_old_reference_metadata_improvement_is_unverified(monkeypatch,
                                                degraded=False, strategy="resolved"))
                 for item in read_history(**kwargs)]
 
-    monkeypatch.setattr(client, "get_chat_history", enrich_reference)
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", enrich_reference)
 
     assert client._verify_send("Synthetic", before, text="回复文本")["verified"] is False
 
@@ -413,21 +410,21 @@ def test_anonymous_old_reference_metadata_improvement_is_unverified(monkeypatch,
 def test_anonymous_old_file_path_completion_is_unverified(monkeypatch, fast_sender_clock):
     client, message_list, _ = history_client(monkeypatch, [("report.pdf", "outgoing", ())])
     message_list._children[0].ClassName = "mmui::ChatFileItemView"
-    read_history = client.get_chat_history
+    read_history = client.get_send_bubble_snapshot
     before = [replace(item, direction="outgoing") for item in read_history(limit=5)]
 
     def enrich_attachment(**kwargs):
         return [replace(item, direction="outgoing", file_path="D:/synthetic/report.pdf")
                 for item in read_history(**kwargs)]
 
-    monkeypatch.setattr(client, "get_chat_history", enrich_attachment)
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", enrich_attachment)
 
     assert client._verify_send("Synthetic", before, expected_type="file")["verified"] is False
 
 
 def test_anonymous_old_body_correction_without_new_bubble_is_unverified(monkeypatch, fast_sender_clock):
     client, message_list, lines = history_client(monkeypatch, [("识别错误文本", "outgoing", ())])
-    before = client.get_chat_history(limit=5)
+    before = client.get_send_bubble_snapshot(limit=5)
     message_list._children[0].Name = "正确文本"
     lines[0] = replace(lines[0], text="正确文本")
 
@@ -436,7 +433,7 @@ def test_anonymous_old_body_correction_without_new_bubble_is_unverified(monkeypa
 
 def test_anonymous_old_body_correction_gaining_id_is_unverified(monkeypatch, fast_sender_clock):
     client, message_list, lines = history_client(monkeypatch, [("识别错误文本", "outgoing", ())])
-    before = client.get_chat_history(limit=5)
+    before = client.get_send_bubble_snapshot(limit=5)
     message_list._children[0].Name = "正确文本"
     message_list._children[0].GetRuntimeId = lambda: (42, 2)
     lines[0] = replace(lines[0], text="正确文本")
@@ -448,7 +445,7 @@ def test_anonymous_old_body_correction_gaining_id_is_unverified(monkeypatch, fas
 def test_body_correction_with_unrelated_new_incoming_is_unverified(monkeypatch, fast_sender_clock, runtime):
     client, _, _ = history_client(monkeypatch, [("正确文本", "outgoing", runtime),
                                               ("无关新消息", "incoming", ())])
-    before = [replace(client.get_chat_history(limit=5)[0], content="识别错误文本", runtime_id="")]
+    before = [replace(client.get_send_bubble_snapshot(limit=5)[0], content="识别错误文本", runtime_id="")]
 
     assert client._verify_send("Synthetic", before, text="正确文本")["verified"] is False
 
@@ -457,7 +454,7 @@ def test_different_type_anonymous_baseline_prevents_full_snapshot_new_id_claim(m
     entries = [(f"文本{index}", "outgoing", (42, index)) for index in range(1, 5)]
     entries.append(("新增文本", "outgoing", (42, 6)))
     client, _, _ = history_client(monkeypatch, entries)
-    before = client.get_chat_history(limit=5)
+    before = client.get_send_bubble_snapshot(limit=5)
     before[-1] = replace(before[-1], content="report.pdf", message_type="file", runtime_id="")
 
     assert client._verify_send("Synthetic", before, text="新增文本")["verified"] is False
@@ -469,7 +466,7 @@ def test_full_snapshot_append_requires_stable_identity(monkeypatch, fast_sender_
                for index in range(1, 5)]
     entries.append(("新增文本", "outgoing", (42, 6) if stable_ids else ()))
     client, _, _ = history_client(monkeypatch, entries)
-    before = client.get_chat_history(limit=5)
+    before = client.get_send_bubble_snapshot(limit=5)
     before[-1] = replace(before[-1], content="之前的文本",
                          runtime_id="42.5" if stable_ids else "")
 
@@ -481,6 +478,6 @@ def test_file_verification_requires_new_outgoing_snapshot(monkeypatch, fast_send
     client = WechatUiaClient({})
     old = UiaChatMessage("成员", "report.pdf", message_type="file", direction="outgoing")
     new = replace(old, runtime_id="42.2", direction=direction)
-    monkeypatch.setattr(client, "get_chat_history", lambda **_: [old, new])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_: [old, new])
 
     assert client._verify_send("Synthetic", [old], expected_type="file")["verified"] is expected

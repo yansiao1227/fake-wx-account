@@ -4,23 +4,23 @@ import json
 import queue
 import threading
 import time
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.config import load_wechat_desktop_config
-from channel.wechat_desktop.contracts import SendResult, SendStatus, TargetStatus
-from channel.wechat_desktop.models import HeaderInfo, WechatDesktopEvent
+from channel.wechat_desktop.contracts import SendResult, SendStatus
+from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.pipeline.delivery import DeliveryService
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
 from channel.wechat_desktop.storage.service import WechatDesktopService
 from channel.wechat_desktop.storage.store import WechatDesktopStore
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
+from channel.wechat_desktop.db.source import WechatDatabaseSource
 from channel.wechat_desktop.uia.operations import WechatSendOperations, WechatConversationSelector
-from .helpers import _bare_wechat_channel, FakeClient, FakeHook, incoming, row
+from .helpers import _bare_wechat_channel
+from .test_db_reader import make_reader, add_message
 from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
 
 
@@ -35,18 +35,17 @@ def event(text="hello"):
     return WechatDesktopEvent("message", "alice", "Alice", "alice", "Alice", "text", text, source_type="private")
 
 
-def driver_with_messages(**config):
-    client = FakeClient()
-    client.rows = [row("Alice", runtime_id="alice")]
-    client.headers["alice"] = HeaderInfo("Alice", "private")
-    client.histories["alice"] = [incoming("hello", "message-1")]
-    driver = WechatUiaDriver(load_wechat_desktop_config(config), client=client, shell_hook=FakeHook())
-    return driver, client
+def database_source_with_messages(tmp_path, store, *, batch_size=200):
+    reader, talker = make_reader(tmp_path, batch_size=batch_size)
+    source = WechatDatabaseSource({}, reader=reader, checkpoint_store=store)
+    assert source.observe_events()[1] == []
+    add_message(reader.caches["message/message_0.db"], talker, 1, content="hello")
+    return source, reader, talker
 
 
 def make_channel(store, driver):
     channel = _bare_wechat_channel()
-    channel.config = load_wechat_desktop_config({"bootstrap_existing_messages": True, "shadow_mode": False})
+    channel.config = load_wechat_desktop_config({"shadow_mode": False})
     channel._driver = driver
     channel._store = store
     channel._service = WechatDesktopService(store)
@@ -54,7 +53,6 @@ def make_channel(store, driver):
     channel._reply_queue = WechatReplyQueue(capacity=1)
     channel._stop_event = threading.Event()
     channel._lifecycle = LifecycleRecorder()
-    channel._bootstrapped = False
     channel._last_cleanup_at = time.time()
     channel._trace = lambda *args, **kwargs: None
     channel._materialize_submit_lock = threading.RLock()
@@ -95,48 +93,50 @@ def test_observation_failure_cannot_turn_verified_send_into_retry():
     assert calls == [1]
 
 
-def test_unacknowledged_events_are_redelivered_with_same_identity():
-    driver, client = driver_with_messages()
-    _, first = driver.observe_events()
-    client.rows = [replace(client.rows[0], not_read_number=0)]
-    _, again = driver.observe_events()
-    assert [item.event_id for item in again] == [item.event_id for item in first]
-    driver.acknowledge_events([first[0].event_id])
-    driver.acknowledge_events([first[0].event_id])
-    assert driver.observe_events()[1] == []
+def test_unacknowledged_database_events_are_redelivered_with_same_identity(tmp_path, store):
+    source, _, _ = database_source_with_messages(tmp_path, store)
+    observation, first = source.observe_events()
+    repeated, again = source.observe_events()
+    assert first and [item.event_id for item in again] == [item.event_id for item in first]
+    assert observation["source_batch"].batch_id == repeated["source_batch"].batch_id
+    store.receive_source_batch(observation["source_batch"])
+    source.acknowledge_events([observation["source_batch"].batch_id])
+    source.acknowledge_events([observation["source_batch"].batch_id])
+    assert source.observe_events()[1] == []
 
 
-def test_receipt_failure_does_not_ack_or_lose_event(store, monkeypatch):
-    driver, client = driver_with_messages()
-    channel = make_channel(store, driver)
+def test_database_receipt_failure_does_not_ack_or_lose_event(tmp_path, store, monkeypatch):
+    source, reader, _ = database_source_with_messages(tmp_path, store)
+    channel = make_channel(store, source)
     routed = []
     channel._route_reply_event = lambda message: routed.append(message.event_id)
-    original = store.receive_event
-    monkeypatch.setattr(store, "receive_event", lambda message: (_ for _ in ()).throw(RuntimeError("disk unavailable")))
+    original = store.receive_source_batch
+    checkpoints = store.get_source_checkpoints(reader.account_id)
+    monkeypatch.setattr(store, "receive_source_batch", lambda batch: (_ for _ in ()).throw(RuntimeError("disk unavailable")))
     channel._poll_once()
-    pending = list(driver._unacknowledged_events)
-    assert len(pending) == 1 and routed == []
-    client.rows = [replace(client.rows[0], not_read_number=0)]
-    monkeypatch.setattr(store, "receive_event", original)
+    pending = source.pending_batch
+    assert pending is not None and routed == []
+    assert store.get_source_checkpoints(reader.account_id) == checkpoints
+    monkeypatch.setattr(store, "receive_source_batch", original)
     channel._poll_once()
-    assert routed == pending
-    assert not driver._unacknowledged_events
+    assert routed == [record.event.event_id for record in pending.records if record.event]
+    assert source.pending_batch is None
 
 
-def test_lost_ack_does_not_reenter_agent_or_finish_active_event(store, monkeypatch):
-    driver, _ = driver_with_messages()
-    channel = make_channel(store, driver)
+def test_lost_database_ack_does_not_reenter_agent_or_finish_active_event(tmp_path, store, monkeypatch):
+    source, _, _ = database_source_with_messages(tmp_path, store)
+    channel = make_channel(store, source)
     routed = []
     channel._route_reply_event = lambda message: routed.append(message.event_id)
-    original_ack = driver.acknowledge_events
-    monkeypatch.setattr(driver, "acknowledge_events", lambda ids: (_ for _ in ()).throw(RuntimeError("ack lost")))
+    original_ack = source.acknowledge_events
+    monkeypatch.setattr(source, "acknowledge_events", lambda ids: (_ for _ in ()).throw(RuntimeError("ack lost")))
     with pytest.raises(RuntimeError, match="ack lost"):
         channel._poll_once()
-    monkeypatch.setattr(driver, "acknowledge_events", original_ack)
+    monkeypatch.setattr(source, "acknowledge_events", original_ack)
     channel._poll_once()
     assert len(routed) == 1
     assert store.event_state(routed[0])["state"] == "received"
-    assert not driver._unacknowledged_events
+    assert source.pending_batch is None
 
 
 def test_event_and_receipt_commit_atomically(store):
@@ -157,32 +157,16 @@ def test_receipt_returns_canonical_identity_for_duplicate_snapshot(store):
     assert duplicate.observed_event_id == second.event_id
 
 
-def test_backpressure_is_bounded_until_ack():
-    driver, client = driver_with_messages(event_receipt_capacity=1, auto_reply_groups=["Alice"], group_reply_mode="all")
-    client.headers["alice"] = HeaderInfo("Alice", "group", 3)
-    client.histories["alice"] = [incoming("one", "1"), incoming("two", "2")]
-    _, first = driver.observe_events()
-    assert [item.content for item in first] == ["one"]
-    assert len(driver._unacknowledged_events) == 1
-    driver.acknowledge_events([first[0].event_id])
-    client.rows = [replace(client.rows[0], not_read_number=0)]
-    _, second = driver.observe_events()
-    assert [item.content for item in second] == ["two"]
-
-
-def test_resolution_reports_ambiguity_stale_identity_and_missing_name():
-    driver, client = driver_with_messages()
-    driver.observe_events()
-    resolution = driver.resolve_target("Alice")
-    assert resolution.status == TargetStatus.RESOLVED
-    original_id = resolution.target.conversation_id
-    assert driver.resolve_target(original_id).target == resolution.target
-    driver._conversation_selectors["uia-session:other"] = replace(client.rows[0], runtime_id="other")
-    assert driver.resolve_target("Alice").status == TargetStatus.AMBIGUOUS
-    del driver._conversation_selectors[original_id]
-    assert driver.resolve_target(original_id).status == TargetStatus.STALE
-    assert driver.resolve_target("missing").status == TargetStatus.NOT_FOUND
-    assert driver.send_text(original_id, "must not send").status == SendStatus.NOT_SENT
+def test_database_backpressure_is_bounded_until_ack(tmp_path, store):
+    source, reader, talker = database_source_with_messages(tmp_path, store, batch_size=1)
+    add_message(reader.caches["message/message_0.db"], talker, 2, content="two")
+    observation, first = source.observe_events()
+    assert [item.content for item in first] == ["hello"]
+    assert len(source.pending_batch.records) == 1
+    assert source.observe_events()[1] == first
+    store.receive_source_batch(observation["source_batch"])
+    source.acknowledge_events([observation["source_batch"].batch_id])
+    assert [item.content for item in source.observe_events()[1]] == ["two"]
 
 
 @pytest.mark.parametrize("stage,expected", [("received", "interrupted"), ("queued", "interrupted"), ("running", "interrupted"), ("sending", "uncertain")])
@@ -222,7 +206,7 @@ def test_full_queue_has_durable_rejection_and_cannot_replay(store, queue_type):
 
 
 def test_expired_item_is_terminal_without_entering_agent(store):
-    channel = make_channel(store, SimpleNamespace(end_reply_cycle=lambda: None))
+    channel = make_channel(store, SimpleNamespace())
     message = event()
     message.task.created_at -= 1000
     store.receive_event(message)
@@ -241,7 +225,7 @@ def test_expired_item_is_terminal_without_entering_agent(store):
 
 @pytest.mark.parametrize("pending_send,expected", [(False, "timeout"), (True, "uncertain")])
 def test_timeout_with_possible_submission_is_not_reported_as_safe_failure(store, monkeypatch, pending_send, expected):
-    channel = make_channel(store, SimpleNamespace(end_reply_cycle=lambda: None))
+    channel = make_channel(store, SimpleNamespace())
     message = event()
     store.receive_event(message)
     channel._enqueue_reply_event(message)
@@ -354,20 +338,18 @@ def test_not_sent_delivery_is_not_automatically_reclaimed(store):
         assert duplicate_id == claim_id and previous.status == SendStatus.NOT_SENT
 
 
-def test_startup_baseline_stays_baseline_after_receipt_retry(store, monkeypatch):
-    driver, client = driver_with_messages()
-    client.rows = [replace(client.rows[0], not_read_number=0)]
-    message = event()
-    message.session_unread_count = 0
-    driver._unacknowledged_events[message.event_id] = message
-    channel = make_channel(store, driver)
-    channel.config["bootstrap_existing_messages"] = False
+def test_database_backfill_phase_survives_receipt_retry(tmp_path, store, monkeypatch):
+    source, reader, _ = database_source_with_messages(tmp_path, store)
+    source = WechatDatabaseSource({}, reader=reader, checkpoint_store=store)
+    observation, messages = source.observe_events()
+    assert messages[0].receipt_phase == "offline_backfill"
+    channel = make_channel(store, source)
     routed = []
     channel._route_reply_event = lambda message: routed.append(message)
-    receive = store.receive_event
-    monkeypatch.setattr(store, "receive_event", lambda message: (_ for _ in ()).throw(RuntimeError("disk unavailable")))
+    receive = store.receive_source_batch
+    monkeypatch.setattr(store, "receive_source_batch", lambda batch: (_ for _ in ()).throw(RuntimeError("disk unavailable")))
     channel._poll_once()
-    monkeypatch.setattr(store, "receive_event", receive)
+    monkeypatch.setattr(store, "receive_source_batch", receive)
     channel._poll_once()
     assert not routed
-    assert store.event_state(message.event_id)["reason"] == "startup_baseline"
+    assert store.event_state(messages[0].event_id)["reason"] == "offline_backfill"

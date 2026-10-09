@@ -32,9 +32,12 @@ class Client:
         self.ui_calls.append("pid")
         return self.pid
 
-    def get_owner_info(self):
-        self.ui_calls.append("owner")
+    def get_owner_info_passive(self):
+        self.ui_calls.append("owner_passive")
         return OwnerInfo("Owner", self.wxid)
+
+    def get_owner_info(self):
+        pytest.fail("数据库绑定不得交互式读取账号资料")
 
     def get_visible_conversations(self):
         self.ui_calls.append("rows")
@@ -63,7 +66,7 @@ class Gateway:
         return nullcontext()
 
     def inspect_account(self):
-        return self.client.get_owner_window_process_id(), self.client.get_owner_info()
+        return self.client.get_owner_window_process_id(), self.client.get_owner_info_passive()
 
     def list_conversations(self):
         return self.client.get_visible_conversations()
@@ -108,7 +111,7 @@ def test_observation_and_redelivery_never_call_uia(backend):
     assert driver.client.ui_calls == []
 
 
-def test_reply_and_progress_hooks_do_not_initialize_uia_or_affect_database_receipt(backend, monkeypatch):
+def test_database_receipt_does_not_initialize_uia(backend, monkeypatch):
     _, reader, store, driver, talker = backend
     instance = WechatDatabaseBackend({}, db_reader=reader, store=store)
 
@@ -117,15 +120,11 @@ def test_reply_and_progress_hooks_do_not_initialize_uia_or_affect_database_recei
 
     monkeypatch.setattr(instance, "_actions", reject_uia)
     instance.observe_events()
-    instance.begin_reply_cycle("Synthetic", reader.conversation_id(talker))
-    instance.register_interim_text(reader.conversation_id(talker), "synthetic progress")
     add_message(reader.caches["message/message_0.db"], talker, 1)
     observation, events = instance.observe_events()
     assert len(events) == 1
     assert store.receive_source_batch(observation["source_batch"])[0].accepted
     instance.acknowledge_events([observation["source_batch"].batch_id])
-    instance.forget_interim_text(reader.conversation_id(talker), "synthetic progress")
-    instance.end_reply_cycle()
     assert not instance.uia_initialized
     assert driver.client.ui_calls == []
     assert instance.observe_events()[1] == []
@@ -241,6 +240,7 @@ def test_database_event_validation_does_not_require_visible_message_bubble(backe
     add_message(reader.caches["message/message_0.db"], talker, 1)
     event = instance.observe_events()[1][0]
     assert instance.validate_reply_target(event).valid
+    assert driver.client.ui_calls == []
     event.account_id = "another-account"
     assert not instance.validate_reply_target(event).valid
 
@@ -253,7 +253,7 @@ def test_history_and_search_query_do_not_initialize_or_modify_cursors(backend):
     assert instance.read_chat_history(cid).returned_count == 1
     assert instance.read_current_chat_history().conversation_id == cid
     assert store.get_source_checkpoints(reader.account_id) == {}
-    assert driver.client.ui_calls == ["pid", "owner", "header"]
+    assert driver.client.ui_calls == ["pid", "owner_passive", "header"]
 
 
 def test_factory_registers_database_backend_and_retains_uia_default(backend):
@@ -609,21 +609,23 @@ def test_hybrid_resume_waits_for_source_close_and_restores_backfill(backend, mon
     assert store.receive_source_batch(status["source_batch"])[0].accepted
 
 
-def test_legacy_uia_driver_injection_uses_public_gateway_binding(backend):
-    from channel.wechat_desktop.uia.driver import WechatUiaDriver
-    from .helpers import FakeClient, FakeHook
+def test_explicit_gateway_injection_uses_public_gateway_binding(backend):
+    from channel.wechat_desktop.uia.gateway import WechatUiaGateway
+    from .helpers import FakeClient
 
     _, reader, store, _, talker = backend
     client = FakeClient()
+    client.get_owner_info_passive = client.get_owner_info
+    client.get_owner_window_handle = lambda: 123
     client.rows = [ConversationInfo("Synthetic", runtime_id="synthetic-ui-row", row_index=0)]
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    gateway = WechatUiaGateway({}, client=client)
     sent = []
     client.send_message = lambda who, text, **kwargs: sent.append((who, text, kwargs)) or {"success": True, "verified": True}
-    instance = WechatDatabaseBackend({}, db_reader=reader, store=store, uia_driver=driver)
+    instance = WechatDatabaseBackend({}, db_reader=reader, store=store, uia_gateway=gateway)
     cid = reader.conversation_id(talker)
     assert instance.send_text(cid, "synthetic outgoing").status == SendStatus.SENT
     assert sent == [("Synthetic", "synthetic outgoing", {"runtime_id": "synthetic-ui-row", "row_index": 0})]
-    assert client.history_calls == [] and not driver._hook_started
+    assert client.history_calls == []
 
 
 @pytest.mark.parametrize("restart_at", ["after_resolution", "before_submission"])

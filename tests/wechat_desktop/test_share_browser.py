@@ -4,11 +4,13 @@ import time
 from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
-from channel.wechat_desktop.models import HeaderInfo, UiaChatMessage, UiaReferencedMessage, WechatDesktopEvent
+from channel.wechat_desktop.models import UiaChatMessage, UiaReferencedMessage, WechatDesktopEvent
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from channel.wechat_desktop.uia.driver import WechatUiaDriver, _UiaPriorityCoordinator
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway, _UiaPriorityCoordinator
+from channel.wechat_desktop.uia.materializer import WechatUiaMaterializer
 from channel.wechat_desktop.pipeline.prompts import _render_event_context_lines
-from .helpers import FakeClient, FakeHook, GeometryControl, incoming, row
+from .helpers import FakeClient, GeometryControl
+from .test_uia_materializer import materialize_native_target
 
 
 def test_share_card_requires_link_marker_and_matching_title():
@@ -50,15 +52,19 @@ def test_located_original_rejects_duplicate_preview_matches():
     )
 
 
-def test_share_reference_fetches_url_after_uia_materialization():
-    calls = []
-    fetcher = SimpleNamespace(
-        execute=lambda args: calls.append(args)
-        or SimpleNamespace(status="success", result="Title: B站视频\nContent: 页面正文")
-    )
-    driver = WechatUiaDriver(
-        {}, client=FakeClient(), shell_hook=FakeHook(), web_fetcher=fetcher
-    )
+def _materialize_share_reference(monkeypatch, reference, *, initial_reference=None):
+    def forbid_fetch(*_args, **_kwargs):
+        raise AssertionError("UIA materialization must leave URL reading to Agent tools")
+
+    monkeypatch.setattr("agent.tools.web_fetch.web_fetch.WebFetch.execute", forbid_fetch)
+    client = FakeClient()
+
+    def resolve_reference(message, *, allow_filename_cache=True, validate_target=None):
+        assert allow_filename_cache is False
+        return replace(message, reference=reference)
+
+    client.resolve_message_reference = resolve_reference
+    driver = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     event = WechatDesktopEvent(
         "message",
         "conversation",
@@ -66,78 +72,72 @@ def test_share_reference_fetches_url_after_uia_materialization():
         "alice",
         "Alice",
         "text",
-        "这个视频讲了啥",
-        reference={
-            "content_type": "share_card",
-            "content": "B站视频",
-            "url": "https://www.bilibili.com/video/BV1test",
-        },
+        "阅读这篇文章",
+        reference=initial_reference or {"source_message_id": "synthetic-reference"},
+        account_id="synthetic-account",
+        source_message_id="message_0/Msg_synthetic/1",
+    )
+    target = UiaChatMessage(
+        "Alice", event.content, runtime_id="synthetic-runtime", reference=reference,
+    )
+    result, count = driver.materialize_event(
+        event, target_message=target, validate=lambda: True,
+    )
+    assert count == 1
+    return result
+
+
+def test_share_reference_preserves_url_without_network_fetch(monkeypatch):
+    reference = UiaReferencedMessage(
+        "Bob", "合成分享标题", "share_card", url="https://example.com/article",
+        resolved=True, platform="合成平台",
     )
 
-    result = driver._fetch_share_reference(event)
+    result = _materialize_share_reference(monkeypatch, reference)
 
-    assert calls == [{"url": "https://www.bilibili.com/video/BV1test"}]
-    assert result.reference["fetch_status"] == "success"
-    assert "页面正文" in result.reference["fetched_content"]
-
-
-def test_share_reference_uses_wechat_browser_content_without_network_fetch():
-    fetcher = SimpleNamespace(
-        execute=lambda _args: (_ for _ in ()).throw(
-            AssertionError("direct WeChat browser content must bypass web_fetch")
-        )
-    )
-    driver = WechatUiaDriver(
-        {},
-        client=FakeClient(),
-        shell_hook=FakeHook(),
-        web_fetcher=fetcher,
-    )
-    event = WechatDesktopEvent(
-        "message",
-        "conversation",
-        "Alice",
-        "alice",
-        "Alice",
-        "text",
-        "总结一下",
-        reference={
-            "content_type": "share_card",
-            "content": "分享标题",
-            "browser_content": "这是微信内置浏览器直接读取到的页面正文。",
-            "browser_status": "success",
-        },
-    )
-
-    result = driver._fetch_share_reference(event)
-
-    assert result.reference["fetch_status"] == "direct_browser"
+    assert result.reference["url"] == "https://example.com/article"
+    assert result.reference["platform"] == "合成平台"
+    assert result.reference["source_message_id"] == "synthetic-reference"
+    assert result.reference["fetch_status"] == "link_available"
     assert result.reference["fetched_content"] == ""
+    assert result.reference["fetch_source"] == ""
+    assert result.reference["resolved"] is False
+    assert result.reference["degraded"] is True
 
 
-def test_share_reference_without_url_never_calls_web_fetch():
-    fetcher = SimpleNamespace(
-        execute=lambda _args: (_ for _ in ()).throw(
-            AssertionError("web_fetch must not run without a copied URL")
-        )
-    )
-    driver = WechatUiaDriver(
-        {}, client=FakeClient(), shell_hook=FakeHook(), web_fetcher=fetcher
-    )
-    event = WechatDesktopEvent(
-        "message",
-        "conversation",
-        "Alice",
-        "alice",
-        "Alice",
-        "text",
-        "看看",
-        reference={"content_type": "share_card", "content": "标题", "url": ""},
+def test_share_reference_preserves_wechat_browser_content_without_network_fetch(monkeypatch):
+    reference = UiaReferencedMessage(
+        "Bob", "合成分享标题", "share_card",
+        browser_content="这是合成的微信内置浏览器页面正文。",
+        browser_status="success",
     )
 
-    driver._fetch_share_reference(event)
+    result = _materialize_share_reference(monkeypatch, reference)
 
-    assert event.reference["fetch_status"] == "link_unavailable"
+    assert result.reference["browser_content"] == reference.browser_content
+    assert result.reference["browser_status"] == "success"
+    assert result.reference["fetch_status"] == "direct_browser"
+    assert result.reference["fetch_source"] == "direct_browser"
+    assert result.reference["fetched_content"] == ""
+    assert result.reference["resolved"] is True
+    assert result.reference["degraded"] is False
+    assert result.attachment_status == "materialized"
+
+
+def test_share_reference_without_url_is_unavailable_without_network_fetch(monkeypatch):
+    reference = UiaReferencedMessage(
+        "Bob", "合成分享标题", "share_card", resolved=True,
+        fetched_content="旧的预取正文", fetch_status="success", browser_status="success",
+    )
+
+    result = _materialize_share_reference(monkeypatch, reference)
+
+    assert result.reference["fetch_status"] == "link_unavailable"
+    assert result.reference["browser_status"] == "unavailable"
+    assert result.reference["fetched_content"] == ""
+    assert result.reference["resolved"] is False
+    assert result.reference["degraded"] is True
+    assert result.attachment_status == "unavailable"
 
 
 def test_share_browser_flow_clicks_quote_right_clicks_more_and_closes(monkeypatch):
@@ -400,13 +400,13 @@ def test_image_reference_opens_current_quote_region_without_locating_original(
     image_path.write_bytes(b"png")
     client = FakeClient()
     calls = []
-    client.fetch_referenced_message_image = lambda message: calls.append(
+    client.fetch_referenced_message_image = lambda message, **kwargs: calls.append(
         ("viewer", message.content)
     ) or str(image_path)
     client.resolve_message_reference = lambda _message: (_ for _ in ()).throw(
         AssertionError("image reference must not locate original")
     )
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    driver = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     quoted = UiaChatMessage(
         "Alice",
         "这张图",
@@ -419,28 +419,25 @@ def test_image_reference_opens_current_quote_region_without_locating_original(
         ),
     )
 
-    resolved, resolve_count = driver._resolve_reply_target_message(
-        "conversation", quoted
-    )
+    resolved, resolve_count = materialize_native_target(driver, quoted)
 
     assert calls == [("viewer", "这张图")]
     assert resolve_count == 1
-    assert resolved.reference.file_path == str(image_path)
-    assert resolved.reference.resolved is True
-    assert resolved.reference.strategy == "wechat_reference_image_viewer"
+    assert resolved.reference["file_path"] == str(image_path)
+    assert resolved.reference["resolved"] is True
+    assert resolved.reference["strategy"] == "wechat_reference_image_viewer"
 
 
-def test_file_reference_uses_prefix_cache_before_locating_original(tmp_path):
+def test_file_reference_does_not_reuse_same_named_prefix_cache(tmp_path):
     cached_file = tmp_path / "report(1).pdf"
     cached_file.write_bytes(b"%PDF")
     client = FakeClient()
-    client.resolve_message_reference = lambda _message: (_ for _ in ()).throw(
-        AssertionError("prefix cache hit must not locate original")
-    )
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-    driver._remember_file_by_name(
-        "conversation", "report(1).pdf", str(cached_file)
-    )
+    calls = []
+    client.resolve_message_reference = lambda message, **kwargs: calls.append(message.reference.content) or message
+    client.file_paths["report(1).pdf"] = str(cached_file)
+    driver = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
+    original = UiaChatMessage("Alice", "report(1).pdf", message_type="file", runtime_id="file-runtime")
+    materialize_native_target(driver, original, local_id=2)
     quoted = UiaChatMessage(
         "Alice",
         "帮我读一下",
@@ -453,13 +450,12 @@ def test_file_reference_uses_prefix_cache_before_locating_original(tmp_path):
         ),
     )
 
-    resolved, resolve_count = driver._resolve_reply_target_message(
-        "conversation", quoted
-    )
+    resolved, resolve_count = materialize_native_target(driver, quoted)
 
-    assert resolve_count == 0
-    assert resolved.reference.file_path == str(cached_file)
-    assert resolved.reference.resolved is True
+    assert resolve_count == 1
+    assert calls == ["report.pdf"]
+    assert resolved.reference["file_path"] == ""
+    assert resolved.reference["resolved"] is False
 
 
 def test_file_reference_cache_miss_locates_original(tmp_path):
@@ -468,7 +464,7 @@ def test_file_reference_cache_miss_locates_original(tmp_path):
     client = FakeClient()
     calls = []
 
-    def resolve_reference(message):
+    def resolve_reference(message, **kwargs):
         calls.append(message.reference.content)
         return replace(
             message,
@@ -485,7 +481,7 @@ def test_file_reference_cache_miss_locates_original(tmp_path):
     client.fetch_referenced_message_image = lambda _message: (
         _ for _ in ()
     ).throw(AssertionError("file reference must not open image viewer"))
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    driver = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     quoted = UiaChatMessage(
         "Alice",
         "帮我读一下",
@@ -498,14 +494,12 @@ def test_file_reference_cache_miss_locates_original(tmp_path):
         ),
     )
 
-    resolved, resolve_count = driver._resolve_reply_target_message(
-        "conversation", quoted
-    )
+    resolved, resolve_count = materialize_native_target(driver, quoted)
 
     assert calls == ["report.pdf"]
     assert resolve_count == 1
-    assert resolved.reference.file_path == str(resolved_file)
-    assert resolved.reference.strategy == "wechat_locate_original"
+    assert resolved.reference["file_path"] == str(resolved_file)
+    assert resolved.reference["strategy"] == "wechat_locate_original"
 
 
 def test_attachment_cache_re_resolves_invalid_path_and_changed_identity(tmp_path):
@@ -515,7 +509,7 @@ def test_attachment_cache_re_resolves_invalid_path_and_changed_identity(tmp_path
     second_path.write_bytes(b"two")
     client = FakeClient()
     client.image_paths["same"] = str(first_path)
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    driver = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     first = UiaChatMessage(
         "Alice",
         "same",
@@ -524,12 +518,10 @@ def test_attachment_cache_re_resolves_invalid_path_and_changed_identity(tmp_path
         stable_id="stable-1",
     )
 
-    resolved, first_count = driver._resolve_reply_target_message("alice", first)
+    resolved, first_count = materialize_native_target(driver, first)
     first_path.unlink()
     client.image_paths["same"] = str(second_path)
-    refreshed, invalid_path_count = driver._resolve_reply_target_message(
-        "alice", first
-    )
+    refreshed, invalid_path_count = materialize_native_target(driver, first)
     changed_identity = UiaChatMessage(
         "Alice",
         "same",
@@ -537,32 +529,15 @@ def test_attachment_cache_re_resolves_invalid_path_and_changed_identity(tmp_path
         runtime_id="runtime-2",
         stable_id="stable-2",
     )
-    _, identity_count = driver._resolve_reply_target_message(
-        "alice", changed_identity
-    )
+    _, identity_count = materialize_native_target(driver, changed_identity)
 
-    assert resolved.file_path == str(first_path)
-    assert refreshed.file_path == str(second_path)
+    assert resolved.content == str(first_path)
+    assert refreshed.content == str(second_path)
     assert (first_count, invalid_path_count, identity_count) == (1, 1, 1)
     assert client.image_fetches == ["same", "same", "same"]
 
 
-def test_reply_priority_skips_starting_a_scan():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-    driver._reply_ui_pending.set()
-
-    observation, events = driver.observe_events()
-
-    assert events == []
-    assert observation["scan_yielded_to_reply"] is True
-    assert client.focus_calls == 0
-    assert client.owner_calls == 0
-    assert client.history_calls == []
-
-
-def test_waiting_reply_prevents_scanner_from_reentering_uia():
+def test_waiting_reply_prevents_attachment_operation_from_reentering_uia():
     coordinator = _UiaPriorityCoordinator()
     first_scan_started = threading.Event()
     release_first_scan = threading.Event()
@@ -599,63 +574,3 @@ def test_waiting_reply_prevents_scanner_from_reentering_uia():
         worker.join(1)
 
     assert order == ["reply", "scan"]
-
-
-def test_reply_validation_does_not_deadlock_with_active_scan():
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    client.histories["Alice"] = [incoming("hello", "message-1")]
-    scan_inside_uia = threading.Event()
-    release_scan_read = threading.Event()
-    original_locate = client.locate_conversation
-
-    def blocking_locate(*args, **kwargs):
-        scan_inside_uia.set()
-        assert release_scan_read.wait(1)
-        return original_locate(*args, **kwargs)
-
-    client.locate_conversation = blocking_locate
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True},
-        client=client,
-        shell_hook=FakeHook(),
-    )
-    conversation_id = driver._row_key(client.rows[0])
-    event = WechatDesktopEvent(
-        "message",
-        conversation_id,
-        "Alice",
-        "Alice",
-        "Alice",
-        "text",
-        "hello",
-    )
-    result = {}
-    scan_thread = threading.Thread(
-        target=lambda: result.setdefault("scan", driver.observe_events()),
-        daemon=True,
-    )
-    reply_thread = threading.Thread(
-        target=lambda: result.setdefault(
-            "validation", driver.validate_reply_target(event)
-        ),
-        daemon=True,
-    )
-
-    scan_thread.start()
-    assert scan_inside_uia.wait(1)
-    reply_thread.start()
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline:
-        with driver._uia_priority._condition:
-            if driver._uia_priority._reply_waiters:
-                break
-        time.sleep(0.005)
-    release_scan_read.set()
-    scan_thread.join(1)
-    reply_thread.join(1)
-
-    assert not scan_thread.is_alive()
-    assert not reply_thread.is_alive()
-    assert result["validation"].valid is True

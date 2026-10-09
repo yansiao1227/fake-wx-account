@@ -14,6 +14,7 @@ from pathlib import Path
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.contracts import EVENT_TERMINALS
+from channel.wechat_desktop.references import reference_requires_uia
 from common.log import logger
 
 
@@ -95,7 +96,7 @@ class WechatDesktopMaterializeMixin:
         return bool(attachment and question)
 
     def _materialize_batch(
-        self, events: list[WechatDesktopEvent], *, before_share_fetch=None
+        self, events: list[WechatDesktopEvent]
     ) -> WechatDesktopEvent:
         """解析批次附件，并把多条消息折叠为一个可回复事件。
 
@@ -105,13 +106,9 @@ class WechatDesktopMaterializeMixin:
         """
         resolved_events = []
         for event in events:
-            if before_share_fetch is None:
-                event, resolve_count = self._driver.materialize_event(event)
-            else:
-                event, resolve_count = self._driver.materialize_event(
-                    event, before_share_fetch=before_share_fetch
-                )
-            self._preserve_event_evidence(event)
+            event, resolve_count = self._driver.materialize_event(event)
+            if not self._source_invalid_for_context(event):
+                self._preserve_event_evidence(event)
             resolved_events.append(event)
             self._mark_lifecycle(
                 [event.event_id],
@@ -124,12 +121,27 @@ class WechatDesktopMaterializeMixin:
             events[-1].task.batch_id or uuid.uuid4().hex
         )
         source_event_ids = [event.event_id for event in resolved_events]
-        history = list(target.history)
+        invalid_ids = {
+            identity
+            for event in resolved_events if self._source_invalid_for_context(event)
+            for identity in (event.message_stable_id, event.source_message_id)
+            if identity
+        }
+        # 已撤回或变化的同批消息不能以旧历史或聚合正文绕过来源校验。
+        # 身份和生命周期仍保留在 source_event_ids，不改变接收账本。
+        history = [
+            item for item in target.history
+            if not any(str(item.get(key) or "") in invalid_ids
+                       for key in ("_message_stable_id", "source_message_id"))
+            and (not target.reference or item.get("is_reference"))
+        ]
         existing = {
             (str(item.get("content") or ""), str(item.get("content_type") or ""))
             for item in history
         }
         for event in resolved_events[:-1]:
+            if target.reference or self._source_invalid_for_context(event):
+                continue
             content = self._attachment_marker(event)
             key = (content, event.content_type)
             replaced_history_item = False
@@ -152,6 +164,8 @@ class WechatDesktopMaterializeMixin:
                         "sender_name": event.sender_name,
                         "content": content,
                         "content_type": event.content_type,
+                        "_message_stable_id": event.message_stable_id,
+                        "source_message_id": event.source_message_id,
                     }
                 )
                 existing.add(key)
@@ -170,7 +184,22 @@ class WechatDesktopMaterializeMixin:
         target.history = history
         target.task.source_event_ids = source_event_ids
         target.task.batch_id = batch_id
+        # 队列等待期间前序来源也可能被撤回。保存轻量原生证据供投递时复核，
+        # 不复制 task 或历史，避免循环引用与重复保存整个聚合上下文。
+        target.task.context_source_events = [
+            WechatDesktopEvent(**{**event.to_dict(), "history": []})
+            for event in resolved_events[:-1]
+            if event.source_message_id and not target.reference
+            and not self._source_invalid_for_context(event)
+        ]
         target.task.cache_only = bool(resolved_events) and all((event.content_type == 'file' and (not event.reference) for event in resolved_events))
+        target.task.file_cache_results = {
+            event.event_id: bool(
+                event.attachment_status == "materialized" and os.path.isfile(event.content)
+            )
+            for event in resolved_events
+            if event.content_type == "file" and not event.reference
+        }
         target.task.attachment_reference_required = self._requires_attachment_reference(target)
         self._mark_lifecycle(
             source_event_ids,
@@ -180,15 +209,14 @@ class WechatDesktopMaterializeMixin:
         return target
 
     @staticmethod
+    def _source_invalid_for_context(event: WechatDesktopEvent) -> bool:
+        return (event.attachment_status == "source_invalid"
+                or str(event.reference.get("fetch_status") or "").lower() == "source_invalid")
+
+    @staticmethod
     def _has_referenced_attachment(event: WechatDesktopEvent) -> bool:
-        """任何未解析引用都在 FIFO 队首占用微信窗口定位原文。"""
-        if not event.reference:
-            return False
-        reference_type = str(event.reference.get("content_type") or "").lower()
-        return (
-            reference_type in {"file", "image", "share_card"}
-            or not bool(event.reference.get("resolved", False))
-        )
+        """需要界面操作的引用推迟到 FIFO 队首；已有链接交给 Agent。"""
+        return reference_requires_uia(event.reference)
 
     def _prepare_deferred_materialization(
         self, events: list[WechatDesktopEvent]
@@ -241,14 +269,19 @@ class WechatDesktopMaterializeMixin:
                     self._finish_lifecycle(event_ids, "stopped")
                 elif bool(materialized.task.cache_only):
                     for event_id in event_ids:
-                        self._store.mark_event_processed(event_id, "cached")
+                        cached = materialized.task.file_cache_results.get(event_id, False)
+                        state = "cached" if cached else "observed"
+                        self._store.mark_event_processed(
+                            event_id, state, "" if cached else "attachment_unavailable"
+                        )
+                        self._finish_lifecycle([event_id], state)
                     self._trace(
-                        "09-file-cached",
-                        "conversation=%s messages=%s",
+                        "09-file-cache",
+                        "conversation=%s messages=%s cached=%s",
                         materialized.conversation_name,
                         len(event_ids),
+                        sum(materialized.task.file_cache_results.values()),
                     )
-                    self._finish_lifecycle(event_ids, "cached")
                 else:
                     self._enqueue_reply_event(materialized)
             except Exception:

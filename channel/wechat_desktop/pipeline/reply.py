@@ -27,8 +27,6 @@ class WechatDesktopReplyMixin:
             return "skipped"
         validation = self._driver.validate_reply_target(event)
         if not validation.valid:
-            if validation.replacement_event is not None:
-                self._accept_replacement_event(validation.replacement_event)
             self._store.audit(
                 "send_text",
                 target_name,
@@ -89,9 +87,6 @@ class WechatDesktopReplyMixin:
     def _send_deferred_attachment_notice(self, item: ReplyQueueItem) -> bool:
         return AgentReplyCoordinator(self).send_attachment_notice(item)
 
-    def _send_share_content_fetch_notice(self, item: ReplyQueueItem) -> bool:
-        return AgentReplyCoordinator(self).send_share_fetch_notice(item)
-
     _best_effort = staticmethod(best_effort)
 
     def _consume_reply_queue(self):
@@ -104,7 +99,6 @@ class WechatDesktopReplyMixin:
         ).run()
 
     def _on_reply_worker_error(self, item, exc):
-        self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
         self._best_effort("worker_error", self._service.update_status, last_error=str(exc))
 
     def _on_reply_worker_finish(self, item, terminal):
@@ -131,23 +125,12 @@ class WechatDesktopReplyMixin:
         )
         if deferred_events:
             try:
-                # 延迟物化会打开图片查看器或定位文件，必须纳入独占回复周期。
-                self._driver.begin_reply_cycle(
-                    item.event.conversation_name,
-                    item.event.conversation_id,
-                )
+                # 附件组件在实际 UI 操作段取得租约，避免与发送争抢窗口。
                 # 分享卡片打开内置浏览器时不发进度提示：发送会和浏览器
                 # 小窗抢同一个微信窗口，实际经常发不出去。
                 notice_sent = self._send_deferred_attachment_notice(item)
 
-                def before_share_fetch():
-                    nonlocal notice_sent
-                    if not notice_sent:
-                        notice_sent = self._send_share_content_fetch_notice(item)
-
-                materialized = self._materialize_batch(
-                    deferred_events, before_share_fetch=before_share_fetch
-                )
+                materialized = self._materialize_batch(deferred_events)
                 materialized.task.preflight_attachment_notice_sent = notice_sent
                 item.event = materialized
             except Exception:
@@ -201,7 +184,6 @@ class WechatDesktopReplyMixin:
                         notice_exc,
                     )
             if not reference_required:
-                self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
                 self._mark_lifecycle(item.source_event_ids, "agent_done")
             self._best_effort(
                 "reply_audit", self._store.audit, "reply_queue",
