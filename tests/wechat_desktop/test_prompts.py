@@ -215,8 +215,42 @@ def test_direct_reference_links_use_common_reader(reference):
 
     assert _link_reading_urls(event) == ["https://example.invalid/post"]
     instruction = _link_reading_instruction(event)
-    assert "skills/analyze-url/SKILL.md" in instruction
+    assert "<available_skills> 中查找 analyze-url" in instruction
+    assert "<location> 绝对路径" in instruction
+    assert "skills/analyze-url/SKILL.md" not in instruction
     assert "navigate" in instruction and "snapshot" in instruction and "get_text" in instruction
+
+
+def test_link_skill_catalog_path_is_readable_outside_agent_workspace(tmp_path):
+    from xml.etree import ElementTree
+
+    from agent.skills.formatter import format_skills_for_prompt
+    from agent.skills.loader import SkillLoader
+    from agent.tools.read.read import Read
+
+    workspace = tmp_path / "agent workspace"
+    workspace.mkdir()
+    skill_dir = tmp_path / "project skills" / "analyze-url"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: analyze-url\ndescription: Synthetic URL reader\n---\n"
+        "Synthetic reader instructions outside the workspace.\n", encoding="utf-8")
+    skills = SkillLoader().load_skills_from_dir(str(skill_dir.parent), source="custom").skills
+    catalog = ElementTree.fromstring(format_skills_for_prompt(skills).strip())
+    location = catalog.find("skill/location").text
+    reader = Read({"cwd": str(workspace)})
+
+    # Reproduce the reported error even though the skill is installed.
+    assert reader.execute({"path": "skills/analyze-url/SKILL.md"}).status == "error"
+    result = reader.execute({"path": location})
+    assert result.status == "success"
+    assert "Synthetic reader instructions outside the workspace." in result.result["content"]
+    assert location == str(skill_file)
+    instruction = _link_reading_instruction(_link_event("读取 https://example.invalid/post"))
+    assert "<available_skills> 中查找 analyze-url" in instruction
+    assert "<location> 绝对路径" in instruction
+    assert "skills/analyze-url/SKILL.md" not in instruction
 
 
 @pytest.mark.parametrize("content,expected", [

@@ -129,7 +129,9 @@ def test_dispatch_current_and_quoted_links_request_agent_browser_reading(referen
     prompt = captured["content"]
     link_requirement = prompt.split("[链接读取要求]", 1)[1]
     assert "https://example.invalid/current?signature=synthetic%2Fvalue" in link_requirement
-    assert "skills/analyze-url/SKILL.md" in link_requirement
+    assert "<available_skills> 中查找 analyze-url" in link_requirement
+    assert "<location> 绝对路径" in link_requirement
+    assert "skills/analyze-url/SKILL.md" not in link_requirement
     assert "navigate" in link_requirement and "snapshot" in link_requirement
     assert "old-history" not in link_requirement
     if reference:

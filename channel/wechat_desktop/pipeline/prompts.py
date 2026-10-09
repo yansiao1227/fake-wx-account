@@ -106,7 +106,9 @@ def _link_reading_instruction(event: WechatDesktopEvent) -> str:
         "[链接读取要求]\n"
         "当前文字或直接引用含有尚未读取的链接：\n"
         + "\n".join(f"- {url}" for url in urls)
-        + "\n请先调用 read 读取可用的 skills/analyze-url/SKILL.md，再按技能使用工具读取链接内容。"
+        + "\n请先在系统提供的 <available_skills> 中查找 analyze-url，"
+        "调用 read 时使用该条目的 <location> 绝对路径读取 SKILL.md，再按技能使用工具读取链接内容。"
+        "不要把技能名拼成相对于 Agent 工作区的路径；没有匹配条目时不要猜测技能目录。"
         "技能不可用时，直接使用现有 browser 或 web_fetch 工具；不要因为缺少技能就跳过读取。"
         "网页应读取实际正文：第三方分享或动态页面优先使用 browser 的 navigate，"
         "从返回的 snapshot 读取页面，必要时再调用 snapshot 或 get_text 提取正文。"
