@@ -31,7 +31,6 @@ class WechatDesktopService:
             "reply_in_flight": False,
             "reply_conversation": "",
             "uia_available": False,
-            "shell_hook_active": False,
             "owner_name": "",
             "owner_source": "unknown",
             "queue_depth": 0,

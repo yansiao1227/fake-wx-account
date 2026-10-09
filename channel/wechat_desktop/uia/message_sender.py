@@ -292,6 +292,8 @@ class WechatMessageSender:
                 if send_button is not None:
                     client._click_send_button(send_button)
                 else:
+                    if client._wait_for_keyboard_focus(control) is not True:
+                        raise SendNotSubmitted("WeChat input focus could not be confirmed before Enter")
                     mark_send_submitted()
                     win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
                     win32api.keybd_event(
@@ -331,11 +333,11 @@ class WechatMessageSender:
         chunks = client._split_message_text(text, chunk_limit)
         # ``_send_lock`` only serializes competing senders. Humanized pacing
         # (send interval + per-conversation cooldown) waits under it but
-        # OUTSIDE ``uia_section``/``operation_lock``, so conversation scanning
-        # and attachment reads keep running while this sender sleeps. Each
+        # OUTSIDE ``uia_section``/``operation_lock``, so independent attachment
+        # reads keep running while this sender sleeps. Each
         # chunk then performs its bounded UI work (focus, locate, paste,
         # verify) inside an exclusive UIA section; the per-chunk
-        # focus/locate/title checks make interleaved scans safe.
+        # focus/locate/title checks reject a target changed between sections.
         with send_lock(client._send_lock):
             logger.info(
                 "[WechatDesktop] sending text: target=%s chars=%s chunks=%s "
@@ -366,7 +368,7 @@ class WechatMessageSender:
                             # still shows a different chat title (failed session
                             # switch).
                             self._verify_active_target(who)
-                            before = client.get_chat_history(limit=5)
+                            before = client.get_send_bubble_snapshot(conversation=who, limit=5)
                             with client._clipboard(unicode_text=chunk):
                                 try:
                                     check_send_allowed()
@@ -393,25 +395,8 @@ class WechatMessageSender:
                             now = time.monotonic()
                             client._last_send_at = now
                             client._last_conversation_send[str(who)] = now
-                        if result.get("verified"):
-                            client.remember_outgoing_message(
-                                who,
-                                chunk,
-                                str(result.get("runtime_id") or ""),
-                            )
-                        else:
-                            # Sent-but-unverified: the UI action completed but the
-                            # outgoing bubble was not confirmed in time. We do NOT
-                            # retry (to avoid duplicates), so treat the message as
-                            # "probably sent" and suppress the echo.  Register the
-                            # text without a runtime_id so is_known_outgoing_message
-                            # can still match on content and prevent a self-reply
-                            # loop if the bubble appears on the next scan.
-                            client.remember_outgoing_message(who, chunk)
                     except Exception as exc:
                         if results or attempt.submitted:
-                            if attempt.submitted:
-                                client.remember_outgoing_message(who, chunk)
                             return self._interrupted_result(results, len(chunks), attempt.submitted, exc)
                         if isinstance(exc, SendCancelled):
                             raise
@@ -452,7 +437,7 @@ class WechatMessageSender:
                         if not client.locate_conversation(who, runtime_id, row_index):
                             raise RuntimeError(f"Conversation is not visible: {who}")
                         self._verify_active_target(who)
-                        before = client.get_chat_history(limit=5)
+                        before = client.get_send_bubble_snapshot(conversation=who, limit=5)
                         with client._clipboard(files=paths):
                             check_send_allowed()
                             client._paste_and_send()
@@ -461,10 +446,6 @@ class WechatMessageSender:
                     now = time.monotonic()
                     client._last_send_at = now
                     client._last_conversation_send[str(who)] = now
-                    if result.get("verified"):
-                        client.remember_outgoing_message(
-                            who, runtime_id=str(result.get("runtime_id") or "")
-                        )
                     return result
                 except Exception as exc:
                     if attempt.submitted:
@@ -520,7 +501,7 @@ class WechatMessageSender:
         deadline = time.time() + 3.0
         while time.time() < deadline:
             time.sleep(0.15)
-            after = client.get_chat_history(limit=5)
+            after = client.get_send_bubble_snapshot(conversation=who, limit=5)
             after_counts = Counter(signature(item) for item in after)
             after_outgoing = Counter(signature(item) for item in after if item.direction == "outgoing")
             snapshot_increased = (len(after) > len(before)

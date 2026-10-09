@@ -32,8 +32,8 @@ class WechatDesktopScanMixin:
     def _poll_once(self):
         """执行一次观察、持久化、策略过滤和路由。
 
-        首次扫描默认建立基线而不回复旧消息，但会按配置处理会话列表明确标记的
-        未读消息。通过全部安全门的事件才会进入后续队列。
+        数据库来源固定启动基线与未读边界。来源记录、事件和游标必须先整批
+        提交，再进入后续队列；此处不接受界面快照作为消息来源。
         """
         self._lifecycle.advance_scan()
         observation, events = self._driver.observe_events()
@@ -56,9 +56,8 @@ class WechatDesktopScanMixin:
         self.login_status = "logged_in"
         self._service.update_status(
             login_status=self.login_status,
-            mode=observation.get("mode", "uia"),
+            mode=observation.get("mode", "db_uia"),
             uia_available=observation.get("uia_available", False),
-            shell_hook_active=observation.get("shell_hook_active", False),
             owner_name=observation.get("owner_name", ""),
             owner_source=observation.get("owner_source", "unknown"),
             last_observation_at=now,
@@ -83,44 +82,21 @@ class WechatDesktopScanMixin:
             }
             for receipt in receipts:
                 if receipt.accepted:
-                    self._admit_received_event(events_by_id[receipt.observed_event_id], False, {})
+                    self._admit_received_event(events_by_id[receipt.observed_event_id])
             self._driver.acknowledge_events([source_batch.batch_id])
-            self._bootstrapped = True
             self._cleanup_after_poll(now)
             return
 
-        first_poll = not self._bootstrapped
-        baseline_history_exists = {}
-        if first_poll:
-            baseline_history_exists = {
-                event.conversation_id: self._store.has_conversation_history(
-                    event.conversation_id
-                )
-                for event in events
-                if event.kind == "message"
-            }
-        for event in events:
-            if first_poll and not self.config.get("bootstrap_existing_messages", False):
-                event.task.baseline_only = not (
-                    self.config.get("process_startup_unread_messages", True) and event.session_unread_count > 0
-                )
-            try:
-                receipt = self._store.receive_event(event)
-            except Exception as exc:
-                # 未持久化不 ACK：后端下轮交付同一个事件，不能提前抑制它。
-                self._service.update_status(last_error=f"event receipt failed: {exc}")
-                logger.exception("[WechatDesktop] event receipt failed")
-                continue
-            if receipt.accepted:
-                self._admit_received_event(event, first_poll, baseline_history_exists)
-            self._driver.acknowledge_events([receipt.observed_event_id])
-        self._bootstrapped = True
+        if events:
+            # 接收只接受数据库来源事务，禁止退回单条 UIA 事件登记。
+            self._service.update_status(last_error="source_batch_required")
+            return
         self._cleanup_after_poll(now)
 
-    def _admit_received_event(self, event, first_poll, baseline_history_exists):
+    def _admit_received_event(self, event):
         self._start_lifecycle(event)
         try:
-            self._process_received_event(event, first_poll, baseline_history_exists)
+            self._process_received_event(event)
         except Exception as exc:
             self._store.mark_event_processed(event.event_id, "failed", "admission_failed")
             self._finish_lifecycle([event.event_id], "failed")
@@ -139,14 +115,8 @@ class WechatDesktopScanMixin:
             )
             self._last_cleanup_at = now
 
-    def _process_received_event(self, event, first_poll, baseline_history_exists):
+    def _process_received_event(self, event):
         """持久化接收后的单事件路由；所有拒绝也必须有可查询终态。"""
-        # 数据库来源的历史已与接收游标一起提交；这里仅补写 UIA 快照历史。
-        if event.kind == "message" and not event.source_message_id and not (
-            (first_poll or event.task.baseline_only)
-            and baseline_history_exists.get(event.conversation_id, False)
-        ):
-            self._store.append_event_history(event)
         if event.kind != "message":
             self._trace(
                 "08-request",
@@ -157,38 +127,17 @@ class WechatDesktopScanMixin:
             self._store.mark_event_processed(event.event_id)
             self._finish_lifecycle([event.event_id], "skipped")
             return
-        if event.source_message_id:
-            reason = ""
-            if event.direction != "incoming":
-                reason = "source_not_incoming"
-            elif event.receipt_phase in {"baseline", "offline_backfill"}:
-                reason = event.receipt_phase
-            elif event.receipt_phase == "startup_unread" and not self.config.get("process_startup_unread_messages", True):
-                reason = "startup_unread_disabled"
-            if reason:
-                self._store.mark_event_processed(event.event_id, "skipped", reason)
-                self._finish_lifecycle([event.event_id], "skipped")
-                return
-        process_startup_unread = bool(
-            self.config.get("process_startup_unread_messages", True)
-        )
-        startup_unread_event = bool(
-            process_startup_unread and event.session_unread_count > 0
-        )
-        if (
-            not event.source_message_id
-            and (first_poll or event.task.baseline_only)
-            and not bool(
-                self.config.get("bootstrap_existing_messages", False)
-            )
-            and not startup_unread_event
-        ):
-            self._trace(
-                "08-skip",
-                "id=%s reason=initial_baseline",
-                event.event_id[:10],
-            )
-            self._store.mark_event_processed(event.event_id, "skipped", "startup_baseline")
+        reason = ""
+        if not event.source_message_id:
+            reason = "native_source_required"
+        elif event.direction != "incoming":
+            reason = "source_not_incoming"
+        elif event.receipt_phase in {"baseline", "offline_backfill"}:
+            reason = event.receipt_phase
+        elif event.receipt_phase == "startup_unread" and not self.config.get("process_startup_unread_messages", True):
+            reason = "startup_unread_disabled"
+        if reason:
+            self._store.mark_event_processed(event.event_id, "skipped", reason)
             self._finish_lifecycle([event.event_id], "skipped")
             return
         if (
@@ -433,16 +382,3 @@ class WechatDesktopScanMixin:
                 event_ids.extend(event.event_id for event in events)
             self._pending_private_batches.clear()
         return event_ids
-
-    def _accept_replacement_event(self, event: WechatDesktopEvent):
-        """发送前发现目标已更新时，用相同安全门重新接纳替代事件。"""
-        receipt = self._store.receive_event(event)
-        if receipt.accepted:
-            self._start_lifecycle(event)
-            try:
-                self._process_received_event(event, False, {})
-            except Exception:
-                self._store.mark_event_processed(event.event_id, "failed", "replacement_admission_failed")
-                self._finish_lifecycle([event.event_id], "failed")
-                raise
-        self._driver.acknowledge_events([receipt.observed_event_id])

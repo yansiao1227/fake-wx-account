@@ -9,6 +9,7 @@ from channel.wechat_desktop.pipeline.prompts import (
     DEFAULT_BOT_MENTION_ALIASES,
     _format_agent_notice,
     _is_user_visible_tool_notice,
+    _link_reading_instruction,
     _preflight_tool_notice_data,
     _render_event_context_lines,
     _reply_requirements,
@@ -75,31 +76,6 @@ class AgentReplyCoordinator:
             )
             return False
 
-    def send_share_fetch_notice(self, item: ReplyQueueItem) -> bool:
-        """内置浏览器读不到正文、回退到 web_fetch 时补发一次进度提示。"""
-        channel = self.channel
-        if not bool(channel.config.get("agent_tool_notice_enabled", True)):
-            return False
-        context = {
-            "msg": WechatDesktopMessage(item.event),
-            "receiver": item.event.conversation_id or item.event.conversation_name,
-            "isgroup": item.event.is_group,
-            "wechat_desktop_queue_token": item.token,
-            "wechat_desktop_source_type": item.event.source_type,
-            "wechat_desktop_source_event_ids": list(item.source_event_ids),
-        }
-        try:
-            return channel._send_agent_tool_notice(
-                context,
-                {
-                    "tool_name": "web_fetch",
-                    "notice_template_key": "share_content_fetch_notice_templates",
-                },
-            )
-        except Exception as exc:
-            logger.warning("[WechatDesktop] share content fetch notice failed: %s", exc)
-            return False
-
     def build_image_prompt(self, event: WechatDesktopEvent) -> str:
         """把本地图片路径转换为明确要求调用 vision 的文字提示。"""
         channel = self.channel
@@ -122,6 +98,27 @@ class AgentReplyCoordinator:
         的指令。返回 ``True`` 表示已成功交给 Agent，最终发送状态由回调完成。
         """
         channel = self.channel
+        if (event.task.source_invalid or event.attachment_status == "source_invalid"
+                or str((event.reference or {}).get("fetch_status") or "").lower() == "source_invalid"):
+            # 来源失效的任务不交给 Agent，避免其依据旧 URL 发起工具读取。
+            return False
+        if event.source_message_id:
+            validation = channel._driver.validate_reply_target(event)
+            if not validation.valid:
+                return False
+        invalid_context_ids = set()
+        for source in event.task.context_source_events:
+            if not channel._driver.validate_reply_target(source).valid:
+                invalid_context_ids.update(
+                    identity for identity in (source.message_stable_id, source.source_message_id) if identity
+                )
+        if invalid_context_ids:
+            # FIFO 恢复的是入队时历史；实际投递前再剔除等待期间变化的前序来源。
+            event.history = [
+                item for item in event.history
+                if not any(str(item.get(key) or "") in invalid_context_ids
+                           for key in ("_message_stable_id", "source_message_id"))
+            ]
         msg = WechatDesktopMessage(event)
         ctype = msg.ctype
         content = msg.content
@@ -176,7 +173,7 @@ class AgentReplyCoordinator:
                 event.event_id[:10],
                 event.conversation_name,
                 len(history_items),
-                "visible",
+                "wechat_database" if event.source_message_id else "visible",
             )
             history_heading, history_lines = _render_event_context_lines(event)
             sections = []
@@ -205,6 +202,9 @@ class AgentReplyCoordinator:
             )
             if attachment_instruction:
                 sections.append(attachment_instruction)
+            link_instruction = _link_reading_instruction(event)
+            if link_instruction:
+                sections.append(link_instruction)
             content = "\n".join(sections)
             if event.is_group:
                 content = _strip_group_bot_mentions(
@@ -232,7 +232,6 @@ class AgentReplyCoordinator:
                 context.get("session_id"),
                 context.type,
             )
-            context["wechat_desktop_reply_cycle"] = True
             context["wechat_desktop_queue_token"] = queue_token
             context["wechat_desktop_queue_terminal"] = "completed"
             context["wechat_desktop_source_event_ids"] = list(
@@ -244,38 +243,29 @@ class AgentReplyCoordinator:
             context["wechat_desktop_agent_notice_sent"] = bool(
                 event.task.preflight_attachment_notice_sent
             )
-            channel._driver.begin_reply_cycle(
-                event.conversation_name, event.conversation_id
-            )
-            try:
-                # 附件物化阶段的进度通知可以提前发；Agent 侧等到真正开始
-                # 调用用户可理解的工具后再发，避免猜错下一步工具。
-                if bool(channel.config.get("agent_preflight_notice_enabled", False)):
-                    notice_data = _preflight_tool_notice_data(event)
-                    if (
-                        notice_data
-                        and not context["wechat_desktop_agent_notice_sent"]
-                        and bool(channel.config.get("agent_tool_notice_enabled", True))
-                        and channel._is_user_visible_tool_notice(notice_data)
-                    ):
-                        try:
-                            context["wechat_desktop_agent_notice_sent"] = (
-                                channel._send_agent_tool_notice(context, notice_data)
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "[WechatDesktop] Agent preflight notice failed: %s",
-                                exc,
-                            )
-                context["on_event"] = channel._make_agent_event_callback(context)
-                if event.task.source_invalid:
-                    channel._finish_reply_cycle(context)
-                    return False
-                channel.produce(context)
-            except Exception:
-                context["wechat_desktop_reply_cycle"] = False
-                channel._driver.end_reply_cycle()
-                raise
+            # 附件物化阶段的进度通知可以提前发；Agent 侧等到真正开始
+            # 调用用户可理解的工具后再发，避免猜错下一步工具。
+            if bool(channel.config.get("agent_preflight_notice_enabled", False)):
+                notice_data = _preflight_tool_notice_data(event)
+                if (
+                    notice_data
+                    and not context["wechat_desktop_agent_notice_sent"]
+                    and bool(channel.config.get("agent_tool_notice_enabled", True))
+                    and channel._is_user_visible_tool_notice(notice_data)
+                ):
+                    try:
+                        context["wechat_desktop_agent_notice_sent"] = (
+                            channel._send_agent_tool_notice(context, notice_data)
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[WechatDesktop] Agent preflight notice failed: %s",
+                            exc,
+                        )
+            context["on_event"] = channel._make_agent_event_callback(context)
+            if event.task.source_invalid:
+                return False
+            channel.produce(context)
             return True
         channel._trace(
             "09-dropped",
@@ -355,7 +345,6 @@ class AgentReplyCoordinator:
             or context.get("receiver", "")
         )
         event = getattr(msg, "event", None)
-        conversation_id = str(getattr(event, "conversation_id", "") or target_id)
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
         if queue_token and not channel._reply_queue.is_active(queue_token):
             return False
@@ -392,16 +381,11 @@ class AgentReplyCoordinator:
         ):
             return False
 
-        channel._driver.register_interim_text(conversation_id, notice)
-        try:
-            result = channel._deliver(send_target, notice, policy_target=target_name,
-                                   is_group=is_group, interim=True, token=queue_token,
-                                   source_event_ids=context.get("wechat_desktop_source_event_ids", []))
-            if not result.get("success"):
-                raise RuntimeError(str(result.get("message") or "send failed"))
-        except Exception:
-            channel._driver.forget_interim_text(conversation_id, notice)
-            raise
+        result = channel._deliver(send_target, notice, policy_target=target_name,
+                               is_group=is_group, interim=True, token=queue_token,
+                               source_event_ids=context.get("wechat_desktop_source_event_ids", []))
+        if not result.get("success"):
+            raise RuntimeError(str(result.get("message") or "send failed"))
 
         channel._store.append_conversation_history(
             conversation_id=target_id,

@@ -1,22 +1,40 @@
 ---
 title: 桌面微信自动化
-description: 使用 Windows UI Automation 操作单个微信 4.1.9.30 窗口
+description: 从微信本地数据库接收消息，使用 Windows UI Automation 执行界面操作
 ---
 
-`wechat_desktop` 通道直接通过 Windows UI Automation 操作本机已登录的微信 4.1.9.30，不使用截图、OCR、视觉大模型或独立自动化服务器。
+`wechat_desktop` 通道在 Windows 上使用 `db_uia` 后端。微信本地加密数据库是消息、联系人和聊天历史的唯一读取来源；Windows UI Automation（UIA）负责定位会话、发送以及必要的附件操作。UIA 接收后端和 Shell Hook 监听已移除。
 
-## 安装
+当前实现面向微信 **4.1.9.30** 和本工作站 Conda 环境中的 **Python 3.13.11 x64**。数据库访问只读，不修改微信进程内存或原始库，只能读取已经同步到本机的数据。
 
-使用 Windows 10/11 和 Python 3.13+：
+## 项目架构
+
+| 组件 | 职责 |
+| --- | --- |
+| `backend.py` / `hybrid.py` | 公共接口，以及数据库来源和 UIA 操作的组合 |
+| `db/source.py` | 账号生命周期、固定启动基线、各来源分页与批次 ACK |
+| `db/reader.py`、`db/cache.py` | 数据库定位、认证解密、WAL 刷新、结构与消息解析 |
+| `binding.py` | 将稳定数据库会话 ID 绑定到唯一账号、窗口和 UIA 会话行 |
+| `uia/gateway.py`、`uia/materializer.py` | 共享 UI 操作租约、发送和经过验证的附件物化 |
+| `pipeline/`、`storage/` | 准入策略、聚合、回复队列、Agent 执行、发送账本和来源接收事务 |
+
+数据库包不依赖 UIA。普通消息观察、联系人检索和指定会话 ID 的历史查询不会创建 UIA 网关、切换微信前台或执行 OCR。默认查询当前会话历史时，UIA 被动读取标题并核验账号，正文仍从数据库读取。实际发送和必要的附件物化可以激活微信。
+
+普通发送使用独立 UIA 气泡快照，不执行 OCR。显式 UIA 历史诊断和分享卡片复制链接菜单后备才按需加载 OCR，启动时不预加载。
+
+## 安装与启动
+
+使用 Windows 10/11 和 Conda 环境 `cowagent-wechat`。本工作站第一次执行任何 Python 命令前，先核验解释器：
 
 ```powershell
-python -m pip install -r requirements-windows.txt
+Set-Location D:\workshop\repositories\fake-wx-account
+D:\Miniconda\envs\cowagent-wechat\python.exe -c "import sys; print(sys.executable)"
+D:\Miniconda\envs\cowagent-wechat\python.exe -m pip install -r requirements-windows.txt
 ```
 
-启动并登录且只登录一个桌面微信实例，然后配置：
+核验输出必须为 `D:\Miniconda\envs\cowagent-wechat\python.exe`。依赖包括 `pycryptodome` 和 `zstandard==0.25.0`，不安装上游完整自动化包。
 
-通道业务配置写在 `channel/wechat_desktop/config.py`（唯一源）。根目录 `config.json`
-只放模型、Agent、`channel_type` 等通用项，**不要**写 `wechat_desktop` 段。启用通道时全局只需：
+保持一个微信实例登录。通道业务配置的唯一来源是 `channel/wechat_desktop/config.py`；根目录 `config.json` 只放模型、Agent、进程等通用项。启用通道只需配置：
 
 ```json
 {
@@ -24,33 +42,115 @@ python -m pip install -r requirements-windows.txt
 }
 ```
 
-在 `channel/wechat_desktop/config.py` 中配置 `self_display_name`、`shadow_mode`、
-白名单等。微信没有通过 UIA 暴露当前账号时使用 `self_display_name`；
-若配置昵称与 UIA 读取结果不一致，自动发送会停止。
+不要添加根 JSON 的 `wechat_desktop` 段或通道专用键。云厂商密钥优先存放于 `~/.cow/.env`，不写入通道配置或文档。
 
-## 消息处理
+首次受控验证前先停止项目，然后在通道 `DEFAULT_CONFIG` 中设置：
 
-Windows Shell Hook 的任务栏闪烁事件负责唤醒观察器，同时每 15 秒只检查一次会话行，以补偿前台消息或系统未触发闪烁的情况。通道最多读取当前已经显示的 5 个消息气泡，不向上滚动读取旧历史。
-
-每次会话变化都会读取一份最近 5 个可见气泡的 UIA 快照。私聊只选择最后一个右侧气泡之后的最新左侧消息；群聊只选择最新一条明确 `@自己` 的左侧消息。目标之外的气泡只作为历史交给模型，不会分别创建回复。气泡方向只由 UI 树中的气泡或头像左右位置决定，私聊不依赖用户名。
-
-需要回复的消息进入一个严格追加的全局内存 FIFO。私聊连续消息先按会话在 800ms 滑动窗口内聚合；Agent 开始后，新消息只排到当前任务之后，不替换或取消当前任务。只有明确的 `/steer` 与 `/cancel` 会绕过队列改变正在执行的任务。扫描阶段只读取消息身份和文字，目标确定后才按需解析并缓存附件。单独发送的图片或文件只在后台缓存，不会成为后续文字的隐式附件上下文；没有引用附件却询问“这是什么图”“文件讲了什么”等问题时，程序会要求先引用对应附件。生成结果直接通过 UIA 发送，不经过审批。CowAgent 停止时会丢弃尚未处理的内存队列。
-
-群聊必须同时满足：会话行显示 `[有人@我]`，并且具体消息气泡自身包含 `@自己的昵称`。不能因为前一条消息 @ 了自己，就把后续没有 @ 的普通消息一起入队。
-
-会话标题只用于展示，不能作为唯一 ID。同名联系人通过会话行的 UIA RuntimeId 和可见行序号区分。群聊预览带 `发送者:` 前缀时表示最近消息来自其他成员；没有该前缀时，不能只凭会话行变化把它当作新的入站消息。
-
-微信在后台时会先恢复到前台。UIA 树为 0 个节点时最多点击任务栏微信按钮恢复 3 次。所有读取和发送操作共用同一把 UIA 操作锁。
-
-Shell Hook、聚焦、选择会话、粘贴和发送之间采用可中断的保守等待区间；全局两次发送默认间隔 2–5 秒，同一会话默认至少间隔 5 秒。发送结果不明确时不会自动重试。
-
-## 冒烟测试
-
-诊断报告包含原始会话名称和消息内容，但不会截图：
-
-```powershell
-python scripts/test_wechat_uia.py
-python scripts/test_wechat_uia.py --conversation "文件传输助手"
+```python
+"desktop_backend": "db_uia",
+"shadow_mode": True,
+"db_data_dir": "",
+"db_account": "",
+"db_poll_interval_seconds": 1.0,
+"db_cache_dir": "",
 ```
 
-不要未经检查直接对外发送诊断报告。只有同时提供 `--send-to` 和 `--text` 才会发送消息。
+`db_uia` 是唯一支持的后端。空数据路径自动定位；空账号仅在能够唯一认证登录账号时有效。多账号歧义或非默认存储位置，应显式设置数据目录和账号目录名或完整路径，不按文件修改时间猜账号。
+
+开启自动回复前检查 `auto_reply_private_all`、`auto_reply_groups_all`、联系人/群白名单、黑名单和 `group_reply_mode`。当前配置全部放行私聊和群聊，黑名单优先；群聊在 `at_only` 下仍需原生 @ 元数据命中。`shadow_mode` 当前默认是 `False`，验证时需显式改为 `True`。数据库消息方向不依赖 `self_display_name` 推断。
+
+`shadow_mode` 只禁止发送内容，正式通道仍可能执行 Agent 和必要附件物化。需要不执行这些动作的数据库验证时，使用下文的 `--shadow-seconds` 专用诊断。
+
+前台启动命令：
+
+```powershell
+.\cow.ps1 start
+```
+
+`cow.ps1` 只支持 `start`、`stop`、`restart`、`status`，通过 Conda 查找 `cowagent-wechat`，日志直接输出到当前终端，不自动打开浏览器。按仓库 Web 配置，控制台位于 `http://127.0.0.1:9899`。正常停止按 `Ctrl+C`；修改配置后需重启进程。详细操作见[项目启动与关闭](../guide/wechat-desktop-service)。
+
+## 自动回复流程
+
+1. 数据库来源默认每秒轮询。每条消息身份包含账号、分片、消息表和原生主键，同文消息与跨分片同主键不会被合并为同一条。
+2. Reader 生成来源批次，并保留出站、系统或方向无法确认记录的过滤原因。Store 将来源去重、事件、过滤记录、业务历史和各来源游标一次提交；提交失败保留游标并重交付整批。成功后才 ACK；ACK 丢失后的重复交付不会再次进入回复队列。
+3. 路由只处理实时入站及符合条件的启动未读，随后应用黑名单和群触发规则。群 @ 使用数据库原生元数据，不要求会话预览显示 `[有人@我]`。
+4. 私聊可在执行前按滑动窗口聚合，群聊不聚合。任务进入有容量限制的全局 FIFO；新消息不会替换旧排队任务，也不会取消正在生成的任务。显式 `/steer`、`/cancel` 走控制路径。
+5. 实时事件携带数据库原生上文，明确引用则携带一层引用片段，普通文本不为获取上下文打开会话。附件仅按需物化；引用附件的 UI 操作延后到该任务位于回复队首时执行。
+6. 当前文本与一层引用中的链接交给 Agent 的 `analyze-url` 技能或通用工具读取后再回复。动态分享网页可用 `browser`，静态网页可用 `web_fetch`，文件链接按类型解析；已有可信正文不重复读取，无关历史链接不自动打开。已有原生分享 URL 无需 UIA 定位，只有缺少链接时才保留安全的微信原文读取。最终回复、工具进度和失败通知统一检查影子模式、暂停状态、黑白名单、发送限流及任务取消。
+7. 发送时才将数据库会话绑定到实际微信账号、窗口、RuntimeId、选中状态和标题。每个实际 UI 发送段复核已授权目标和生命周期。同名歧义、绑定变化或账号不一致时拒绝发送。界面没有原生会话身份时，绑定明确记录为 `display_name` 验证。
+
+首次启动只固定一次历史基线；仅在能证明未读边界时应用启动未读策略。重启补读默认只补账本和历史，不回复离线期间消息，也不重放已中断回复或不确定发送。ACK 代表接收已落库，不代表发送成功。
+
+引用优先通过原生 `svrid` 在同账号、同会话各分片回查唯一原消息，补齐文字、文件名及分享链接，只追溯一层。原消息身份、世代和内容摘要随引用保留，物化、Agent 执行及发送前复核；原文删除、修改或匹配有歧义时停止沿用。完整文字和已有链接无需 UIA，缺失原文或未知应用类型只有在安全关联成立时才用 UIA 定位备用。图片查看器、文件取得和对应工具解析保持可用，旧文件名/前缀缓存与仅服务 UIA 接收的解析入口已移除。
+
+发送按钮已尝试执行后，不因输入框仍返回旧值或气泡方向未知而再次按 Enter；
+保留 `uncertain` 等未确认结果，不自动重发。原生消息复核包含完整正文与引用/分享结构，
+物化后的本地路径不替代原生证据。
+
+## 本地库解密的使用时机
+
+| 操作 | 数据库行为 | UI 行为 |
+| --- | --- | --- |
+| 构造后端 | 创建来源与绑定对象，Reader 延迟创建 | 无 |
+| 首次观察或数据库查询 | 认证账号、获取并校验密钥，建立已验证明文快照 | 普通观察和指定 ID 查询无需 UI |
+| 文件无变化的轮询 | 检查主库与 WAL 状态，不解密页面、不重建快照 | 无 |
+| 同一 WAL 世代追加 | 核验新增帧、页 HMAC、校验和与提交边界，只发布已提交数据 | 无 |
+| checkpoint、WAL 重置/截断或库替换 | 重建快照 | 无 |
+| 联系人、历史或目标验证 | 按需刷新快照并查询，不推进接收游标 | 需要 UI 目标时才被动核验身份 |
+
+首次刷新全量解密主库并合并已验证的已提交 WAL 帧。刷新期间按 SQLite WAL 协议持有共享锁，避免与提交和 checkpoint 交错；全量重建时持锁时间随库规模增加，锁忙时重试。失败保留上一份已验证副本，标记陈旧、暂停新事件交付并保留游标，不自动切换为 UIA 接收。
+
+缓存默认位于 `<agent_workspace>/wechat_desktop_db/<account_id>/`。逐库密钥使用 Windows DPAPI 持久保存，目录 ACL 限制为当前用户和 LocalSystem。明文快照本身包含聊天数据，每个 Reader 使用独立文件，关闭时删除；进程重启或 Reader 重建后的首次刷新仍需全量解密。已有密钥缓存也不能跳过账号认证或保证完全不扫描微信进程。
+
+当前自动发现 `contact.db`、数字编号的 `message_*.db` 和用于启动未读边界的辅助 `session.db`。尚未接入 `sns.db`、朋友圈或加密媒体文件解码。
+
+## 联系人、历史与附件
+
+通过 `wechat_desktop` 工具检索联系人，取得稳定会话 ID：
+
+```json
+{"action": "search_contacts", "query": "联系人或群名", "limit": 20}
+```
+
+再将返回的原始 ID 交给 `wechat_history`：
+
+```json
+{"conversation_id": "查询返回的原始 ID", "limit": 20}
+```
+
+历史默认 20 条，最多 50 条，返回原生消息身份、时间、方向、发送者和来源。省略 `conversation_id` 时，被动读取当前 UI 标题并唯一映射到数据库会话。联系人和历史查询不触发回复、不改变实时游标。
+
+独立图片和分享卡片只观察，不主动打开；独立文件可按需缓存，明确引用可请求图片、文件或分享正文。缓存附件不会成为后续普通文本的隐式上下文。
+
+附件关联先要求 UIA `ScrollPattern` 证明聊天列表处于底部，再将最多 50 条数据库记录与最多 20 条可见消息做唯一后缀匹配，要求至少两种不同的规范化 `(类型, 内容)` 锚点，以及唯一目标外观和 RuntimeId。实际物化前再次核验账号、窗口、原生消息及两端序列。验证失败返回 `attachment_identity_unavailable`，拒绝附件点击。目标微信版本的真实 ScrollPattern 覆盖仍需实机验证，不能绕过缺失的证据。
+
+数据库附件流程不按文件名、大小或修改时间跨账号搜索缓存，只使用已验证气泡的复制路径
+或下载/另存为结果；等待期间继续检查账号、窗口、当前会话和 RuntimeId。
+已物化路径缓存绑定原生消息身份，不能代替关联与原生行复核。
+
+## 验证与来源说明
+
+只验证数据库且不执行 Agent 或发送消息，可运行：
+
+```powershell
+D:\Miniconda\envs\cowagent-wechat\python.exe scripts\wechat_db_doctor.py --schema
+D:\Miniconda\envs\cowagent-wechat\python.exe scripts\wechat_db_doctor.py --shadow-seconds 60
+```
+
+可增加 `--data-dir`、`--account`、`--cache-dir`、`--conversation-id`。影子诊断使用账号缓存下独立账本，报告健康、耗时和资源开销，并检查历史查询未改变游标。诊断输出不含密钥和正文，但独立账本仍可能包含聊天明文。
+
+`--benchmark-uia` 显式比较当前 UI 历史读取，是诊断能力，不是接收后备。UI 诊断可能执行 OCR 或操作窗口；`scripts/test_wechat_uia.py`、`scripts/dump_wechat_conversation_tree.py` 保留用于手工诊断，报告可能包含原始聊天内容。`--send-smoke`，或同时指定 `--send-to` 与 `--text`，会真实发送消息。
+
+回归命令必须使用指定解释器：
+
+```powershell
+D:\Miniconda\envs\cowagent-wechat\python.exe -m pytest tests/wechat_desktop -q
+```
+
+职责边界回归包括 `test_database_only_backend.py`、`test_db_passive_ui.py`、
+`test_db_reply_context.py`、`test_db_uia_attachment_bridge.py`、`test_uia_materializer.py` 与
+`test_uia_passive_reads.py`。
+
+合成库与控件替身测试不能证明真实账号兼容性、附件 ScrollPattern 可用性、受控新消息接收或实时 WAL 性能。启用自动回复前需另行完成影子验收。
+
+数据库格式参考 [wechatauto-replica 的固定提交 `fbfb02677f8f5c8d52be166dc2a662a836f1354d`](https://github.com/fanyuantaier/wechatauto-replica/tree/fbfb02677f8f5c8d52be166dc2a662a836f1354d)，来源与上游 Apache 2.0 许可证保留在 `channel/wechat_desktop/db/NOTICE` 和 `UPSTREAM_LICENSE.txt`。私有缓存、认证校验、来源账本和 UIA 组合由本项目实现。

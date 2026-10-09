@@ -4,7 +4,6 @@ import threading
 import time
 import sqlite3
 from contextlib import contextmanager, nullcontext
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,11 +19,11 @@ from channel.wechat_desktop.send_control import (
 )
 from channel.wechat_desktop.storage.store import WechatDesktopStore
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from channel.wechat_desktop.uia.driver import WechatUiaDriver, _UiaPriorityCoordinator
+from channel.wechat_desktop.uia.gateway import _UiaPriorityCoordinator
 from channel.wechat_desktop.uia.controls import _runtime_id
 from .helpers import (
-    ClickableGeometryControl, GeometryControl, FakeClient, FakeHook,
-    _selection_tree, incoming, row,
+    ClickableGeometryControl, GeometryControl,
+    _selection_tree,
 )
 
 
@@ -81,42 +80,6 @@ def test_row_index_cannot_disambiguate_same_name_sessions(same_name_sessions):
     assert not client.locate_conversation("同名", row_index=1)
 
 
-def test_scan_keeps_successful_events_and_retries_failed_read_without_unread_marker():
-    client = FakeClient()
-    client.rows = [row(name, runtime_id=name) for name in ("Alice", "Bob", "Carol")]
-    client.headers = {name: HeaderInfo(name, "private") for name in ("Alice", "Bob", "Carol")}
-    client.histories = {name: [incoming(name + " message", name + "-1")] for name in client.headers}
-    original = client.get_chat_history
-
-    def fail_second(name, *args, **kwargs):
-        if name == "Bob":
-            raise RuntimeError("stale control after opening chat")
-        return original(name, *args, **kwargs)
-
-    client.get_chat_history = fail_second
-    driver = WechatUiaDriver({"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook())
-    observation, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    assert [event.conversation_name for event in events] == ["Alice", "Carol"]
-    assert len(observation["scan_errors"]) == 1
-    client.get_chat_history = original
-    client.rows = [replace(item, not_read_number=0) for item in client.rows]
-    _, recovered = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in recovered])
-    assert [event.conversation_name for event in recovered] == ["Bob"]
-    assert driver.observe_events()[1] == []
-
-
-@pytest.mark.parametrize("stopped", [False, True])
-def test_failed_scan_retries_without_new_shell_hook_signal(stopped):
-    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
-    driver._retry_conversations.add("session")
-    waits = []
-    stop = SimpleNamespace(wait=lambda delay: waits.append(delay) or stopped)
-    assert driver.wait_for_changes(stop) == ("stopped" if stopped else "scan-retry")
-    assert waits and waits[0] > 0
-
-
 @pytest.mark.parametrize("known_group", [False, True])
 @pytest.mark.parametrize("mode,content,mention,expected", [
     ("all", "普通消息", False, True),
@@ -128,20 +91,11 @@ def test_failed_scan_retries_without_new_shell_hook_signal(stopped):
     ("at_or_prefix", "@小牛 帮忙", True, True),
     ("at_or_prefix", "普通消息", False, False),
 ])
-def test_group_trigger_modes_agree_between_discovery_and_policy(known_group, mode, content, mention, expected):
+def test_group_trigger_modes_use_native_event_metadata(known_group, mode, content, mention, expected):
     config = load_wechat_desktop_config({"group_reply_mode": mode, "auto_reply_groups": ["群"] if known_group else []})
-    client = FakeClient()
-    client.rows = [row("群", mention=mention)]
-    client.headers["群"] = HeaderInfo("群", "group", 3)
-    client.histories["群"] = [incoming(content, "group-1")]
-    driver = WechatUiaDriver(config, client=client, shell_hook=FakeHook())
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    assert bool(events) is expected
-    for event in events:
-        assert event.is_at is mention
-        assert WechatDesktopPolicy(config, None).group_triggered(event)
-        assert driver.validate_reply_target(event).valid
+    event = WechatDesktopEvent("message", "db-session:group", "群", "member", "成员", "text", content,
+                               is_group=True, is_at=mention, source_type="group")
+    assert WechatDesktopPolicy(config, None).group_triggered(event) is expected
 
 
 @pytest.fixture
@@ -151,7 +105,7 @@ def sender(monkeypatch):
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
     monkeypatch.setattr(client, "get_title", lambda: HeaderInfo("Alice", "private"))
-    monkeypatch.setattr(client, "get_chat_history", lambda **kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **kwargs: [])
     monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
     monkeypatch.setattr(client, "_wait_for_send_slot", lambda who: None)
 

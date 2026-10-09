@@ -5,7 +5,7 @@ import time
 from common.log import logger
 from channel.wechat_desktop.models import UiaChatMessage
 
-from channel.wechat_desktop.uia.controls import _text, _bounds
+from channel.wechat_desktop.uia.controls import _text, _bounds, _runtime_id
 
 
 class WechatShareBrowser:
@@ -116,8 +116,10 @@ class WechatShareBrowser:
             return 0
 
 
-    def _click_copy_link_menu(self, browser_hwnd: int) -> bool:
+    def _click_copy_link_menu(self, browser_hwnd: int, *, validate_context=None) -> bool:
         client = self.client
+        if validate_context is not None:
+            validate_context()
         menu_item = client._find_desktop_control("复制链接", "mmui::XMenuView")
         if menu_item is None:
             try:
@@ -136,6 +138,8 @@ class WechatShareBrowser:
             except Exception:
                 menu_item = None
         if menu_item is not None:
+            if validate_context is not None:
+                validate_context()
             return client._click_control_point(menu_item)
         # Some WebView builds do not expose menu text through UIA. OCR is only
         # allowed inside the already verified browser window and must recognize
@@ -161,6 +165,8 @@ class WechatShareBrowser:
             if len(matches) != 1:
                 return False
             line = matches[0]
+            if validate_context is not None:
+                validate_context()
             client._left_click_point(
                 (
                     int((line.bounds[0] + line.bounds[2]) / 2),
@@ -173,10 +179,21 @@ class WechatShareBrowser:
             return False
 
 
-    def _close_share_browser(self, browser_hwnd: int, main_hwnd: int) -> bool:
+    def _close_share_browser(self, browser_hwnd: int, main_hwnd: int, *, restore_main=True, expected_identity=None) -> bool:
         client = self.client
         import win32con
         import win32gui
+        import win32process
+
+        def verified():
+            if not client._is_verified_share_browser_window(browser_hwnd, main_hwnd):
+                return False
+            return expected_identity is None or (
+                int(win32process.GetWindowThreadProcessId(browser_hwnd)[1]),
+                str(win32gui.GetClassName(browser_hwnd))) == expected_identity
+
+        if not verified():
+            return False
 
         # The HWND has already passed the strict WeChatAppEx verification.
         # Do not enumerate the dynamic WebView UIA tree again just to find its
@@ -195,6 +212,8 @@ class WechatShareBrowser:
         deadline = time.monotonic() + timeout
         closed = False
         for attempt in range(2):
+            if not verified():
+                return False
             win32gui.PostMessage(browser_hwnd, win32con.WM_CLOSE, 0, 0)
             while time.monotonic() < deadline:
                 if not (
@@ -207,6 +226,8 @@ class WechatShareBrowser:
                     break
             if closed:
                 break
+        if not restore_main:
+            return closed
         restored = bool(closed and client._restore_main_window_after_viewer(main_hwnd))
         if restored:
             logger.info(
@@ -224,16 +245,79 @@ class WechatShareBrowser:
 
 
     def fetch_referenced_share_page(
-        self, message: UiaChatMessage
+        self, message: UiaChatMessage, *, strict=False, validate_target=None,
     ) -> tuple[str, str]:
         """Read a quoted share card in WeChat, falling back to its URL."""
 
         client = self.client
-        return client._fetch_referenced_share(message, direct_read=True)
+        return client._fetch_referenced_share(message, direct_read=True, strict=strict, validate_target=validate_target)
+
+    def _bound_share_guard(self, message, validate_target):
+        client = self.client
+        if not message.runtime_id:
+            raise RuntimeError("attachment_control_identity_unavailable")
+
+        def identity():
+            return (int(client.get_owner_window_handle()), int(client.get_owner_window_process_id()),
+                    str(client.get_title().title or ""))
+
+        if validate_target is not None and validate_target() is False:
+            raise RuntimeError("attachment_target_changed")
+        expected = identity()
+        if not all(expected):
+            raise RuntimeError("attachment_target_unavailable")
+
+        def require_context():
+            if validate_target is not None and validate_target() is False:
+                raise RuntimeError("attachment_target_changed")
+            if identity() != expected:
+                raise RuntimeError("attachment_target_changed")
+
+        return require_context
+
+    def _bound_share_control(self, root, message):
+        control = self.client._find_message_control(root, message)
+        return control if control is not None and _runtime_id(control) == message.runtime_id else None
+
+    def fetch_share_message_page(self, message, *, strict=False, validate_target=None):
+        """原文分享卡片由当前精确控件定位，数据库调用不能只有旧坐标。"""
+        client = self.client
+        if message.message_type != "share_card":
+            return "", ""
+        try:
+            require_context = self._bound_share_guard(message, validate_target) if strict else None
+            if require_context is not None:
+                require_context()
+            client.focus_window()
+            with client.operation_lock, client._uia_root() as root:
+                if require_context is not None:
+                    require_context()
+                control = (self._bound_share_control(root, message) if strict else
+                           client._find_message_control(root, message))
+                if strict and control is None:
+                    return "", ""
+                bounds = _bounds(control) if control is not None else message.bounds
+                if not bounds:
+                    return "", ""
+                point = client._share_card_activation_point(bounds)
+            if not strict:
+                return client._fetch_share_from_point(point, direct_read=True)
+
+            def before_click():
+                require_context()
+                with client.operation_lock, client._uia_root() as root:
+                    current = self._bound_share_control(root, message)
+                    if current is None or _bounds(current) != bounds:
+                        raise RuntimeError("attachment_share_control_changed")
+
+            return client._fetch_share_from_point(
+                point, direct_read=True, validate_before_click=before_click, validate_context=require_context)
+        except Exception:
+            return "", ""
 
 
     def _fetch_referenced_share(
-        self, message: UiaChatMessage, *, direct_read: bool
+        self, message: UiaChatMessage, *, direct_read: bool, strict=False, validate_target=None,
     ) -> tuple[str, str]:
         """Open a verified share-card quote and return page text plus fallback URL."""
 
@@ -246,13 +330,31 @@ class WechatShareBrowser:
         ):
             return "", ""
         try:
+            require_context = self._bound_share_guard(message, validate_target) if strict else None
+            if require_context is not None:
+                require_context()
             client.focus_window()
             with client.operation_lock, client._uia_root() as root:
-                control = client._find_message_control(root, message)
+                if require_context is not None:
+                    require_context()
+                control = (self._bound_share_control(root, message) if strict else
+                           client._find_message_control(root, message))
+                if strict and control is None:
+                    return "", ""
                 click_bounds = _bounds(control) if control is not None else message.bounds
                 if not click_bounds:
                     return "", ""
                 point = client._reference_image_activation_point(click_bounds)
+            if strict:
+                def before_click():
+                    require_context()
+                    with client.operation_lock, client._uia_root() as root:
+                        current = self._bound_share_control(root, message)
+                        if current is None or _bounds(current) != click_bounds:
+                            raise RuntimeError("attachment_share_control_changed")
+                return client._fetch_share_from_point(
+                    point, direct_read=direct_read, validate_before_click=before_click,
+                    validate_context=require_context)
             return client._fetch_share_from_point(point, direct_read=direct_read)
         except Exception as exc:
             logger.warning(
@@ -262,11 +364,12 @@ class WechatShareBrowser:
             return "", ""
 
 
-    def _read_share_browser_content(self, browser_hwnd: int) -> str:
+    def _read_share_browser_content(self, browser_hwnd: int, *, validate_context=None) -> str:
         """Read the rendered document from WeChat UIA, then use clipboard fallback."""
 
         client = self.client
-        value = client._wait_for_share_browser_content(browser_hwnd)
+        value = (client._wait_for_share_browser_content(browser_hwnd) if validate_context is None else
+                 client._wait_for_share_browser_content(browser_hwnd, validate_context=validate_context))
         if value:
             return value
         logger.info(
@@ -279,6 +382,8 @@ class WechatShareBrowser:
             import win32api
             import win32con
             import win32gui
+            if validate_context is not None:
+                validate_context()
 
             left, top, right, bottom = (
                 int(value) for value in win32gui.GetWindowRect(browser_hwnd)
@@ -286,6 +391,8 @@ class WechatShareBrowser:
             if right <= left or bottom <= top:
                 return ""
             win32gui.SetForegroundWindow(browser_hwnd)
+            if validate_context is not None:
+                validate_context()
             # Focus below the browser chrome so Ctrl+A targets the rendered page.
             content_point = (
                 int((left + right) / 2),
@@ -298,7 +405,11 @@ class WechatShareBrowser:
             )
 
             def copy_page():
+                if validate_context is not None:
+                    validate_context()
                 client._press_shortcut(win32api, win32con, ord("A"))
+                if validate_context is not None:
+                    validate_context()
                 client._press_shortcut(win32api, win32con, ord("C"))
                 client._paced_wait(
                     "uia_share_browser_clipboard_settle_ms_min",
@@ -308,6 +419,8 @@ class WechatShareBrowser:
             value = client._normalize_share_browser_content(
                 client._clipboard_unicode_after(copy_page)
             )
+            if validate_context is not None:
+                validate_context()
             if value:
                 logger.info(
                     "[WechatDesktop][share-browser] direct read success "
@@ -395,7 +508,7 @@ class WechatShareBrowser:
             return ""
 
 
-    def _wait_for_share_browser_content(self, browser_hwnd: int) -> str:
+    def _wait_for_share_browser_content(self, browser_hwnd: int, *, validate_context=None) -> str:
         """Poll until a usable UIA document remains stable for several probes."""
 
         client = self.client
@@ -444,8 +557,12 @@ class WechatShareBrowser:
             stable_required,
         )
         while True:
+            if validate_context is not None:
+                validate_context()
             probes += 1
             value = client._read_share_browser_uia_content_once(browser_hwnd)
+            if validate_context is not None:
+                validate_context()
             if len(value) > len(best):
                 best = value
                 logger.info(
@@ -532,7 +649,7 @@ class WechatShareBrowser:
 
 
     def _fetch_share_from_point(
-        self, point: tuple[int, int], *, direct_read: bool
+        self, point: tuple[int, int], *, direct_read: bool, validate_before_click=None, validate_context=None,
     ) -> tuple[str, str]:
         """Open one verified share browser and return rendered text or fallback URL."""
 
@@ -540,11 +657,18 @@ class WechatShareBrowser:
         main_hwnd = client.get_owner_window_handle()
         visible_before = client._visible_top_level_window_handles()
         browser_hwnd = 0
+        browser_identity = None
+        activation_started = False
         try:
+            if validate_context is not None:
+                validate_context()
             logger.info(
                 "[WechatDesktop][share-browser] opening card direct_read=%s",
                 direct_read,
             )
+            if validate_before_click is not None:
+                validate_before_click()
+            activation_started = True
             client._left_click_point(point)
             client._paced_wait(
                 "uia_share_browser_open_settle_ms_min",
@@ -558,6 +682,22 @@ class WechatShareBrowser:
                     "[WechatDesktop][share-browser] opened window was not detected"
                 )
                 return "", ""
+
+            def require_browser():
+                validate_context()
+                import win32gui
+                import win32process
+                if (not client._is_verified_share_browser_window(browser_hwnd, main_hwnd)
+                        or (int(win32process.GetWindowThreadProcessId(browser_hwnd)[1]),
+                            str(win32gui.GetClassName(browser_hwnd))) != browser_identity):
+                    raise RuntimeError("attachment_share_browser_changed")
+
+            if validate_context is not None:
+                import win32gui
+                import win32process
+                browser_identity = (int(win32process.GetWindowThreadProcessId(browser_hwnd)[1]),
+                                    str(win32gui.GetClassName(browser_hwnd)))
+                require_browser()
             logger.info(
                 "[WechatDesktop][share-browser] verified hwnd=%s direct_read=%s",
                 browser_hwnd,
@@ -566,7 +706,10 @@ class WechatShareBrowser:
             if direct_read and bool(
                 client.config.get("uia_share_browser_direct_read_enabled", True)
             ):
-                content = client._read_share_browser_content(browser_hwnd)
+                content = (client._read_share_browser_content(browser_hwnd) if validate_context is None else
+                           client._read_share_browser_content(browser_hwnd, validate_context=require_browser))
+                if validate_context is not None:
+                    require_browser()
                 if content:
                     return content, ""
                 logger.info(
@@ -586,12 +729,18 @@ class WechatShareBrowser:
             )
 
             def copy_action():
+                if validate_context is not None:
+                    require_browser()
                 client._right_click_point(more_point)
                 client._paced_wait(
                     "uia_share_browser_menu_settle_ms_min",
                     "uia_share_browser_menu_settle_ms_max",
                 )
-                if not client._click_copy_link_menu(browser_hwnd):
+                if validate_context is not None:
+                    require_browser()
+                copied = (client._click_copy_link_menu(browser_hwnd) if validate_context is None else
+                          client._click_copy_link_menu(browser_hwnd, validate_context=require_browser))
+                if not copied:
                     return
                 client._paced_wait(
                     "uia_share_browser_clipboard_settle_ms_min",
@@ -599,6 +748,8 @@ class WechatShareBrowser:
                 )
 
             value = client._clipboard_unicode_after(copy_action)
+            if validate_context is not None:
+                require_browser()
             if not client._is_safe_public_url(value):
                 value = ""
             logger.info(
@@ -611,12 +762,21 @@ class WechatShareBrowser:
             logger.warning("[WechatDesktop] failed to copy share URL: %s", exc)
             return "", ""
         finally:
+            context_valid = True
+            if validate_context is not None:
+                try:
+                    validate_context()
+                except Exception:
+                    context_valid = False
             if browser_hwnd:
-                if not client._close_share_browser(browser_hwnd, main_hwnd):
+                closed = (client._close_share_browser(browser_hwnd, main_hwnd) if validate_context is None else
+                          client._close_share_browser(browser_hwnd, main_hwnd,
+                                                      restore_main=context_valid, expected_identity=browser_identity))
+                if not closed:
                     logger.warning(
                         "[WechatDesktop] verified share browser could not be closed"
                     )
-            else:
+            elif context_valid and (activation_started or validate_context is None):
                 client._recover_foreground_after_dependency_failure(
                     "share browser detection failure", main_hwnd
                 )

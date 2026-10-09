@@ -105,6 +105,7 @@ class WechatUiaGateway:
         self._lifecycle_lock = threading.RLock()
         self._closed = False
         self._generation = 0
+        self._materializer = None
         self.send_operations = WechatSendOperations(
             self.client,
             self._selector_resolver,
@@ -187,7 +188,8 @@ class WechatUiaGateway:
     def inspect_account(self) -> tuple[int, OwnerInfo]:
         with self.operation():
             pid = int(self.client.get_owner_window_process_id())
-            info = self.client.get_owner_info()
+            # 账号核验必须只读；不能为预检查点击头像、打开资料或激活窗口。
+            info = self.client.get_owner_info_passive()
             if pid <= 0 or pid != int(self.client.get_owner_window_process_id()):
                 raise RuntimeError("WeChat account window changed during identity inspection")
             return pid, info
@@ -211,6 +213,53 @@ class WechatUiaGateway:
             if not conversation_header_matches_target(header, target.display_name, is_group=target.is_group):
                 raise SendNotSubmitted("conversation header or type does not match database target")
 
+    def inspect_window_identity(self) -> tuple[int, int]:
+        """窗口句柄和进程身份只读检查，不恢复或激活微信。"""
+        with self.operation(reply=False):
+            return (int(self.client.get_owner_window_handle()),
+                    int(self.client.get_owner_window_process_id()))
+
+    def prepare_attachment_target(self, conversation_id: str, *, validate) -> None:
+        """仅在确有附件待物化且数据库身份已核验后定位会话。"""
+        with self.operation(reply=False):
+            validate()
+            selector = self._resolve_bound_selector(conversation_id)
+            if not selector.title or not selector.runtime_id:
+                raise SendNotSubmitted("attachment_target_unavailable")
+            # 返回值表示本次是否执行激活；已经在前台会返回 False。
+            # 激活失败由客户端抛异常，不能把无需激活误当作失败。
+            self.client.ensure_foreground_window()
+            validate()
+            if not self.client.locate_conversation(
+                    selector.title, runtime_id=selector.runtime_id, row_index=selector.row_index):
+                raise SendNotSubmitted("attachment_target_changed")
+            validate()
+
+    def read_attachment_snapshot(self, conversation_id: str):
+        """附件关联专用的被动气泡序列，不下载、不截图、不使用 OCR。"""
+        with self.operation(reply=False):
+            selector = self._resolve_bound_selector(conversation_id)
+            if not selector.title or not selector.runtime_id:
+                raise SendNotSubmitted("attachment_target_unavailable")
+            header = self.client.get_title()
+            from channel.wechat_desktop.conversation import conversation_titles_match
+            if not conversation_titles_match(header.title, selector.title):
+                raise SendNotSubmitted("attachment_target_changed")
+            before = self.client.get_chat_scroll_position_passive()
+            messages = self.client.get_send_bubble_snapshot(selector.title, limit=20)
+            after = self.client.get_chat_scroll_position_passive()
+            if before is not True or after is not True:
+                raise SendNotSubmitted("attachment_bottom_unverified")
+            return tuple(messages)
+
+    def materialize_event(self, event, *, target_message, validate=None, validate_target=None):
+        if self._materializer is None:
+            from channel.wechat_desktop.uia.materializer import WechatUiaMaterializer
+            self._materializer = WechatUiaMaterializer(self.config, gateway=self)
+        return self._materializer.materialize_event(
+            event, target_message=target_message,
+            validate=validate, validate_target=validate_target)
+
     def bind_target(self, conversation_id: str, row: ConversationInfo) -> None:
         identity = str(conversation_id or "").strip()
         if not identity or not str(row.conversation_title or "").strip():
@@ -221,7 +270,7 @@ class WechatUiaGateway:
                 self._bindings[identity] = row
 
     def _resolve_bound_selector(self, conversation_id: str) -> WechatConversationSelector:
-        """显式绑定优先；默认 UIA Driver 的动态缓存只作为回退。"""
+        """显式绑定优先；可注入解析器用于独立界面操作。"""
         with self._bindings_lock:
             row = self._bindings.get(str(conversation_id or ""))
         if row is not None:
@@ -268,6 +317,8 @@ class WechatUiaGateway:
             cancel = getattr(self.client, "cancel_waits", None)
             if callable(cancel):
                 cancel()
+            if self._materializer is not None:
+                self._materializer.close()
             with self._bindings_lock:
                 self._bindings.clear()
 

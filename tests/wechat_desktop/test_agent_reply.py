@@ -105,6 +105,79 @@ def test_dispatch_regular_prompt_requests_context_relevance_filtering():
     assert "关联度低、已结束或属于其他话题的内容直接忽略" in prompt
 
 
+@pytest.mark.parametrize("reference", [
+    None,
+    {"content_type": "text", "content": "看看 https://example.invalid/quoted?token=synthetic"},
+    {"content_type": "share_card", "content": "合成分享卡片",
+     "url": "https://example.invalid/quoted?token=synthetic", "fetch_status": "pending_tool"},
+])
+def test_dispatch_current_and_quoted_links_request_agent_browser_reading(reference):
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+    channel._compose_context = lambda _ctype, content, **_kwargs: captured.update(content=content)
+    event = WechatDesktopEvent(
+        "message", "session", "Alice", "alice", "Alice", "text",
+        "看看 https://example.invalid/current?signature=synthetic%2Fvalue",
+        reference=reference,
+        history=[{"content": "https://example.invalid/old-history"}],
+    )
+
+    assert AgentReplyCoordinator(channel).dispatch(event) is False
+
+    prompt = captured["content"]
+    link_requirement = prompt.split("[链接读取要求]", 1)[1]
+    assert "https://example.invalid/current?signature=synthetic%2Fvalue" in link_requirement
+    assert "<available_skills> 中查找 analyze-url" in link_requirement
+    assert "<location> 绝对路径" in link_requirement
+    assert "skills/analyze-url/SKILL.md" not in link_requirement
+    assert "navigate" in link_requirement and "snapshot" in link_requirement
+    assert "old-history" not in link_requirement
+    if reference:
+        assert "https://example.invalid/quoted?token=synthetic" in link_requirement
+        assert "old-history" not in prompt
+        assert "通过工具读取该层引用链接得到的正文也属于被引用资料" in prompt
+
+
+def test_dispatch_reuses_read_share_body_without_requesting_browser():
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+    channel._compose_context = lambda _ctype, content, **_kwargs: captured.update(content=content)
+    event = WechatDesktopEvent(
+        "message", "session", "Alice", "alice", "Alice", "text", "总结一下",
+        reference={
+            "content_type": "share_card", "content": "合成分享卡片",
+            "url": "https://example.invalid/read", "browser_content": "已经读取的合成文章正文",
+            "fetch_status": "direct_browser",
+        },
+    )
+
+    assert AgentReplyCoordinator(channel).dispatch(event) is False
+
+    assert "已经读取的合成文章正文" in captured["content"]
+    assert "[链接读取要求]" not in captured["content"]
+
+
+def test_dispatch_history_link_alone_does_not_schedule_browser():
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+    channel._compose_context = lambda _ctype, content, **_kwargs: captured.update(content=content)
+    event = WechatDesktopEvent(
+        "message", "session", "Alice", "alice", "Alice", "text", "晚饭定了吗",
+        history=[{"content": "https://example.invalid/old-history"}],
+    )
+
+    assert AgentReplyCoordinator(channel).dispatch(event) is False
+
+    assert "[链接读取要求]" not in captured["content"]
+    assert "不要自动打开全部历史链接" in captured["content"]
+
+
 def test_dispatch_group_prompt_removes_bot_mention_before_agent():
     channel = _bare_wechat_channel()
     channel.config = {"self_display_name": ""}
@@ -243,7 +316,7 @@ def test_agent_callback_notifies_first_visible_tool_and_skips_bash():
 
 @pytest.mark.parametrize("has_event", [True, False])
 @pytest.mark.parametrize("send_fails", [False, True])
-def test_tool_notice_callback_sends_and_tracks_conversation(has_event, send_fails, caplog):
+def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fails, caplog):
     channel = _bare_wechat_channel()
     event = WechatDesktopEvent(
         "message", "uia-session:a", "Alice", "a", "Alice", "text", "hello"
@@ -257,7 +330,7 @@ def test_tool_notice_callback_sends_and_tracks_conversation(has_event, send_fail
     channel._reply_queue = WechatReplyQueue()
     channel._reply_queue.enqueue(event)
     item = channel._reply_queue.get()
-    registered, forgotten, sent, history, audits, downstream = [], [], [], [], [], []
+    sent, history, audits, downstream = [], [], [], []
 
     def send(target, text):
         sent.append((target, text))
@@ -267,8 +340,6 @@ def test_tool_notice_callback_sends_and_tracks_conversation(has_event, send_fail
 
     channel._driver = SimpleNamespace(
         validate_reply_target=lambda event: ReplyTargetValidation(True),
-        register_interim_text=lambda *args: registered.append(args),
-        forget_interim_text=lambda *args: forgotten.append(args),
         send_interim_text=send,
     )
     channel._service = SimpleNamespace(status=lambda: {"paused": False})
@@ -299,8 +370,7 @@ def test_tool_notice_callback_sends_and_tracks_conversation(has_event, send_fail
     callback(payload)
 
     expected = [(event.conversation_id, "正在调用 web_search")]
-    assert registered == sent == expected
-    assert forgotten == (expected if send_fails else [])
+    assert sent == expected
     assert len(history) == len(audits) == (0 if send_fails else 1)
     assert downstream == [payload, payload]
     assert "name 'conversation_id' is not defined" not in caplog.text

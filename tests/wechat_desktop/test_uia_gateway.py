@@ -2,7 +2,6 @@
 
 import threading
 from contextlib import nullcontext
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -14,10 +13,9 @@ from channel.wechat_desktop.send_control import (
     mark_send_submitted, send_scope,
 )
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from channel.wechat_desktop.uia.driver import WechatUiaDriver, _UiaPriorityCoordinator
-from channel.wechat_desktop.uia.gateway import WechatUiaGateway
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway, _UiaPriorityCoordinator
 from channel.wechat_desktop.uia.operations import resolve_conversation_selector
-from .helpers import FakeClient, FakeHook, row
+from .helpers import FakeClient, row
 
 
 @pytest.fixture
@@ -27,7 +25,7 @@ def gateway_sender(monkeypatch):
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
     monkeypatch.setattr(client, "get_title", lambda: HeaderInfo("合成联系人", "private"))
-    monkeypatch.setattr(client, "get_chat_history", lambda **kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **kwargs: [])
     monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
     monkeypatch.setattr(client, "_wait_for_send_slot", lambda who: None)
     monkeypatch.setattr(client, "_verify_send", lambda *args, **kwargs: {"success": True, "verified": True})
@@ -49,14 +47,15 @@ def test_gateway_has_no_receiver_driver_state_or_shell_hook():
     assert gateway.priority._owner is None
 
 
-def test_account_inspection_uses_public_client_api_and_reentrant_lease():
+def test_account_inspection_uses_passive_client_api_and_reentrant_lease():
     client = SimpleNamespace(
         get_owner_window_process_id=lambda: 42,
-        get_owner_info=lambda: OwnerInfo("合成账号", wx_id="wxid_synthetic", source="uia"),
+        get_owner_info_passive=lambda: OwnerInfo("合成账号", wx_id="wxid_synthetic", source="uia"),
+        get_owner_info=lambda: pytest.fail("网关不能打开账号资料"),
     )
     gateway = WechatUiaGateway({}, client=client)
     with gateway.operation():
-        assert gateway.inspect_account() == (42, client.get_owner_info())
+        assert gateway.inspect_account() == (42, client.get_owner_info_passive())
         assert gateway.reply_pending.is_set()
     assert not gateway.reply_pending.is_set()
     assert gateway.priority._owner is None
@@ -66,7 +65,7 @@ def test_account_inspection_refuses_process_change():
     ids = iter((42, 43))
     gateway = WechatUiaGateway({}, client=SimpleNamespace(
         get_owner_window_process_id=lambda: next(ids),
-        get_owner_info=lambda: OwnerInfo("合成账号"),
+        get_owner_info_passive=lambda: OwnerInfo("合成账号"),
     ))
     with pytest.raises(RuntimeError, match="window changed"):
         gateway.inspect_account()
@@ -243,22 +242,17 @@ def test_waiting_gateway_send_can_cancel_without_releasing_scan(gateway_sender):
     assert not gateway.reply_pending.is_set()
 
 
-def test_default_driver_composes_gateway_and_uses_dynamic_selector_cache():
+def test_gateway_uses_explicit_binding_and_refuses_missing_target():
     client = FakeClient()
     calls = []
     client.send_message = lambda who, text, **kwargs: calls.append((who, kwargs)) or {"success": True, "verified": True}
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-    assert driver.gateway.priority is driver._uia_priority
-    assert driver.gateway.reply_pending is driver._reply_ui_pending
-    assert isinstance(driver._uia_priority, _UiaPriorityCoordinator)
-    driver._conversation_selectors = {"uia-session:test": row("原名", runtime_id="one")}
-    assert driver.send_text("uia-session:test", "第一条").status == SendStatus.SENT
-    driver._conversation_selectors = {"uia-session:test": row("新名", runtime_id="two")}
-    assert driver.send_text("uia-session:test", "第二条").status == SendStatus.SENT
-    driver._conversation_selectors["uia-session:duplicate"] = replace(driver._conversation_selectors["uia-session:test"], runtime_id="three")
-    assert driver.send_text("新名", "歧义").status == SendStatus.NOT_SENT
-    driver._conversation_selectors = {}
-    assert driver.send_text("uia-session:test", "失效").status == SendStatus.NOT_SENT
+    gateway = WechatUiaGateway({}, client=client)
+    assert isinstance(gateway.priority, _UiaPriorityCoordinator)
+    gateway.bind_target("db-session:test", row("原名", runtime_id="one"))
+    assert gateway.send_text("db-session:test", "第一条").status == SendStatus.SENT
+    gateway.bind_target("db-session:test", row("新名", runtime_id="two"))
+    assert gateway.send_text("db-session:test", "第二条").status == SendStatus.SENT
+    assert gateway.send_text("db-session:missing", "失效").status == SendStatus.NOT_SENT
     assert calls == [
         ("原名", {"runtime_id": "one", "row_index": 0}),
         ("新名", {"runtime_id": "two", "row_index": 0}),
@@ -305,7 +299,7 @@ def test_closed_gateway_refuses_every_new_ui_path(action):
         uia_section=nullcontext,
         cancel_waits=lambda: calls.append("cancel"),
         get_owner_window_process_id=lambda: pytest.fail("closed account inspection"),
-        get_owner_info=lambda: pytest.fail("closed owner read"),
+        get_owner_info_passive=lambda: pytest.fail("closed owner read"),
         get_visible_conversations=lambda: pytest.fail("closed session read"),
         get_title=lambda: pytest.fail("closed title read"),
         ensure_foreground_window=lambda: pytest.fail("closed foreground operation"),
@@ -410,28 +404,20 @@ def test_close_during_pacing_never_starts_later_ui_section(gateway_sender, monke
     assert submitted == []
 
 
-def test_default_driver_start_never_implicitly_resumes_after_close():
+def test_gateway_close_requires_explicit_resume_before_ui_access():
     calls = []
     client = FakeClient()
     client.cancel_waits = lambda: calls.append("cancel")
     client.resume_waits = lambda: calls.append("resume")
-    hook = SimpleNamespace(
-        start=lambda: calls.append("hook-start") or True,
-        close=lambda: calls.append("hook-close"),
-    )
-    driver = WechatUiaDriver({}, client=client, shell_hook=hook)
-    assert driver.start() is True
-    assert calls == ["hook-start"]
-    driver.close()
-    assert calls == ["hook-start", "cancel", "hook-close"]
-    assert driver.start() is False
-    assert driver.wait_for_changes(threading.Event()) == "stopped"
-    assert calls == ["hook-start", "cancel", "hook-close"]
+    gateway = WechatUiaGateway({}, client=client)
+    gateway.close()
+    assert calls == ["cancel"]
     with pytest.raises(SendCancelled):
-        driver._scan_uia(lambda: pytest.fail("closed driver scanned UI"))
-    driver.resume()
-    assert driver.start() is True
-    assert calls == ["hook-start", "cancel", "hook-close", "resume", "hook-start"]
+        gateway.scan(lambda: pytest.fail("closed gateway accessed UI"))
+    assert calls == ["cancel"]
+    gateway.resume()
+    assert gateway.scan(lambda: "ready") == "ready"
+    assert calls == ["cancel", "resume"]
 
 
 def test_closed_gateway_cannot_rebind_target():
