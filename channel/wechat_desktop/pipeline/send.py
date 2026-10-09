@@ -252,11 +252,29 @@ class WechatDesktopSendMixin:
             **kwargs,
         )
 
+    def _validate_source_before_reply(self, event, context, target_name, content, content_type):
+        """文本和图片共用原消息复核；失效回复不进入发送或额度预留。"""
+        if event is None:
+            return True
+        validation = self._driver.validate_reply_target(event)
+        if validation.valid:
+            return True
+        context["wechat_desktop_queue_terminal"] = "skipped"
+        self._trace("11-send-target-invalid", "target=%s reason=%s", target_name, validation.reason)
+        self._store.audit(f"send_{content_type}", target_name, "stale_target",
+                          self._content_hash(content), detail=validation.reason)
+        if validation.replacement_event is not None:
+            try:
+                self._accept_replacement_event(validation.replacement_event)
+            except Exception as exc:
+                logger.warning("[WechatDesktop] replacement admission failed target=%s: %s", target_name, exc)
+        return False
+
     def _send_reply_impl(self, reply: Reply, context: Context):
         """执行最终发送安全门、目标复核、微信发送和审计。
 
         队列令牌首先阻止超时后的迟到结果；随后检查来源、暂停状态、回复策略和
-        限流。文本发送前还会让后端复核原消息目标，避免 Agent 推理期间会话变化
+        限流。文本和图片发送前都让后端复核原消息目标，避免 Agent 推理期间会话变化
         导致回错人。发送成功但无法验证气泡时记为 ``unverified``，不会自动重试，
         以避免重复发送。
         """
@@ -351,28 +369,8 @@ class WechatDesktopSendMixin:
             if can_auto:
                 try:
                     event = getattr(msg, "event", None)
-                    if event is not None:
-                        validation = self._driver.validate_reply_target(event)
-                        if not validation.valid:
-                            if validation.replacement_event is not None:
-                                self._accept_replacement_event(
-                                    validation.replacement_event
-                                )
-                            context["wechat_desktop_queue_terminal"] = "skipped"
-                            self._trace(
-                                "11-send-target-invalid",
-                                "target=%s reason=%s",
-                                target_name,
-                                validation.reason,
-                            )
-                            self._store.audit(
-                                "send_text",
-                                target_name,
-                                "stale_target",
-                                self._content_hash(reply_text),
-                                detail=validation.reason,
-                            )
-                            return
+                    if not self._validate_source_before_reply(event, context, target_name, reply_text, "text"):
+                        return
                     self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._deliver(send_target, reply_text, policy_target=target_name,
                                            is_group=is_group, token=queue_token, source_event_ids=source_event_ids)
@@ -463,6 +461,9 @@ class WechatDesktopSendMixin:
             )
             if can_auto:
                 try:
+                    event = getattr(msg, "event", None)
+                    if not self._validate_source_before_reply(event, context, target_name, reply.content, "image"):
+                        return
                     self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._deliver(send_target, str(reply.content), policy_target=target_name,
                                            is_group=is_group, content_type="image", token=queue_token, source_event_ids=source_event_ids)
@@ -499,6 +500,9 @@ class WechatDesktopSendMixin:
                         "[WechatDesktop] automatic image send returned unsuccessful: %s",
                         result,
                     )
+                except DeliveryBlocked:
+                    context["wechat_desktop_queue_terminal"] = "skipped"
+                    return
                 except Exception as exc:
                     logger.warning(
                         "[WechatDesktop] automatic image send failed: %s path=%s",

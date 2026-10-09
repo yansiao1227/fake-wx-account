@@ -38,6 +38,20 @@ def normalize_root(value: str) -> Path:
     return Path(value).expanduser().resolve()
 
 
+def _current_database_paths(db_storage: Path, pattern: str) -> list[Path]:
+    # 认证和读取必须使用同一目录范围，迁移遗留库不能证明当前登录身份。
+    return sorted((path for path in db_storage.rglob(pattern)
+                   if "migrate" not in path.relative_to(db_storage).parts), key=str)
+
+
+def _contact_pages(db_storage: Path) -> list[bytes]:
+    pages = []
+    for contact in _current_database_paths(db_storage, "contact.db"):
+        with contact.open("rb") as handle:
+            pages.append(handle.read(PAGE_SIZE))
+    return pages
+
+
 def _extract_paths(text: str) -> list[str]:
     text = text.strip().lstrip("\ufeff")
     try:
@@ -137,17 +151,21 @@ class DatabaseCatalog:
         directories = self.account_directories()
         samples = []
         for directory in directories:
-            contacts = list((directory / "db_storage").rglob("contact.db"))
-            if contacts:
-                with contacts[0].open("rb") as handle:
-                    samples.append((directory, handle.read(PAGE_SIZE)))
+            pages = _contact_pages(directory / "db_storage")
+            if pages:
+                samples.append((directory, pages))
         scanner = self.scanner or scan_key_candidates
-        self._candidates = scanner(processes, float(self.config["db_key_scan_timeout_seconds"]))
+        process_order = {pid: index for index, (pid, _) in enumerate(processes)}
+        # 扫描器以集合收集密钥，必须恢复主窗口进程优先的枚举顺序。
+        self._candidates = sorted(
+            scanner(processes, float(self.config["db_key_scan_timeout_seconds"])),
+            key=lambda candidate: process_order.get(candidate[0], len(processes)))
         matches = {}
-        for directory, page in samples:
+        for directory, pages in samples:
             for pid, key in self._candidates:
-                if verify_key(key, page):
+                if any(verify_key(key, page) for page in pages):
                     matches[str(directory)] = (directory, pid)
+                    break
         if len(matches) != 1:
             code = "account_ambiguous" if len(matches) > 1 else "key_not_found"
             raise DatabaseReadError(code, "无法唯一认证微信登录账号；请确认登录状态和读取权限")
@@ -164,20 +182,18 @@ class DatabaseCatalog:
             return False
         if self.scanner is not None:
             return True  # 合成扫描器的测试账号没有真实进程内存。
-        contacts = list(binding.db_storage.rglob("contact.db"))
-        if not contacts:
+        pages = _contact_pages(binding.db_storage)
+        if not pages:
             return False
-        with contacts[0].open("rb") as handle:
-            page = handle.read(PAGE_SIZE)
-        return any(pid == binding.pid and verify_key(key, page) and candidate_is_resident(pid, key)
+        return any(pid == binding.pid and any(verify_key(key, page) for page in pages)
+                   and candidate_is_resident(pid, key)
                    for pid, key in self._candidates)
 
     def list_databases(self, binding: AccountBinding) -> list[Path]:
         # 发送者资源映射也是消息解析输入；不扫描媒体或朋友圈库。
-        return sorted((path for path in binding.db_storage.rglob("*.db")
-                       if "migrate" not in path.relative_to(binding.db_storage).parts
-                       and (path.name in {"contact.db", "session.db", "message_resource.db"}
-                            or re.fullmatch(r"message_\d+\.db", path.name))), key=str)
+        return [path for path in _current_database_paths(binding.db_storage, "*.db")
+                if path.name in {"contact.db", "session.db", "message_resource.db"}
+                or re.fullmatch(r"message_\d+\.db", path.name)]
 
     @property
     def key_candidates(self):

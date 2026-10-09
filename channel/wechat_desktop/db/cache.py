@@ -33,6 +33,8 @@ class SnapshotStatus:
     full_rebuilds: int = 0
     incremental_refreshes: int = 0
     decrypted_pages: int = 0
+    # None 表示全量重建；增量仅列出实际发布的认证页，便于读取器失效对应表缓存。
+    changed_pages: tuple[int, ...] | None = None
 
 
 @dataclass
@@ -292,7 +294,7 @@ class EncryptedDatabaseCache:
         if (source_sig == self._source_signature and wal_sig == self._wal_signature
                 and probe == self._probe_signature and not unconsumed_frame):
             validate_source()
-            self.status = replace(self.status, healthy=True, stale=False, changed=False, error_code="")
+            self.status = replace(self.status, healthy=True, stale=False, changed=False, error_code="", changed_pages=())
             return self.status
         enc_key, file_salt = key_parts(self.key, first_page)
         mac_key = hmac_key(enc_key, file_salt)
@@ -325,7 +327,8 @@ class EncryptedDatabaseCache:
         self.status = SnapshotStatus(True, False, time.time(), generation, "", True,
             self.status.full_rebuilds + int(rebuild),
             self.status.incremental_refreshes + int(not rebuild),
-            self.status.decrypted_pages + decoded)
+            self.status.decrypted_pages + decoded,
+            None if rebuild else tuple(sorted(number for number in changes if number <= (commit_pages or 0))))
         return self.status
 
     def refresh(self) -> SnapshotStatus:
@@ -339,7 +342,7 @@ class EncryptedDatabaseCache:
                     last_code = exc.code
                 except (OSError, sqlite3.Error, ValueError):
                     last_code = "snapshot_io_failed"
-            self.status = replace(self.status, healthy=False, stale=True, changed=False, error_code=last_code)
+            self.status = replace(self.status, healthy=False, stale=True, changed=False, error_code=last_code, changed_pages=())
             return self.status
 
     def close(self):

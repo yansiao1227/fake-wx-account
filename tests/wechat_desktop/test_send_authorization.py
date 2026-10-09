@@ -213,6 +213,38 @@ def test_real_uia_header_parser_enforces_group_policy(store, monkeypatch, indica
     assert len(client.sent) == (1 if indicator == "private_title" else 0)
 
 
+@pytest.mark.parametrize("title", ["Synthetic(1)", "Synthetic（1）", "Synthetic(25)"])
+def test_user_controlled_numeric_title_suffix_cannot_prove_group(store, monkeypatch, title):
+    backend, client = uia_backend()
+    selector = row(title, runtime_id="synthetic-row")
+    client.rows = [selector]
+    backend._conversation_selectors = {"uia-session:synthetic-row": selector}
+    controls = [SimpleNamespace(AutomationId="current_chat_name_label", Name=title)]
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(controls), raising=False)
+    monkeypatch.setattr(client, "_walk", lambda root: iter(root), raising=False)
+    monkeypatch.setattr(client, "get_title", lambda: WechatUiaClient.get_title(client))
+    channel = channel_for(backend, store, auto_reply_private_all=False,
+                          auto_reply_groups_all=True)
+
+    header = client.get_title()
+    result = channel._execute_agent_action("send_text", conversation=title, text="合成消息")
+
+    assert header.header_type == "unknown"
+    assert header.title == title
+    assert result["status"] == "blocked"
+    assert client.sent == []
+
+
+def test_one_member_group_requires_independent_count_control(monkeypatch):
+    controls = [SimpleNamespace(AutomationId="current_chat_name_label", Name="Synthetic(1)"),
+                SimpleNamespace(AutomationId="current_chat_count_label", Name="1")]
+    client = WechatUiaClient({})
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(controls))
+    monkeypatch.setattr(client, "_walk", lambda root: iter(root))
+
+    assert client.get_title() == HeaderInfo("Synthetic", "group", 1)
+
+
 @pytest.mark.parametrize("failure", ["unknown_kind", "wrong_header", "stale", "ambiguous"])
 def test_uia_unverified_identity_or_type_never_submits(store, failure):
     backend, client = uia_backend()

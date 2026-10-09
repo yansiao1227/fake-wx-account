@@ -3,6 +3,7 @@ from __future__ import annotations
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 import hashlib
 import time
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional
@@ -183,10 +184,41 @@ class WechatMessageSender:
             client._press_shortcut(win32api, win32con, ord("A"))
             client._press_shortcut(win32api, win32con, ord("V"))
 
+        def input_is_clear(control) -> bool:
+            available, value = client._try_input_value(control)
+            return available and not value
+
+        def reject_paste(control, actual_text: str, value_available: bool) -> None:
+            nonlocal input_readable_seen
+            logger.warning(
+                "[WechatDesktop] paste attempt %s/%s did not match reply text: "
+                "expected_chars=%s actual_chars=%s keyboard_focus=%s value_pattern=%s",
+                attempt, attempts, len(expected_text), len(actual_text),
+                client._keyboard_focus_state(control), value_available,
+            )
+            # 错误草稿既不能提交，也不能留给下次 Enter 回退。每次失败都
+            # 清空输入，然后重新获取控件和粘贴；此处尚未标记发送提交。
+            check_send_allowed()
+            control.SetFocus()
+            if client._wait_for_keyboard_focus(control) is False:
+                raise SendNotSubmitted("WeChat input focus could not be confirmed")
+            client._press_shortcut(win32api, win32con, ord("A"))
+            win32api.keybd_event(win32con.VK_BACK, 0, 0, 0)
+            win32api.keybd_event(win32con.VK_BACK, 0, win32con.KEYEVENTF_KEYUP, 0)
+            clear_available, _ = client._try_input_value(control)
+            input_readable_seen = input_readable_seen or clear_available
+            if clear_available and not client._wait_for_input_value(
+                control, lambda _: input_is_clear(control), 1.25
+            ):
+                raise SendNotSubmitted("WeChat mismatched draft could not be cleared")
+            if attempt < attempts:
+                client._paced_wait("uia_paste_retry_ms_min", "uia_paste_retry_ms_max")
+
         # Conversation selection and clipboard setup can take long enough for
         # another window to steal focus. Reassert WeChat immediately before
         # keyboard input and the physical Send-button click.
         attempts = max(1, min(int(client.config.get("uia_paste_attempts", 3)), 5))
+        input_readable_seen = False
         for attempt in range(1, attempts + 1):
             check_send_allowed()
             client.focus_window()
@@ -207,54 +239,23 @@ class WechatMessageSender:
                 # on every attempt so a transient focus loss cannot poison retries.
                 paste_into(control)
                 value_available, _value = client._try_input_value(control)
+                input_readable_seen = input_readable_seen or value_available
                 actual_text = ""
 
-                def capture_nonempty(value: str) -> bool:
+                def capture_expected(value: str) -> bool:
                     nonlocal actual_text
                     actual_text = value
-                    return bool(value)
+                    return (client._normalize_input_text(value)
+                            == client._normalize_input_text(expected_text))
 
                 accepted = (
                     not expected_text
                     or not value_available
-                    or client._wait_for_input_value(control, capture_nonempty, 1.25)
+                    or client._wait_for_input_value(control, capture_expected, 1.25)
                 )
                 if not accepted:
-                    try:
-                        import win32gui
-
-                        foreground_hwnd = int(win32gui.GetForegroundWindow() or 0)
-                    except Exception:
-                        foreground_hwnd = 0
-                    logger.warning(
-                        "[WechatDesktop] paste attempt %s/%s left input empty: "
-                        "chars=%s foreground_hwnd=%s keyboard_focus=%s value_pattern=%s",
-                        attempt,
-                        attempts,
-                        len(expected_text),
-                        foreground_hwnd,
-                        client._keyboard_focus_state(control),
-                        value_available,
-                    )
-                    if attempt < attempts:
-                        client._paced_wait(
-                            "uia_paste_retry_ms_min",
-                            "uia_paste_retry_ms_max",
-                        )
+                    reject_paste(control, actual_text, value_available)
                     continue
-
-                if (
-                    expected_text
-                    and value_available
-                    and client._normalize_input_text(actual_text)
-                    != client._normalize_input_text(expected_text)
-                ):
-                    logger.warning(
-                        "[WechatDesktop] pasted reply text differs from the source; "
-                        "continuing because the input is non-empty: expected=%r actual=%r",
-                        expected_text,
-                        actual_text,
-                    )
                 client._paced_wait(
                     "uia_paste_settle_ms_min",
                     "uia_paste_settle_ms_max",
@@ -273,6 +274,19 @@ class WechatMessageSender:
                         "uia_pre_send_settle_ms_min",
                         "uia_pre_send_settle_ms_max",
                     )
+                if expected_text:
+                    current_available, current_text = client._try_input_value(control)
+                    input_readable_seen = input_readable_seen or current_available
+                    if ((input_readable_seen and not current_available)
+                            or (current_available
+                                and client._normalize_input_text(current_text)
+                                != client._normalize_input_text(expected_text))):
+                        reject_paste(control, current_text, current_available)
+                        continue
+                    # ValuePattern 可能刚恢复；一旦已确认可读，也必须验证
+                    # 发送后输入清空。始终不可读时保留初次发送兼容路径。
+                    value_available = current_available
+                if send_button is not None:
                     client._click_send_button(send_button)
                 else:
                     mark_send_submitted()
@@ -284,14 +298,14 @@ class WechatMessageSender:
                     expected_text
                     and value_available
                     and not client._wait_for_input_value(
-                        control, lambda value: not value, 1.5
+                        control, lambda _: input_is_clear(control), 1.5
                     )
                 ):
                     raise RuntimeError("WeChat Send button did not clear the reply input")
                 return
 
-        raise RuntimeError(
-            f"WeChat chat input remained empty after {attempts} attempts"
+        raise SendNotSubmitted(
+            f"WeChat chat input did not match reply text after {attempts} attempts"
         )
 
 
@@ -495,13 +509,51 @@ class WechatMessageSender:
         expected_type: str = "",
     ) -> dict:
         client = self.client
-        before_ids = {item.runtime_id for item in before if item.runtime_id}
+        def identity(item):
+            if item.runtime_id:
+                return ("runtime", item.runtime_id)
+            if item.stable_id:
+                return ("stable", item.stable_id)
+            return None
+
+        def signature(item):
+            # 引用解析状态、附件本地路径、位置和发送者均可能补齐，
+            # 不能作为气泡新增的证据。只保留展示正文和消息类型。
+            return (item.message_type, item.content)
+
+        before_ids = {identity(item) for item in before if identity(item)}
+        before_counts = Counter(signature(item) for item in before)
+        before_outgoing = Counter(signature(item) for item in before if item.direction == "outgoing")
+        before_unknown = Counter(signature(item) for item in before
+                                 if item.direction not in {"incoming", "outgoing"})
+        before_has_anonymous = any(not identity(item) for item in before)
         deadline = time.time() + 3.0
         while time.time() < deadline:
             time.sleep(0.15)
             after = client.get_chat_history(limit=5)
+            after_counts = Counter(signature(item) for item in after)
+            after_outgoing = Counter(signature(item) for item in after if item.direction == "outgoing")
+            snapshot_increased = (len(after) > len(before)
+                                  and all(after_counts[key] >= count
+                                          for key, count in before_counts.items()))
             for item in reversed(after):
-                is_new = not item.runtime_id or item.runtime_id not in before_ids
+                if item.direction != "outgoing":
+                    continue
+                key = signature(item)
+                count_increased = (snapshot_increased
+                                   and after_counts[key] > before_counts[key]
+                                   and after_outgoing[key] > before_outgoing[key] + before_unknown[key])
+                item_id = identity(item)
+                # 匿名气泡必须同时证明旧签名全部保留、快照总数以及
+                # 同签名 outgoing 数量超过旧出站与未知方向气泡的总数，
+                # 避免识别完善与无关新消息组合成假新增证据。最近 5 条窗口
+                # 已满时无法证明新增，保守保留 unverified。
+                # 原匿名气泡后来暴露 ID，也不能仅凭新 ID 误认为新增。
+                if item_id:
+                    is_new = (item_id not in before_ids
+                              and (not before_has_anonymous or count_increased))
+                else:
+                    is_new = count_increased
                 matches = (text and item.content == text) or (
                     expected_type and item.message_type in {expected_type, "image"}
                 )

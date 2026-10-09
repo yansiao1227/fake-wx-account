@@ -992,14 +992,18 @@ def test_locate_conversation_accepts_group_title_with_member_count(monkeypatch):
     assert row.click_count == 1
 
 
-def test_get_title_strips_member_count_suffix(monkeypatch):
+def test_get_title_strips_member_count_suffix_for_independent_group_count(monkeypatch):
     header = GeometryControl(
         (400, 100, 700, 130),
         "小小地下联络站(9)",
         "Text",
         automation_id="current_chat_name_label",
     )
-    root = GeometryControl((0, 0, 1000, 800), children=[header])
+    count_label = GeometryControl(
+        (700, 100, 760, 130), "9", "Text",
+        automation_id="current_chat_count_label",
+    )
+    root = GeometryControl((0, 0, 1000, 800), children=[header, count_label])
     client = WechatUiaClient({})
 
     @contextmanager

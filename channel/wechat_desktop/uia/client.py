@@ -905,7 +905,6 @@ class WechatUiaClient:
         count = 1
         count_label_seen = False
         count_from_label = False
-        count_from_title = False
         with self.operation_lock, self._uia_root() as root:
             for control in self._walk(root):
                 automation_id = _text(control.AutomationId)
@@ -917,23 +916,18 @@ class WechatUiaClient:
                     if match:
                         count = max(1, int(match.group(1)))
                         count_from_label = True
-        # Some builds put the member count only in a dedicated label; others
-        # also (or instead) append "(n)" to the name control. Prefer the bare
-        # group name so callers compare cleanly with session_item_* / config.
+        # 昵称也可以含有数字括号后缀，后缀不能作为群类型的证据。
+        # 只有独立人数控件已经确认群聊时，才去掉标题展示人数。
         base = strip_member_count_suffix(title)
-        if base and base != title:
-            count_from_title = True
-            if not count_from_label:
-                match = re.search(r"[（(](\d+)[）)]\s*$", title)
-                if match:
-                    count = max(1, int(match.group(1)))
+        title_has_count_suffix = bool(base and base != title)
+        if count_from_label and title_has_count_suffix:
             title = base
-        # 人数控件或人数后缀本身标识群聊；仅剩一人的群仍须执行群策略。
-        # 人数控件存在却不可解析时拒绝把不明类型降级为私聊。
+        # 独立人数控件确认的一人群仍执行群策略；仅有后缀或人数控件
+        # 不可解析时无法确认类型，禁止主动发送时降级为私聊或群聊。
         kind = "unknown"
         if title:
-            kind = ("group" if count_from_label or count_from_title
-                    else "unknown" if count_label_seen else "private")
+            kind = ("group" if count_from_label else "unknown"
+                    if count_label_seen or title_has_count_suffix else "private")
         return HeaderInfo(
             title,
             kind,
@@ -1610,13 +1604,22 @@ class WechatUiaClient:
                 return False
             value_available, value = self._try_input_value(control)
             if (
-                value_available
-                and self._normalize_input_text(value)
+                not value_available
+                or self._normalize_input_text(value)
                 != self._normalize_input_text(expected_text)
             ):
                 return False
             try:
                 control.SetFocus()
+                if self._wait_for_keyboard_focus(control) is not True:
+                    return False
+                # 点击后的回退可能重复提交；焦点切换也可能改变草稿。
+                # 只有紧邻 Enter 仍可读且一致，才能继续回退。
+                current_available, current_text = self._try_input_value(control)
+                if (not current_available
+                        or self._normalize_input_text(current_text)
+                        != self._normalize_input_text(expected_text)):
+                    return False
             except Exception:
                 return False
             mark_send_submitted()

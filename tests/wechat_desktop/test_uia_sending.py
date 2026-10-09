@@ -161,8 +161,10 @@ def test_input_text_normalization_handles_uia_line_endings_and_spaces():
     assert normalize("e\u0301") == normalize("é")
 
 
-def test_paste_sends_nonempty_text_even_when_uia_value_differs(monkeypatch):
+def test_paste_rejects_nonempty_text_when_uia_value_differs(monkeypatch):
     import win32api
+    import win32con
+    from channel.wechat_desktop.send_control import SendNotSubmitted, track_send_attempt
 
     state = {"value": "", "paste_count": 0, "click_count": 0}
 
@@ -192,16 +194,23 @@ def test_paste_sends_nonempty_text_even_when_uia_value_differs(monkeypatch):
         if key == ord("V") and flags == 0:
             state["paste_count"] += 1
             state["value"] = "UIA 返回的可见片段"
+        elif key == win32con.VK_BACK and flags == 0:
+            state["value"] = ""
 
     monkeypatch.setattr(win32api, "keybd_event", keybd_event)
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "_uia_root", fake_root)
     monkeypatch.setattr(client, "_walk", lambda _root: iter((input_control, send_button)))
     monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
+    monkeypatch.setattr(client, "_wait_for_input_value",
+                        lambda control, predicate, _: predicate(client._input_value(control)))
 
-    client._paste_and_send("完整的原始文本")
+    with track_send_attempt() as attempt:
+        with pytest.raises(SendNotSubmitted):
+            client._paste_and_send("完整的原始文本")
 
-    assert state == {"value": "", "paste_count": 1, "click_count": 1}
+    assert attempt.submitted is False
+    assert state == {"value": "", "paste_count": 3, "click_count": 0}
 
 
 def test_paste_retries_once_when_input_remains_empty(monkeypatch):

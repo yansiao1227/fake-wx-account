@@ -21,7 +21,6 @@ class WechatDatabaseSource:
         self._lock = threading.RLock()
         self._pending_batch = None
         self._boot_highwaters = None
-        self._baseline_streams = set()
         self._startup_unread_bounds = {}
         self._cleanup_readers = []
         self._closed = threading.Event()
@@ -100,7 +99,6 @@ class WechatDatabaseSource:
         self._cleanup_retired_readers()
         self._session_epoch += 1
         self._boot_highwaters = None
-        self._baseline_streams = set()
         self._startup_unread_bounds = {}
         self._startup_unread_allowed = False
         # 丢失 ACK 的已提交批次由持久游标覆盖；未提交行按新高水位补历史。
@@ -148,22 +146,20 @@ class WechatDatabaseSource:
                     return self.status(source_batch=batch, redelivery=True), [r.event for r in batch.records if r.event]
                 checkpoints = ledger.get_source_checkpoints(reader.account_id)
                 if self._boot_highwaters is None:
-                    self._boot_highwaters = dict(highwaters)
-                    # 只有账号从未建立过接收账本时才跳过初始历史。
-                    # 已有账号停机期间新增的流必须从安全起点补账。
-                    self._baseline_streams = set(highwaters) if not checkpoints else set()
-                    if (not checkpoints and self._startup_unread_allowed and
+                    unread_bounds = {}
+                    if (not ledger.source_account_initialized(reader.account_id) and self._startup_unread_allowed and
                             self.config.get("process_startup_unread_messages", True)):
                         unread = getattr(reader, "startup_unread_boundaries", None)
                         if callable(unread):
-                            self._startup_unread_bounds = unread(highwaters)
-                for stream_id, high in highwaters.items():
-                    if stream_id not in checkpoints:
-                        initial_stream = stream_id in self._baseline_streams
-                        cursor = (self._startup_unread_bounds.get(stream_id, high["cursor"] + 1) - 1) if initial_stream else 0
-                        checkpoints[stream_id] = ledger.initialize_source_checkpoint(
-                            reader.account_id, stream_id, cursor,
-                            high["cursor"] if initial_stream else 0, high.get("generation", ""))
+                            unread_bounds = unread(highwaters)
+                    # 本次启动的全部流和账号标记必须同事务完成。失败不固定
+                    # 内存高水位，下次轮询或重启重新建立完整首次基线。
+                    checkpoints = ledger.initialize_source_account(
+                        reader.account_id, highwaters, startup_unread_bounds=unread_bounds)
+                    self._boot_highwaters = dict(highwaters)
+                    self._startup_unread_bounds = unread_bounds
+                elif any(stream_id not in checkpoints for stream_id in highwaters):
+                    checkpoints = ledger.initialize_source_account(reader.account_id, highwaters)
                 batch = reader.poll_batch(checkpoints, self._boot_highwaters)
                 self._pending_batch = batch
                 return self.status(**({"source_batch": batch} if batch else {})), (

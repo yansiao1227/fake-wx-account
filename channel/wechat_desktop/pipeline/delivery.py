@@ -38,9 +38,6 @@ class DeliveryService:
             raise DeliveryBlocked("send blocked by policy")
         limit = self.config.get("uia_text_chunk_chars", DEFAULT_CONFIG["uia_text_chunk_chars"])
         units = len(split_message_text(content, limit)) if content_type == "text" else 1
-        if not self.policy.reserve_send(units):
-            raise DeliveryBlocked("send rate limit exceeded")
-        # 额度按气泡数一次性预留；UI 操作开始后不退款，避免不确定发送结果引发重复。
         with send_scope(check_cancelled):
             delivery_id = ""
             if self.store is not None:
@@ -49,6 +46,10 @@ class DeliveryService:
                 if previous is not None:
                     return previous
             try:
+                # 只有获得新幂等 claim 的调用才预留额度；旧回执直接复用。
+                # 限流失败也写为未提交，避免留下 sending；UI 操作开始后不退款。
+                if not self.policy.reserve_send(units):
+                    raise DeliveryBlocked("send rate limit exceeded")
                 authorization = {"authorized_target": authorized_target} if authorized_target is not None else {}
                 if content_type == "image":
                     raw = self.backend.send_image(target, content, **authorization)

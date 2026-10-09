@@ -98,9 +98,11 @@ def test_full_cache_and_idle_refresh(tmp_path):
     cache = create_cache(tmp_path)
     first = cache.refresh()
     assert first.healthy and first.full_rebuilds == 1
+    assert first.changed_pages is None
     assert version(cache) == 0
     idle = cache.refresh()
     assert not idle.changed and idle.decrypted_pages == first.decrypted_pages
+    assert idle.changed_pages == ()
 
 
 @pytest.mark.parametrize("magic", [0x377F0682, 0x377F0683])
@@ -122,6 +124,7 @@ def test_uncommitted_wal_is_not_visible_then_publishes_incrementally(tmp_path):
     assert refreshed.full_rebuilds == 1
     assert refreshed.incremental_refreshes == 1
     assert refreshed.decrypted_pages - initial.decrypted_pages == 1
+    assert refreshed.changed_pages == (1,)
 
 
 def test_incremental_commit_does_not_run_full_database_check(tmp_path, monkeypatch):

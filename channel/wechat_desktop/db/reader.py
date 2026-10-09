@@ -38,7 +38,12 @@ def _text(value) -> str:
         if offset >= 0:
             try:
                 import zstandard
-                data = zstandard.ZstdDecompressor().decompress(data[offset:], max_output_size=2_000_000)
+                frame = data[offset:]
+                frame_size = zstandard.frame_content_size(frame)
+                # max_output_size 只约束未声明长度的帧；声明长度的帧必须先检查。
+                if frame_size not in (zstandard.CONTENTSIZE_UNKNOWN, zstandard.CONTENTSIZE_ERROR) and frame_size > 2_000_000:
+                    raise ValueError("compressed content exceeds limit")
+                data = zstandard.ZstdDecompressor().decompress(frame, max_output_size=2_000_000)
             except ImportError as exc:
                 raise DatabaseReadError("dependency_missing", "数据库文本读取需要 zstandard") from exc
             except Exception as exc:
@@ -126,13 +131,16 @@ class WechatDatabaseReader:
         self._conversation_lookup = {}
         self._sender_maps = {}
         self._streams = {}
+        self._database_indexes = {}
+        self._index_dirty = set()
         self._session_unread = {}
         self._startup_unread_ids = set()
         self._initialized = False
         self._scan_offset = 0
         self._backlog = {}
         self._index_revision = 0
-        self._highwaters = None
+        self._highwaters = {}
+        self._backlog_counts = {}
         self._idle_poll_signature = None
         self._error_code = ""
         self._last_success_at = 0.0
@@ -169,7 +177,8 @@ class WechatDatabaseReader:
     def refresh(self):
         with self._lock:
             try:
-                changed = not self._initialized
+                pending = set(self._index_dirty)
+                changed = set(pending)
                 if self.catalog is not None:
                     binding = self.catalog.resolve()
                     if binding.account_id != self.account_id or binding.pid != self.binding.pid:
@@ -185,7 +194,7 @@ class WechatDatabaseReader:
                             self.caches[relative] = self._cache_factory(
                                 source, key, self._cache_dir / relative,
                                 retry_attempts=self.config.get("db_snapshot_retry_attempts", 3))
-                            changed = True
+                            changed.add(relative)
                 for relative, cache in self.caches.items():
                     status = cache.refresh()
                     if getattr(status, "error_code", "") == "page_hmac_failed" and self._key_provider is not None:
@@ -193,13 +202,19 @@ class WechatDatabaseReader:
                         if key != cache.key:
                             cache.key = key
                             status = cache.refresh()
+                    previous_status = self._statuses.get(relative)
                     self._statuses[relative] = status
                     if getattr(status, "stale", False) or not getattr(status, "healthy", True):
                         raise DatabaseReadError(getattr(status, "error_code", "snapshot_stale") or "snapshot_stale",
                                                 "数据库快照刷新失败，暂停消息交付")
-                    changed |= bool(getattr(status, "changed", True))
+                    if (not self._initialized or relative not in self._database_indexes or
+                            bool(getattr(status, "changed", True)) or
+                            getattr(previous_status, "generation", None) != getattr(status, "generation", "")):
+                        changed.add(relative)
+                        self._index_dirty.add(relative)
                 if changed:
-                    self._load_indexes()
+                    self._load_indexes(changed, force_full=pending)
+                    self._index_dirty.difference_update(changed)
                 self._initialized = True
                 self._error_code = ""
                 self._last_success_at = time.time()
@@ -207,83 +222,159 @@ class WechatDatabaseReader:
                 self._error_code = getattr(exc, "code", "database_read_failed")
                 raise
 
-    def _load_indexes(self):
+    @staticmethod
+    def _page_tables(conn):
+        """一次建立已验证快照的页归属；索引页必须归到它的消息/映射表。"""
+        try:
+            result = {}
+            for page, table in conn.execute(
+                    "SELECT d.pageno,coalesce(m.tbl_name,d.name) FROM dbstat AS d "
+                    "LEFT JOIN sqlite_master AS m ON m.name=d.name"):
+                result.setdefault(int(page), set()).add(str(table).lower())
+            return result
+        except sqlite3.OperationalError:
+            # 某些 SQLite 运行时没有 dbstat，仍可安全按变化分片刷新。
+            return None
+
+    def _index_table(self, conn, lowered, table, columns):
+        data = {"contacts": {}, "names": set(), "mapping": None, "unread": {}}
+        if lowered == "contact":
+            username = _column(columns, "username", "user_name")
+            if username is None:
+                raise DatabaseReadError("unsupported_contact_schema", "联系人表缺少 username")
+            expressions = [_quote(username)]
+            for field in ("nick_name", "remark", "alias"):
+                column = _column(columns, field)
+                expressions.append(_quote(column) if column else "''")
+            for row in conn.execute(f"SELECT {','.join(expressions)} FROM {_quote(table)}"):
+                user = _text(row[0])
+                if not user:
+                    continue
+                nick, remark, alias = map(_text, row[1:])
+                data["contacts"][user] = {"conversation_id": self.conversation_id(user), "username": user,
+                                          "nick_name": nick, "remark": remark, "alias": alias,
+                                          "display_name": remark or nick or user,
+                                          "is_group": user.endswith("@chatroom")}
+                data["names"].add(user)
+        elif lowered == "sessiontable":
+            user_col = _column(columns, "username", "user_name")
+            if user_col:
+                data["names"].update(_text(row[0]) for row in conn.execute(
+                    f"SELECT {_quote(user_col)} FROM {_quote(table)}") if row[0])
+                count_col = _column(columns, "unread_count")
+                first_col = _column(columns, "unread_first_msg_srv_id")
+                if count_col and first_col:
+                    for row in conn.execute(f"SELECT {_quote(user_col)},{_quote(count_col)},"
+                                            f"{_quote(first_col)} FROM {_quote(table)} WHERE {_quote(count_col)}>0"):
+                        data["unread"][_text(row[0])] = (_integer(row[1]), _integer(row[2]))
+        elif lowered in {"name2id", "sendername2id"}:
+            user_col = _column(columns, "user_name", "username", "name")
+            id_col = _column(columns, "id", "user_id")
+            if user_col:
+                id_expr = _quote(id_col) if id_col else "rowid"
+                data["mapping"] = {int(row[0]): _text(row[1]) for row in conn.execute(
+                    f"SELECT {id_expr},{_quote(user_col)} FROM {_quote(table)}") if row[1]}
+                data["names"].update(data["mapping"].values())
+        return data
+
+    def _load_indexes(self, changed=None, *, force_full=()):
+        indexes = dict(self._database_indexes)
+        invalid_streams = set()
+        metadata_changed = False
+        for relative in sorted(self.caches if changed is None else changed):
+            status = self._statuses[relative]
+            previous = indexes.get(relative)
+            generation = getattr(status, "generation", "")
+            with self.caches[relative].read() as conn:
+                schema_version = conn.execute("PRAGMA schema_version").fetchone()[0]
+                schema_changed = previous is None or schema_version != previous["schema_version"]
+                generation_changed = previous is None or generation != previous["generation"]
+                if schema_changed or generation_changed:
+                    metadata_changed = True
+                    tables = _tables(conn)
+                    columns = {lowered: _columns(conn, table) for lowered, table in tables.items()}
+                    data = {}
+                    pages = self._page_tables(conn)
+                    affected = set(tables)
+                else:
+                    tables, columns = previous["tables"], previous["columns"]
+                    data, pages = dict(previous["data"]), previous["pages"]
+                    changed_pages = getattr(status, "changed_pages", None)
+                    if changed_pages is None or relative in force_full:
+                        affected = set(tables)
+                        pages = self._page_tables(conn)
+                    elif pages is None:
+                        affected = set(tables)
+                    elif 1 in changed_pages or any(page not in pages for page in changed_pages):
+                        # 页分配/释放会改动页1；未知页、页复用必须重建归属并安全回退。
+                        affected = set(tables)
+                        pages = self._page_tables(conn)
+                    else:
+                        affected = set().union(*(pages[page] for page in changed_pages)) if changed_pages else set()
+                for lowered in affected:
+                    if lowered not in tables:
+                        continue
+                    if lowered in {"contact", "sessiontable", "name2id", "sendername2id"}:
+                        metadata_changed = True
+                        data[lowered] = self._index_table(conn, lowered, tables[lowered], columns[lowered])
+                    if lowered.startswith("msg_"):
+                        invalid_streams.add(relative + ":" + tables[lowered])
+                indexes[relative] = {"schema_version": schema_version, "generation": generation,
+                                     "tables": tables, "columns": columns, "data": data, "pages": pages}
+        if not metadata_changed:
+            # 普通消息页更新只改变行数据；复用全账号联系人、映射和流对象。
+            for stream_id in invalid_streams:
+                self._highwaters.pop(stream_id, None)
+                self._backlog_counts.pop(stream_id, None)
+            self._database_indexes = indexes
+            if invalid_streams:
+                self._index_revision += 1
+                self._idle_poll_signature = None
+            return
         contacts, names, sender_maps, session_unread = {}, set(), {}, {}
-        for relative, cache in self.caches.items():
-            with cache.read() as conn:
-                tables = _tables(conn)
-                for lowered, table in tables.items():
-                    columns = _columns(conn, table)
-                    if lowered == "contact":
-                        username = _column(columns, "username", "user_name")
-                        if username is None:
-                            raise DatabaseReadError("unsupported_contact_schema", "联系人表缺少 username")
-                        expressions = [_quote(username)]
-                        for field in ("nick_name", "remark", "alias"):
-                            column = _column(columns, field)
-                            expressions.append(_quote(column) if column else "''")
-                        for row in conn.execute(f"SELECT {','.join(expressions)} FROM {_quote(table)}"):
-                            user = _text(row[0])
-                            if not user:
-                                continue
-                            nick, remark, alias = map(_text, row[1:])
-                            contacts[user] = {"conversation_id": self.conversation_id(user), "username": user,
-                                              "nick_name": nick, "remark": remark, "alias": alias,
-                                              "display_name": remark or nick or user,
-                                              "is_group": user.endswith("@chatroom")}
-                            names.add(user)
-                    elif lowered == "sessiontable":
-                        user_col = _column(columns, "username", "user_name")
-                        if user_col:
-                            names.update(_text(row[0]) for row in conn.execute(
-                                f"SELECT {_quote(user_col)} FROM {_quote(table)}") if row[0])
-                            count_col = _column(columns, "unread_count")
-                            first_col = _column(columns, "unread_first_msg_srv_id")
-                            if count_col and first_col:
-                                for row in conn.execute(f"SELECT {_quote(user_col)},{_quote(count_col)},"
-                                                        f"{_quote(first_col)} FROM {_quote(table)} WHERE {_quote(count_col)}>0"):
-                                    session_unread[_text(row[0])] = (_integer(row[1]), _integer(row[2]))
-                    elif lowered in {"name2id", "sendername2id"}:
-                        user_col = _column(columns, "user_name", "username", "name")
-                        id_col = _column(columns, "id", "user_id")
-                        if user_col:
-                            id_expr = _quote(id_col) if id_col else "rowid"
-                            mapping = {int(row[0]): _text(row[1]) for row in conn.execute(
-                                f"SELECT {id_expr},{_quote(user_col)} FROM {_quote(table)}") if row[1]}
-                            names.update(mapping.values())
-                            # Name2Id is local to its message shard; SenderName2Id is the global resource map.
-                            sender_maps.setdefault(relative, {}).update(mapping)
-                            if lowered == "sendername2id":
-                                sender_maps.setdefault("*", {}).update(mapping)
+        for relative, index in indexes.items():
+            for lowered, data in index["data"].items():
+                contacts.update(data["contacts"])
+                names.update(data["names"])
+                session_unread.update(data["unread"])
+                if data["mapping"] is not None:
+                    sender_maps.setdefault(relative, {}).update(data["mapping"])
+                    if lowered == "sendername2id":
+                        sender_maps.setdefault("*", {}).update(data["mapping"])
         for user in names:
             contacts.setdefault(user, {"conversation_id": self.conversation_id(user), "username": user,
                                        "nick_name": "", "remark": "", "alias": "",
                                        "display_name": user, "is_group": user.endswith("@chatroom")})
         md5_index = {hashlib.md5(user.encode()).hexdigest(): user for user in names}
         streams = {}
-        for relative, cache in self.caches.items():
+        for relative, index in indexes.items():
             if not Path(relative).name.lower().startswith("message_"):
                 continue
-            with cache.read() as conn:
-                for table in _tables(conn).values():
-                    if not table.lower().startswith("msg_"):
-                        continue
-                    columns = _columns(conn, table)
-                    if not _column(columns, "local_id"):
-                        raise DatabaseReadError("unsupported_message_schema", "消息表缺少 local_id")
-                    if not _column(columns, "local_type", "type") or not _column(columns, "create_time"):
-                        raise DatabaseReadError("unsupported_message_schema", "消息表缺少类型或时间字段")
-                    stream_id = relative + ":" + table
-                    generation = getattr(self._statuses[relative], "generation", "")
-                    streams[stream_id] = MessageStream(stream_id, relative, table,
-                                                       md5_index.get(table[4:].lower(), ""), columns, generation)
+            for lowered, table in index["tables"].items():
+                if not lowered.startswith("msg_"):
+                    continue
+                columns = index["columns"][lowered]
+                if not _column(columns, "local_id"):
+                    raise DatabaseReadError("unsupported_message_schema", "消息表缺少 local_id")
+                if not _column(columns, "local_type", "type") or not _column(columns, "create_time"):
+                    raise DatabaseReadError("unsupported_message_schema", "消息表缺少类型或时间字段")
+                stream_id = relative + ":" + table
+                talker = md5_index.get(table[4:].lower(), "")
+                existing = self._streams.get(stream_id)
+                streams[stream_id] = (existing if existing is not None and existing.talker == talker and
+                                      existing.columns == columns and existing.generation == index["generation"] else
+                                      MessageStream(stream_id, relative, table, talker, columns, index["generation"]))
         if not streams:
             raise DatabaseReadError("message_database_unavailable", "未找到可识别的微信消息表")
+        invalid_streams.update(set(self._streams) ^ set(streams))
+        for stream_id in invalid_streams:
+            self._highwaters.pop(stream_id, None)
+            self._backlog_counts.pop(stream_id, None)
+        self._database_indexes = indexes
         self._contacts, self._sender_maps, self._streams = contacts, sender_maps, streams
         self._session_unread = session_unread
         self._conversation_lookup = {item["conversation_id"]: user for user, item in contacts.items()}
         self._index_revision += 1
-        self._highwaters = None
         self._idle_poll_signature = None
 
     def search_contacts(self, query="", limit=20):
@@ -325,13 +416,15 @@ class WechatDatabaseReader:
 
     def get_highwaters(self):
         with self._lock:
-            if self._highwaters is None:
-                result = {}
-                for stream_id, stream in self._streams.items():
-                    with self.caches[stream.database].read() as conn:
+            pending = {}
+            for stream_id, stream in self._streams.items():
+                if stream_id not in self._highwaters:
+                    pending.setdefault(stream.database, []).append(stream)
+            for database, streams in pending.items():
+                with self.caches[database].read() as conn:
+                    for stream in streams:
                         cursor = conn.execute(f"SELECT coalesce(max(local_id),0) FROM {_quote(stream.table)}").fetchone()[0]
-                    result[stream_id] = {"cursor": int(cursor), "generation": stream.generation}
-                self._highwaters = result
+                        self._highwaters[stream.stream_id] = {"cursor": int(cursor), "generation": stream.generation}
             return {stream: dict(high) for stream, high in self._highwaters.items()}
 
     def startup_unread_boundaries(self, highwaters):
@@ -416,6 +509,16 @@ class WechatDatabaseReader:
     def _parse(self, stream, row, phase="live", *, include_filtered=False):
         local_id = int(row["local_id"])
         source_id = hashlib.sha256(f"{self.account_id}\0{stream.stream_id}\0{local_id}".encode()).hexdigest()
+        try:
+            return self._parse_message(stream, row, local_id, source_id, phase, include_filtered=include_filtered)
+        except DatabaseReadError as exc:
+            if exc.code != "content_decode_failed":
+                raise
+            # 正文损坏仅属于当前行；依赖/账号/快照错误仍必须使来源暂停。
+            return SourceRecord(stream.stream_id, local_id, source_id,
+                                filter_reason="content_decode_failed", receipt_phase=phase)
+
+    def _parse_message(self, stream, row, local_id, source_id, phase, *, include_filtered=False):
         if not stream.talker:
             return SourceRecord(stream.stream_id, local_id, source_id, filter_reason="conversation_unresolved", receipt_phase=phase)
         kind = self._message_kind(row)
@@ -430,7 +533,10 @@ class WechatDatabaseReader:
         # Older message snapshots prefix a group text body with "wxid:\n".
         if is_group and ":\n" in content and not content.lstrip().startswith("<"):
             prefix, body = content.split(":\n", 1)
-            if prefix in self._contacts or prefix.startswith("wxid_"):
+            if sender and prefix == sender:
+                content = body
+            elif not sender and (prefix.startswith("wxid_") or (
+                    prefix in self._contacts and not self._contacts[prefix]["is_group"])):
                 sender, content = prefix, body
         if kind == "system":
             direction = "system"
@@ -516,6 +622,7 @@ class WechatDatabaseReader:
             self._scan_offset = (offset + 1) % len(streams)
             budget = max(1, int(self.config.get("db_batch_size", 200)))
             backlog = {}
+            highwaters = self.get_highwaters()
             for stream in streams:
                 checkpoint = checkpoints.get(stream.stream_id)
                 if checkpoint is None:
@@ -523,12 +630,18 @@ class WechatDatabaseReader:
                 previous = _integer(checkpoint.get("cursor"))
                 if checkpoint.get("generation") and checkpoint["generation"] != stream.generation:
                     raise DatabaseReadError("source_generation_changed", "来源消息库已替换，需要人工确认新基线")
-                with self.caches[stream.database].read() as conn:
-                    maximum = int(conn.execute(f"SELECT coalesce(max(local_id),0) FROM {_quote(stream.table)}").fetchone()[0])
-                    backlog[stream.stream_id] = int(conn.execute(
-                        f"SELECT count(*) FROM {_quote(stream.table)} WHERE local_id>?", (previous,)).fetchone()[0])
+                maximum = highwaters[stream.stream_id]["cursor"]
                 if maximum < previous:
                     raise DatabaseReadError("source_cursor_regressed", "来源消息序号回退，暂停消息交付")
+                if maximum == previous:
+                    backlog[stream.stream_id] = 0
+                    continue
+                counts = self._backlog_counts.setdefault(stream.stream_id, {})
+                if previous not in counts:
+                    with self.caches[stream.database].read() as conn:
+                        counts[previous] = int(conn.execute(
+                            f"SELECT count(*) FROM {_quote(stream.table)} WHERE local_id>?", (previous,)).fetchone()[0])
+                backlog[stream.stream_id] = counts[previous]
                 if budget <= 0:
                     continue
                 rows = self._rows(stream, after=previous, limit=budget)
@@ -543,6 +656,9 @@ class WechatDatabaseReader:
                     records.append(self._parse(stream, row, phase))
                 advances.append(SourceCheckpoint(stream.stream_id, int(rows[-1]["local_id"]), previous,
                                                  _integer(checkpoint.get("baseline_high_water")), stream.generation))
+                # local_id可能有空洞，必须按实际读取行数扣除，不能用游标差值。
+                self._backlog_counts[stream.stream_id] = {
+                    previous: counts[previous], int(rows[-1]["local_id"]): counts[previous] - len(rows)}
                 budget -= len(rows)
             self._backlog = backlog
             self._idle_poll_signature = signature if not records else None
@@ -596,7 +712,8 @@ class WechatDatabaseReader:
                     sender_name=event.sender_name if event else self._contacts.get(sender, {}).get("display_name", sender or ("自己" if record.filter_reason == "outgoing_message" else "unknown")),
                     direction=event.direction if event else ("outgoing" if record.filter_reason == "outgoing_message" else "system" if record.filter_reason == "system_message" else "unknown"),
                     content_type=event.content_type if event else self._message_kind(row),
-                    content=event.content if event else (_text(row["message_content"]) or _text(row["compress_content"])),
+                    content=(event.content if event else "[正文解码失败]" if record.filter_reason == "content_decode_failed"
+                             else (_text(row["message_content"]) or _text(row["compress_content"]))),
                     timestamp=str(timestamp), stable_id=record.source_message_id, source="wechat_database",
                     message_id=record.source_message_id, source_message_id=record.source_message_id,
                     native_timestamp=timestamp, degraded=event is None and record.filter_reason not in {"outgoing_message", "system_message"},

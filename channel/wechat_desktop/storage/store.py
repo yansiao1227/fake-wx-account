@@ -194,6 +194,27 @@ class WechatDesktopStore:
                 db.execute("ALTER TABLE deliveries ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dedupe ON deliveries(dedupe_key) WHERE dedupe_key != ''")
 
+            # 建表与旧账号迁移同一事务完成；不能在以后每次启动时根据非空
+            # checkpoint 再补标记，否则会把未完成的首次基线误认成老账号。
+            db.execute("SAVEPOINT source_account_schema")
+            try:
+                legacy_schema = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_accounts'"
+                ).fetchone() is None
+                db.execute("CREATE TABLE IF NOT EXISTS source_accounts ("
+                           "account_id TEXT PRIMARY KEY, initialized_at REAL NOT NULL)")
+                if legacy_schema:
+                    db.execute(
+                        "INSERT INTO source_accounts(account_id,initialized_at) "
+                        "SELECT DISTINCT account_id,? FROM source_checkpoints WHERE account_id != ''",
+                        (time.time(),),
+                    )
+                db.execute("RELEASE source_account_schema")
+            except BaseException:
+                db.execute("ROLLBACK TO source_account_schema")
+                db.execute("RELEASE source_account_schema")
+                raise
+
     # ------------------------------------------------------------------
     # Startup migrations (run at most once per DB file per version)
     # ------------------------------------------------------------------
@@ -241,6 +262,50 @@ class WechatDesktopStore:
     # ------------------------------------------------------------------
     # Event ledger
     # ------------------------------------------------------------------
+
+    def source_account_initialized(self, account_id: str) -> bool:
+        """账号完成首次基线的标记；空流账号也有独立生命周期。"""
+        with self._lock, self._connect() as db:
+            return db.execute("SELECT 1 FROM source_accounts WHERE account_id=?",
+                              (account_id,)).fetchone() is not None
+
+    def initialize_source_account(
+        self, account_id: str, highwaters: dict[str, dict], *,
+        startup_unread_bounds: dict[str, int] | None = None,
+    ) -> dict[str, dict]:
+        """全流首次基线和账号完成标记原子提交；老账号新流从零补历史。"""
+        if not account_id:
+            raise ValueError("invalid source account")
+        bounds = startup_unread_bounds or {}
+        for stream_id, high in highwaters.items():
+            high_water = int(high["cursor"])
+            unread_start = int(bounds.get(stream_id, high_water + 1))
+            if not stream_id or high_water < 0 or not 1 <= unread_start <= high_water + 1:
+                raise ValueError("invalid source checkpoint baseline")
+        with self._lock:
+            db = self._connect()
+            db.execute("SAVEPOINT initialize_source_account")
+            try:
+                initialized = db.execute("SELECT 1 FROM source_accounts WHERE account_id=?",
+                                         (account_id,)).fetchone() is not None
+                now = time.time()
+                for stream_id, high in highwaters.items():
+                    high_water = int(high["cursor"]) if not initialized else 0
+                    cursor = int(bounds.get(stream_id, high_water + 1)) - 1 if not initialized else 0
+                    db.execute(
+                        "INSERT OR IGNORE INTO source_checkpoints VALUES (?,?,?,?,?,?)",
+                        (account_id, stream_id, cursor, high_water, high.get("generation", ""), now),
+                    )
+                db.execute("INSERT OR IGNORE INTO source_accounts(account_id,initialized_at) VALUES (?,?)",
+                           (account_id, now))
+                rows = db.execute("SELECT * FROM source_checkpoints WHERE account_id=?",
+                                  (account_id,)).fetchall()
+                db.execute("RELEASE initialize_source_account")
+                return {row["stream_id"]: dict(row) for row in rows}
+            except BaseException:
+                db.execute("ROLLBACK TO initialize_source_account")
+                db.execute("RELEASE initialize_source_account")
+                raise
 
     def get_source_checkpoints(self, account_id: str) -> dict[str, dict]:
         with self._lock, self._connect() as db:
