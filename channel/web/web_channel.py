@@ -2949,22 +2949,36 @@ class ModelsHandler:
         skills/image-generation/scripts/generate.py::_build_providers so
         the UI hint matches reality. Chat-only providers (DeepSeek etc.)
         are absent by design — image generation never falls back to a chat
-        bot regardless of the main model.
-
-        When use_linkai is enabled the hint is suppressed entirely — LinkAI
-        proxies to whichever backend it deems appropriate and surfacing
-        "LinkAI" alone tells the user nothing actionable."""
-        use_linkai_flag = bool(local_config.get("use_linkai", False))
-        linkai_configured = cls._is_real_key(local_config.get("linkai_api_key", ""))
-        if use_linkai_flag and linkai_configured:
+        bot regardless of the main model. Dedicated OpenAI-compatible image
+        credentials are independent of the chat provider and its credentials.
+        A dedicated base without a dedicated key cannot borrow the chat key.
+        """
+        skills_node = local_config.get("skills") or local_config.get("skill") or {}
+        img_node = skills_node.get("image-generation") or {} if isinstance(skills_node, dict) else {}
+        if not isinstance(img_node, dict):
+            img_node = {}
+        # Match config._sync_skill_config_to_env: an existing environment
+        # field wins even when empty; only an absent field falls back to JSON.
+        image_key = str(os.environ.get("SKILL_IMAGE_GENERATION_API_KEY", img_node.get("api_key")) or "").strip()
+        image_base = str(os.environ.get("SKILL_IMAGE_GENERATION_API_BASE", img_node.get("api_base")) or "").strip()
+        dedicated_credentials = bool(image_key or image_base)
+        if dedicated_credentials and not image_key:
+            # Runtime rejects an incomplete dedicated endpoint configuration;
+            # it must not silently switch to another vendor's credentials.
             return {"provider": "", "model": ""}
+        key_envs = {
+            "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY", "doubao": "ARK_API_KEY",
+            "dashscope": "DASHSCOPE_API_KEY", "minimax": "MINIMAX_API_KEY", "linkai": "LINKAI_API_KEY",
+        }
 
         for pid, default_model in cls._IMAGE_AUTO_ORDER:
             meta = ConfigHandler.PROVIDER_MODELS.get(pid) or {}
             key_field = meta.get("api_key_field")
             if not key_field:
                 continue
-            if cls._is_real_key(local_config.get(key_field, "")):
+            key = (image_key if pid == "openai" and dedicated_credentials else
+                   os.environ.get(key_envs[pid], local_config.get(key_field)))
+            if cls._is_real_key(str(key or "").strip()):
                 return {"provider": pid, "model": default_model}
         return {"provider": "", "model": ""}
 
@@ -2974,8 +2988,9 @@ class ModelsHandler:
         (mirrors the per-skill config schema documented in skills/image-generation).
         The runtime resolver in skills/image-generation/scripts/generate.py
         reads this via the SKILL_IMAGE_GENERATION_MODEL env var that the
-        agent_initializer syncs at startup; provider is inferred from the
-        model name prefix, mirroring vision.py's design.
+        agent_initializer syncs at startup. The console also syncs model and
+        provider edits immediately; the runtime factory honors explicit
+        provider pinning before inferring the provider from the model prefix.
 
         ``skill`` (singular) is still tolerated as a legacy fallback —
         config.load_config() folds it into ``skills`` at startup.
@@ -2986,12 +3001,12 @@ class ModelsHandler:
         img_node = skills_node.get("image-generation") or {}
         if not isinstance(img_node, dict):
             img_node = {}
-        explicit_model = (img_node.get("model") or "").strip()
-        explicit_provider = (img_node.get("provider") or "").strip()
+        explicit_model = str(os.environ.get("SKILL_IMAGE_GENERATION_MODEL", img_node.get("model")) or "").strip()
+        explicit_provider = str(os.environ.get("SKILL_IMAGE_GENERATION_PROVIDER", img_node.get("provider")) or "").strip()
 
         # Provider resolution priority:
-        #   1. Explicit `skills.image-generation.provider` (persisted via UI;
-        #      supports custom model names that prefix-inference can't catch).
+        #   1. Explicit provider from env or skills.image-generation.provider;
+        #      supports custom model names that prefix-inference can't catch.
         #   2. Scan per-provider model catalog by model name.
         # Empty provider keeps the dropdown on "auto" when we can't tell.
         inferred_provider = ""
@@ -3022,11 +3037,8 @@ class ModelsHandler:
             "fallback_model": predicted["model"],
             "providers": list(cls._IMAGE_PROVIDER_MODELS.keys()),
             "provider_models": cls._IMAGE_PROVIDER_MODELS,
-            # The dispatcher that honors a pinned provider isn't wired up
-            # yet; advertise this so the UI can show a "saved but not active"
-            # banner until the runtime catches up.
-            "runtime_active": False,
-            "note": "router_pending",
+            "runtime_active": True,
+            "note": "",
         }
 
     # Canonical search provider order. Mirrors PROVIDER_ORDER in
@@ -3448,24 +3460,20 @@ class ModelsHandler:
 
         # The skill subprocess reads SKILL_IMAGE_GENERATION_{MODEL,PROVIDER}
         # from env at startup; mirror the change so live edits apply without
-        # restart.
+        # restart. Preserve explicit empty overrides: removing them would
+        # let the subprocess reload an older selection from ~/.cow/.env.
         model_env = "SKILL_IMAGE_GENERATION_MODEL"
         provider_env = "SKILL_IMAGE_GENERATION_PROVIDER"
-        if model:
-            os.environ[model_env] = model
-        else:
-            os.environ.pop(model_env, None)
-        if provider_id:
-            os.environ[provider_env] = provider_id
-        else:
-            os.environ.pop(provider_env, None)
+        os.environ[model_env] = model or ""
+        os.environ[provider_env] = provider_id or ""
 
         logger.info(f"[ModelsHandler] image updated: provider={provider_id!r} model={model!r}")
         return json.dumps({
             "status": "success",
             "provider": provider_id,
             "model": model,
-            "router_pending": True,
+            "runtime_active": True,
+            "router_pending": False,
         })
 
     def _set_chat(self, provider_id: str, model: str) -> str:

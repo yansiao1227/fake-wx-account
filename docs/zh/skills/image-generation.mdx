@@ -22,7 +22,7 @@ description: 文生图 / 图生图 / 多图融合，支持多家厂商自动路�
 
 1. 按 `OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI` 顺序选第一个已配置的厂商
 2. 遇到 401、模型未开通、网络异常等错误时，自动切到下一家
-3. 用户在对话里指定模型时（如「用 seedream 画一只猫」），对应厂商会被提到最前优先尝试
+3. 指定模型或厂商且该厂商已配置时，只尝试匹配厂商；未指定时才按上述顺序自动回退
 
 如需固定使用某个模型：
 
@@ -38,11 +38,45 @@ description: 文生图 / 图生图 / 多图融合，支持多家厂商自动路�
 
 ## 配置 API Key
 
+### 独立的 OpenAI 兼容作图接口
+
+可为图像技能配置独立服务，不影响聊天模型。真实密钥统一放在 `~/.cow/.env`：
+
+```dotenv
+SKILL_IMAGE_GENERATION_API_KEY=填写作图专用密钥
+SKILL_IMAGE_GENERATION_API_BASE=https://mediocre-new-api.midway.run/v1
+SKILL_IMAGE_GENERATION_PROVIDER=openai
+SKILL_IMAGE_GENERATION_MODEL=gpt-image-2
+```
+
+`api_base` 填到 `/v1`，脚本拼接 `/images/generations`，文生图请求包含 `n=1`。专用地址缺少专用 Key 时会报配置错误，不借用聊天凭据或切换其他服务。专用 Key 未填地址时使用官方 OpenAI 图像地址；两个专用字段均未配置时才兼容原有 OpenAI Key/base。
+
+非敏感选项也可写入根 `config.json` 的 `skills.image-generation`：
+
+```json
+{
+  "skills": {
+    "image-generation": {
+      "provider": "openai",
+      "model": "gpt-image-2",
+      "api_base": "https://mediocre-new-api.midway.run/v1",
+      "api_key": ""
+    }
+  }
+}
+```
+
+对应环境变量优先。脚本独立运行也会加载 `~/.cow/.env`；本项目 Windows 使用 `D:\Miniconda\envs\cowagent-wechat\python.exe`。API 返回的签名 URL 会即时下载，输出为本地绝对路径，继续接入现有 Agent 产物检测和微信图片发送；下载不携带生成 API 的 Bearer。空数据、下载失败或非图片响应均报错，日志不会输出密钥和签名 URL。
+
+自定义服务的编辑能力取决于它是否支持 `/images/edits`，本次提供的接口只确认文生图协议。编辑失败会说明错误，不能静默改成生成一张新图。
+
+### 兼容已有厂商凭据
+
 <Tip>
-  推荐通过 [Web 控制台](/zh/channels/web) 的「模型管理」页面配置，配好的对话模型 Key 会被图像生成技能自动复用，无需重复配置。也可手动编辑配置文件或在对话中通过 `env_config` 工具临时设置。
+  未配置专用图像接口时，已有厂商 Key 可继续复用。推荐用 `env_config` 将生产密钥保存到 `~/.cow/.env`，Web 控制台的「模型管理」页面用于选择图像厂商和模型。
 </Tip>
 
-凭证统一复用主模型厂商的 Key：
+原有厂商凭据仍可使用：
 
 | 字段 | 对应厂商 |
 | --- | --- |

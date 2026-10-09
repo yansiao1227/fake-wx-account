@@ -13,7 +13,9 @@
   "skills": {
     "image-generation": {
       "provider": "",
-      "model": ""
+      "model": "",
+      "api_base": "",
+      "api_key": ""
     }
   },
   "moonshot_api_key": "",
