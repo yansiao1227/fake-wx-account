@@ -730,7 +730,7 @@ class WechatDatabaseReader:
         """同批复用已读行，每流额外索引读取有硬上限，完整排序只在内存进行。"""
         from channel.wechat_desktop.config import DEFAULT_CONFIG
         limit = max(0, min(50, int(self.config.get(
-            "wechat_history_max_messages", DEFAULT_CONFIG["wechat_history_max_messages"]))))
+            "reply_context_max_messages", DEFAULT_CONFIG["reply_context_max_messages"]))))
         scan_limit = max(1, min(10000, int(self.config.get(
             "db_reply_context_max_rows_per_stream", DEFAULT_CONFIG["db_reply_context_max_rows_per_stream"]))))
         targets = {}

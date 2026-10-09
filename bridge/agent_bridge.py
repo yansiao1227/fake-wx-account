@@ -146,6 +146,12 @@ class AgentLLMModel(LLMModel):
             self._bot_type = cur_bot_type
         return self._bot
 
+    def _messages_for_model(self, messages):
+        # Web 也可以继续同一微信 session；已保存的内部标记不依赖本轮通道
+        # 进入 API。无已知标记的普通会话与合法 image.source 仍原样传递。
+        from channel.wechat_desktop.pipeline.session_context import model_messages
+        return model_messages(messages)
+
     def call(self, request: LLMRequest):
         """
         Call the model using COW's bot infrastructure
@@ -156,7 +162,7 @@ class AgentLLMModel(LLMModel):
             if hasattr(self.bot, 'call_with_tools'):
                 # Use tool-enabled call if available
                 kwargs = {
-                    'messages': request.messages,
+                    'messages': self._messages_for_model(request.messages),
                     'tools': getattr(request, 'tools', None),
                     'stream': False,
                     'model': self.model  # Pass model parameter
@@ -218,7 +224,7 @@ class AgentLLMModel(LLMModel):
 
                 # Build kwargs for call_with_tools
                 kwargs = {
-                    'messages': request.messages,
+                    'messages': self._messages_for_model(request.messages),
                     'tools': getattr(request, 'tools', None),
                     'stream': True,
                     'model': self.model  # Pass model parameter
@@ -469,6 +475,19 @@ class AgentBridge:
         cancel_event = None
         token_key = None
         steer_inbox = None
+        from channel.wechat_desktop.pipeline.session_context import (
+            current_run_messages,
+            is_wechat_auto_reply,
+            prepare_agent_session,
+            preserve_image_pointers,
+            replace_run_user,
+            text_of,
+            user_message,
+        )
+        wechat_auto_reply = is_wechat_auto_reply(context)
+        if wechat_auto_reply:
+            # 引用的执行输入隔离不能清空持久化的会话审计。
+            clear_history = False
         try:
             # Extract session_id from context for user isolation
             if context:
@@ -516,9 +535,8 @@ class AgentBridge:
             if context and hasattr(agent, 'model'):
                 agent.model.channel_type = context.get("channel_type", "")
                 agent.model.session_id = session_id or ""
-
             # Store session_id on agent so executor can clear DB on fatal errors
-            agent._current_session_id = session_id
+            agent._current_session_id = None if wechat_auto_reply else session_id
 
             # Bound the in-memory context for scheduler sessions before each run.
             # Scheduler sessions are stable per-task and append every trigger,
@@ -531,6 +549,9 @@ class AgentBridge:
                     1, int(conf().get("agent_max_context_turns", 20)) // 5
                 )
                 self._trim_in_memory_to_turns(agent, scheduler_keep_turns)
+
+            # 只裁剪本轮开始前的旧消息；当前工具循环仍保留完整输入和结果。
+            prepare_agent_session(agent, context)
 
             # Eagerly persist the user message BEFORE running the agent so the
             # session and the user's bubble are immediately visible — even if
@@ -585,6 +606,27 @@ class AgentBridge:
                 if session_id and steer_inbox is not None:
                     get_steer_registry().unregister(session_id, steer_inbox)
 
+            if wechat_auto_reply:
+                with agent.messages_lock:
+                    new_messages = current_run_messages(
+                        agent.messages, query, list(getattr(agent, '_last_run_new_messages', []))
+                    )
+                    original = user_message(
+                        str(context.get("wechat_desktop_user_message") or ""),
+                        context.get("wechat_desktop_input_artifact_paths") or [],
+                        is_reference=bool(context.get("wechat_desktop_is_reference")),
+                    )
+                    new_messages = replace_run_user(new_messages, original)
+                    files = list(getattr(getattr(agent, "stream_executor", None), "files_to_send", []) or [])
+                    new_messages = preserve_image_pointers(new_messages, files)
+                    # 保存原文标记供下轮精简；不把本轮完整注入 query 重复累积。
+                    for index in range(len(agent.messages) - 1, -1, -1):
+                        message = agent.messages[index]
+                        if message.get("role") == "user" and text_of(message) == query:
+                            agent.messages = agent.messages[:index] + new_messages
+                            break
+                    agent._last_run_new_messages = new_messages
+
             # Persist new messages generated during this run
             if session_id:
                 channel_type = (context.get("channel_type") or "") if context else ""
@@ -598,7 +640,7 @@ class AgentBridge:
                 else:
                     with agent.messages_lock:
                         msg_count = len(agent.messages)
-                    if msg_count == 0:
+                    if msg_count == 0 and not wechat_auto_reply:
                         try:
                             from agent.memory import get_conversation_store
                             get_conversation_store().clear_session(session_id)
@@ -661,7 +703,7 @@ class AgentBridge:
             logger.error(f"Agent reply error: {e}")
             # If the agent cleared its messages due to format error / overflow,
             # also purge the DB so the next request starts clean.
-            if session_id and agent:
+            if session_id and agent and not wechat_auto_reply:
                 try:
                     with agent.messages_lock:
                         msg_count = len(agent.messages)
@@ -922,13 +964,23 @@ class AgentBridge:
             store = get_conversation_store()
             # clear_history starts a fresh transcript: wipe the store first so
             # the eager user turn becomes seq 0, matching in-memory state.
-            if clear_history:
+            from channel.wechat_desktop.pipeline.session_context import is_wechat_auto_reply, user_message
+            if clear_history and not is_wechat_auto_reply(context):
                 store.clear_session(session_id)
             channel_type = (context.get("channel_type") or "") if context else ""
-            user_msg = {
-                "role": "user",
-                "content": [{"type": "text", "text": query}],
-            }
+            if is_wechat_auto_reply(context):
+                original = str(context.get("wechat_desktop_user_message") or "")
+                if not original:
+                    return False
+                user_msg = user_message(
+                    original, context.get("wechat_desktop_input_artifact_paths") or [],
+                    is_reference=bool(context.get("wechat_desktop_is_reference")),
+                )
+            else:
+                user_msg = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": query}],
+                }
             store.append_messages(session_id, [user_msg], channel_type=channel_type)
             return True
         except Exception as e:

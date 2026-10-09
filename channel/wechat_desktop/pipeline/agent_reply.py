@@ -6,6 +6,7 @@ import threading
 from copy import deepcopy
 from pathlib import Path
 from bridge.context import Context, ContextType
+from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.pipeline.prompts import (
     DEFAULT_BOT_MENTION_ALIASES,
     _format_agent_notice,
@@ -138,6 +139,15 @@ class AgentReplyCoordinator:
         msg = WechatDesktopMessage(event)
         ctype = msg.ctype
         content = msg.content
+        # 保存原消息供短期会话与重启恢复使用，不重复保存整段注入提示词。
+        user_message = str(event.content or "")
+        if event.content_type in {"image", "file"}:
+            user_message = f"[{'图片' if event.content_type == 'image' else '文件'}: {event.content}]"
+        if event.is_group:
+            user_message = _strip_group_bot_mentions(
+                user_message, [*DEFAULT_BOT_MENTION_ALIASES, channel.config.get("self_display_name", "")]
+            )
+            user_message = f"{event.sender_name or '群成员'}: {user_message}"
         attachment_instruction = ""
         if ctype == ContextType.IMAGE:
             ctype = ContextType.TEXT
@@ -182,16 +192,17 @@ class AgentReplyCoordinator:
                     "不要猜测文件内容，直接说明目前无法读取该文件。"
                 )
         if ctype == ContextType.TEXT:
-            history_items = list(event.history)
+            history_heading, history_lines = _render_event_context_lines(event, channel.config)
             channel._trace(
                 "09-context",
-                "id=%s conversation=%s history_items=%s history_source=%s",
+                "id=%s conversation=%s history_available=%s history_used=%s history_chars=%s history_source=%s",
                 event.event_id[:10],
                 event.conversation_name,
-                len(history_items),
+                len(event.history),
+                len(history_lines),
+                len("\n".join(history_lines)),
                 "wechat_database" if event.source_message_id else "visible",
             )
-            history_heading, history_lines = _render_event_context_lines(event)
             sections = []
             if history_lines:
                 sections.extend(
@@ -239,6 +250,20 @@ class AgentReplyCoordinator:
             wechat_desktop_evidence=event.evidence_path,
             wechat_desktop_source_type=event.source_type,
             wechat_desktop_auto_reply=True,
+            wechat_desktop_user_message=user_message,
+            wechat_desktop_is_reference=bool(event.reference),
+            wechat_desktop_input_artifact_paths=list(dict.fromkeys(
+                str(path) for path in (
+                    event.content if event.content_type in {"image", "file"} else "",
+                    (event.reference or {}).get("file_path", ""),
+                ) if path
+            )),
+            wechat_desktop_session_max_turns=channel.config.get(
+                "reply_session_max_turns", DEFAULT_CONFIG["reply_session_max_turns"]
+            ),
+            wechat_desktop_session_max_chars=channel.config.get(
+                "reply_session_max_chars", DEFAULT_CONFIG["reply_session_max_chars"]
+            ),
         )
         if context:
             channel._trace(
