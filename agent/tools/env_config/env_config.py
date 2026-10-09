@@ -14,6 +14,10 @@ from common.utils import expand_path
 
 # API Key 知识库：常见的环境变量及其描述
 API_KEY_REGISTRY = {
+    "SKILL_IMAGE_GENERATION_API_KEY": "图像生成专用 API 密钥，不影响聊天模型",
+    "SKILL_IMAGE_GENERATION_API_BASE": "OpenAI 兼容图像 API 基地址，包含 /v1，不含 /images/generations",
+    "SKILL_IMAGE_GENERATION_MODEL": "图像生成技能默认模型",
+    "SKILL_IMAGE_GENERATION_PROVIDER": "图像生成技能指定厂商，例如 openai",
     # AI 模型服务
     "OPENAI_API_KEY": "OpenAI API 密钥 (用于GPT模型、Embedding模型)",
     "GEMINI_API_KEY": "Google Gemini API 密钥",
@@ -49,6 +53,8 @@ class EnvConfig(BaseTool):
                     "Environment variable key name. Common keys:\n"
                     "- OPENAI_API_KEY: OpenAI API (GPT models)\n"
                     "- OPENAI_API_BASE: OpenAI API base URL\n"
+                    "- SKILL_IMAGE_GENERATION_API_KEY: dedicated image generation API key\n"
+                    "- SKILL_IMAGE_GENERATION_API_BASE: dedicated OpenAI-compatible image base URL\n"
                     "- CLAUDE_API_KEY: Anthropic Claude API\n"
                     "- GEMINI_API_KEY: Google Gemini API\n"
                     "- LINKAI_API_KEY: LinkAI platform\n"
