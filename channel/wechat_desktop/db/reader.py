@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -483,6 +485,166 @@ class WechatDatabaseReader:
                     _integer(row["local_type"]) & 0xFFFFFFFF, "unsupported")
 
     @staticmethod
+    def _app_node(content):
+        if not content.lstrip().startswith("<"):
+            return None
+        try:
+            root = ElementTree.fromstring(content)
+        except ElementTree.ParseError:
+            return None
+        return root if root.tag == "appmsg" else root.find(".//appmsg")
+
+    @staticmethod
+    def _share_metadata(app):
+        # 只记录原生分享字段；不联网、不获取媒体，也不声称取得了页面正文。
+        return {"title": app.findtext("title") or "", "url": app.findtext("url") or "",
+                "description": app.findtext("des") or "",
+                "platform": app.findtext("appname") or app.findtext("sourcedisplayname") or ""}
+
+    def _parse_reference(self, quoted):
+        content = quoted.findtext("content") or ""
+        kind = self._message_kind({"local_type": quoted.findtext("type")})
+        app = self._app_node(content) if kind == "app_message" else None
+        metadata = {}
+        if app is not None:
+            kind = {57: "text", 5: "share_card", 6: "file"}.get(
+                _integer(app.findtext("type")), "app_message")
+            content = app.findtext("title") or ("" if kind == "text" else f"[{kind}]")
+            if kind == "share_card":
+                metadata = self._share_metadata(app)
+        elif kind in {"image", "voice", "video", "sticker", "location"}:
+            content = {"image": "[图片]", "voice": "[语音]", "video": "[视频]",
+                       "sticker": "[动画表情]", "location": "[位置]"}[kind]
+        resolved = kind == "text" and bool(content.strip())
+        return {"sender_name": quoted.findtext("displayname") or "",
+                "sender_id": quoted.findtext("chatusr") or quoted.findtext("fromusr") or "",
+                "content": content, "content_type": kind,
+                "source_message_id": quoted.findtext("svrid") or "", "depth": 1,
+                "native_type": _integer(quoted.findtext("type")) & 0xFFFFFFFF,
+                "resolved": resolved, "degraded": not resolved, "strategy": "database", **metadata}
+
+    @staticmethod
+    def _reference_server_id(reference):
+        """SQLite 的整数参数必须可精确表示，不能 CAST 非数字或溢出的引用 ID。"""
+        value = str(reference.get("source_message_id") or "").strip()
+        if not value or not value.isascii() or not value.isdecimal() or len(value) > 19:
+            return None
+        number = int(value)
+        return number if 0 < number <= 0x7FFFFFFFFFFFFFFF else None
+
+    def _lookup_reference_row(self, talker, server_id, connections, lookup_cache):
+        key = (talker, server_id)
+        if key not in lookup_cache:
+            matches = []
+            for stream in self._streams.values():
+                column = _column(stream.columns, "server_id")
+                if stream.talker != talker or not column:
+                    continue
+                conn = connections[stream.database]
+                conn.row_factory = sqlite3.Row
+                # 唯一性必须覆盖整个原生会话；相同内容的跨分片重复 ID 也不猜。
+                rows = conn.execute(
+                    f"SELECT /* reference_lookup */ {self._select(stream)} FROM {_quote(stream.table)} "
+                    f"WHERE typeof({_quote(column)})='integer' AND {_quote(column)}=? LIMIT 2",
+                    (server_id,)).fetchall()
+                matches.extend((stream, dict(row)) for row in rows)
+                if len(matches) > 1:
+                    break
+            lookup_cache[key] = matches[0] if len(matches) == 1 else None
+        return lookup_cache[key]
+
+    def _reference_origin(self, event, connections, lookup_cache):
+        reference = event.reference
+        server_id = self._reference_server_id(reference)
+        current_stream = self._streams.get(event.source_stream_id)
+        if (server_id is None or current_stream is None or event.account_id != self.account_id or
+                event.conversation_id != self.conversation_id(current_stream.talker)):
+            return None
+        candidate = self._lookup_reference_row(current_stream.talker, server_id, connections, lookup_cache)
+        if candidate is None:
+            return None
+        stream, row = candidate
+        if (stream.stream_id == event.source_stream_id and
+                _integer(row["local_id"]) >= _integer(event.source_local_id)):
+            return None
+        if event.native_timestamp is None or _integer(row["create_time"]) > event.native_timestamp:
+            return None
+        quoted_kind = self._message_kind({"local_type": reference.get("native_type")})
+        if quoted_kind != "unsupported" and quoted_kind != self._message_kind(row):
+            return None
+        origin_key = ("parsed_origin", stream.stream_id, _integer(row["local_id"]))
+        if origin_key not in lookup_cache:
+            origin = self._parse(stream, row, include_filtered=True).event
+            if origin is not None and origin.content_type == "text":
+                raw = _text(row["message_content"]) or _text(row["compress_content"])
+                app = self._app_node(raw) if self._message_kind(row) == "app_message" else None
+                if not raw.strip() or app is not None and not (app.findtext("title") or "").strip():
+                    origin = None
+            lookup_cache[origin_key] = origin
+        origin = lookup_cache[origin_key]
+        if (origin is None or origin.direction not in {"incoming", "outgoing"} or
+                origin.sender_id.startswith("db-sender:")):
+            return None
+        quoted_sender = reference.get("sender_id", "")
+        # 部分群引用的 chatusr 是群 ID；它只能证明会话，不能当成群成员 ID。
+        if quoted_sender and quoted_sender != current_stream.talker and quoted_sender != origin.sender_id:
+            return None
+        if not event.is_group and quoted_sender == current_stream.talker and quoted_sender != origin.sender_id:
+            return None
+        quoted_type = reference.get("source_content_type") or reference.get("content_type", "")
+        if quoted_type not in {"", "unsupported", "app_message"} and quoted_type != origin.content_type:
+            return None
+        return stream, origin
+
+    def _enrich_reference(self, event, connections, lookup_cache):
+        """补全一层原生引用，不递归解析原消息的引用，不访问界面或网络。"""
+        if not event.reference or event.reference.get("source_native_message_id"):
+            return event
+        candidate = self._reference_origin(event, connections, lookup_cache)
+        if candidate is None:
+            return event  # 找不到或证据有歧义时，仍保留 refermsg 自带的内容。
+        stream, origin = candidate
+        reference = event.reference
+        reference.setdefault("preview_content", reference.get("content", ""))
+        kind = origin.content_type
+        reference["content_type"] = kind
+        if kind == "text":
+            reference["content"] = origin.content
+            reference.update(resolved=bool(origin.content.strip()), degraded=not bool(origin.content.strip()))
+        elif (kind == "file" and not origin.content.lstrip().startswith("<") and
+              reference.get("content") in {None, "", "[file]", "[app_message]"}):
+            reference["content"] = origin.content
+        elif kind == "share_card":
+            for key, value in origin.share_card.items():
+                if value and not reference.get(key):
+                    reference[key] = value
+            if reference.get("content") in {None, "", "[share_card]", "[app_message]"}:
+                reference["content"] = origin.share_card.get("title") or reference.get("content", "")
+        if not reference.get("sender_name"):
+            reference["sender_name"] = origin.sender_name
+        reference.update(
+            source_account_id=self.account_id, source_stream_id=origin.source_stream_id,
+            source_local_id=origin.source_local_id, source_native_message_id=origin.source_message_id,
+            source_generation=stream.generation, native_timestamp=origin.native_timestamp,
+            content_signature=origin.content_signature, source_sender_id=origin.sender_id,
+            source_direction=origin.direction, source_content_type=origin.content_type,
+        )
+        event.history = [{**reference, "is_reference": True}]
+        return event
+
+    def enrich_reference(self, event):
+        """FIFO 物化前按需补文；查询不推进实时游标，也不替换已有原生证据。"""
+        with self._lock, ExitStack() as stack:
+            valid, reason = self.validate_native_event(event)
+            if not valid:
+                raise DatabaseReadError(reason, "引用消息来源已变化，暂停处理")
+            stream = self._streams[event.source_stream_id]
+            databases = {item.database for item in self._streams.values() if item.talker == stream.talker}
+            connections = {database: stack.enter_context(self.caches[database].read())
+                           for database in sorted(databases)}
+            return self._enrich_reference(event, connections, {})
+
+    @staticmethod
     def _select(stream):
         names = {
             "local_id": ("local_id",), "local_type": ("local_type", "type"),
@@ -495,16 +657,107 @@ class WechatDatabaseReader:
                         for alias, candidates in names.items()
                         for column in [_column(stream.columns, *candidates)])
 
-    def _rows(self, stream, *, after=None, limit=200, descending=False):
+    @staticmethod
+    def _row_order(stream, row):
+        # 原生时间界定历史边界；并列时间用原生序号及完整来源主键确定顺序。
+        return (_integer(row["create_time"]), _integer(row["sort_seq"]),
+                stream.stream_id, int(row["local_id"]))
+
+    @staticmethod
+    def _history_order_sql(stream):
+        timestamp = _quote(_column(stream.columns, "create_time"))
+        sequence = _column(stream.columns, "sort_seq")
+        order = [f"{timestamp} DESC"]
+        if sequence:
+            order.append(f"{_quote(sequence)} DESC")
+        return ",".join([*order, "local_id DESC"])
+
+    def _rows(self, stream, *, after=None, limit=200, descending=False, connection=None):
+        if connection is None:
+            with self.caches[stream.database].read() as conn:
+                return self._rows(stream, after=after, limit=limit, descending=descending, connection=conn)
         predicate = " WHERE local_id > ?" if after is not None else ""
-        order = "local_id ASC" if not descending else (
-            "sort_seq DESC, local_id DESC" if _column(stream.columns, "sort_seq") else "local_id DESC")
+        order = self._history_order_sql(stream) if descending else "local_id ASC"
         parameters = (after, limit) if after is not None else (limit,)
-        with self.caches[stream.database].read() as conn:
-            conn.row_factory = sqlite3.Row
-            return [dict(row) for row in conn.execute(
-                f"SELECT {self._select(stream)} FROM {_quote(stream.table)}{predicate} ORDER BY {order} LIMIT ?",
-                parameters)]
+        connection.row_factory = sqlite3.Row
+        return [dict(row) for row in connection.execute(
+            f"SELECT {self._select(stream)} FROM {_quote(stream.table)}{predicate} ORDER BY {order} LIMIT ?",
+            parameters)]
+
+    def _attach_reply_context(self, records, rows, connections):
+        """同一批次快照构建有界候选历史，不重读 UI，不消费来源游标。
+
+        每个会话分片仅使用一个倒序游标，本批所有事件复用该游标。
+        无时间索引的库也只需每会话分片一次排序，不为每条消息重扫表。
+        """
+        from channel.wechat_desktop.config import DEFAULT_CONFIG
+        limit = max(0, min(50, int(self.config.get(
+            "wechat_history_max_messages", DEFAULT_CONFIG["wechat_history_max_messages"]))))
+        targets = {}
+        reference_lookup_cache = {}
+        for record in records:
+            event = record.event
+            if event is None or record.receipt_phase not in {"live", "startup_unread"}:
+                continue
+            if event.reference:
+                self._enrich_reference(event, connections, reference_lookup_cache)
+                event.history = [{**event.reference, "is_reference": True}]
+            elif limit:
+                stream = self._streams[record.stream_id]
+                targets.setdefault(stream.talker, []).append(
+                    (self._row_order(stream, rows[record.source_message_id]), event))
+        for talker, events in targets.items():
+            events.sort(key=lambda pair: pair[0], reverse=True)
+            candidates = {event.source_message_id: [] for _, event in events}
+            for stream in self._streams.values():
+                if stream.talker != talker:
+                    continue
+                if self._highwaters[stream.stream_id]["cursor"] <= 0:
+                    continue  # 空来源复用已缓存高水位，不为上下文重新打开查询。
+                if all(event.source_stream_id == stream.stream_id and event.source_local_id <= 1
+                       for _, event in events):
+                    continue  # 首个原生消息没有同来源前序正主键。
+                conn = connections[stream.database]
+                conn.row_factory = sqlite3.Row
+                timestamp = _quote(_column(stream.columns, "create_time"))
+                cursor = iter(conn.execute(
+                    f"SELECT /* reply_context */ {self._select(stream)} FROM {_quote(stream.table)} "
+                    f"WHERE {timestamp}>=0 AND {timestamp}<=? ORDER BY {self._history_order_sql(stream)}",
+                    (events[0][0][0],)))
+                windows = {event.source_message_id: [] for _, event in events}
+                for row in cursor:
+                    row = dict(row)
+                    order = self._row_order(stream, row)
+                    eligible = [event for boundary, event in events
+                                if len(windows[event.source_message_id]) < limit and order < boundary
+                                and (stream.stream_id != event.source_stream_id or
+                                     int(row["local_id"]) < event.source_local_id)]
+                    if not eligible:
+                        continue
+                    record = self._parse(stream, row, include_filtered=True)
+                    previous = record.event
+                    if previous is None or previous.direction == "system":
+                        continue
+                    item = {
+                            "sender_name": previous.sender_name if previous.is_group else "",
+                            "content": previous.content if previous.content_type == "text" else f"[{previous.content_type}]",
+                            "content_type": previous.content_type, "direction": previous.direction,
+                            "_message_stable_id": previous.source_message_id,
+                            "source_message_id": previous.source_message_id,
+                            "source_stream_id": previous.source_stream_id,
+                            "source_local_id": previous.source_local_id,
+                            "account_id": previous.account_id, "native_timestamp": previous.native_timestamp,
+                            "source": "wechat_database",
+                    }
+                    for target in eligible:
+                        windows[target.source_message_id].append((order, item))
+                    if all(len(window) >= limit for window in windows.values()):
+                        break
+                for source_id, window in windows.items():
+                    candidates[source_id].extend(window)
+            for _, event in events:
+                ordered = sorted(candidates[event.source_message_id], key=lambda pair: pair[0], reverse=True)
+                event.history = [dict(item) for _, item in reversed(ordered[:limit])]
 
     def _parse(self, stream, row, phase="live", *, include_filtered=False):
         local_id = int(row["local_id"])
@@ -518,6 +771,27 @@ class WechatDatabaseReader:
             return SourceRecord(stream.stream_id, local_id, source_id,
                                 filter_reason="content_decode_failed", receipt_phase=phase)
 
+    @staticmethod
+    def _native_payload_signature(row, content, sender, direction):
+        """原生内容证据与 UI 物化结果分离；只把摘要保存到事件。
+
+        显示名来自可变联系人目录，不参与校验。引用/XML/分享 URL 仍在完整
+        原生正文中，不能用提取后的同名标题替代该证据。
+        """
+        def digest(value):
+            if value is None:
+                return None
+            data = (b"bytes\0" + bytes(value) if isinstance(value, (bytes, bytearray, memoryview))
+                    else b"text\0" + str(value).encode("utf-8"))
+            return hashlib.sha256(data).hexdigest()
+
+        payload = ["wechat-native-payload-v1", digest(content), _integer(row["local_type"]),
+                   _integer(row["real_sender_id"], -1), sender, direction,
+                   None if row["is_sender"] is None else _integer(row["is_sender"]),
+                   _integer(row["create_time"]), _integer(row["server_id"]), _integer(row["sort_seq"]),
+                   digest(row["source"]), digest(row["packed_info_data"])]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+
     def _parse_message(self, stream, row, local_id, source_id, phase, *, include_filtered=False):
         if not stream.talker:
             return SourceRecord(stream.stream_id, local_id, source_id, filter_reason="conversation_unresolved", receipt_phase=phase)
@@ -530,6 +804,7 @@ class WechatDatabaseReader:
         content = _text(row["message_content"])
         if not content:
             content = _text(row["compress_content"])
+        native_content = content
         # Older message snapshots prefix a group text body with "wxid:\n".
         if is_group and ":\n" in content and not content.lstrip().startswith("<"):
             prefix, body = content.split(":\n", 1)
@@ -552,29 +827,19 @@ class WechatDatabaseReader:
             return SourceRecord(stream.stream_id, local_id, source_id, filter_reason="sender_direction_unresolved", receipt_phase=phase)
         if direction == "outgoing" and not include_filtered:
             return SourceRecord(stream.stream_id, local_id, source_id, filter_reason="outgoing_message", receipt_phase=phase)
-        reference = {}
-        root = None
-        if content.lstrip().startswith("<"):
-            try:
-                root = ElementTree.fromstring(content)
-            except ElementTree.ParseError:
-                root = None
-        if kind == "app_message" and root is not None:
-            app = root.find(".//appmsg")
-            if app is None and root.tag == "appmsg":
-                app = root
+        content_signature = self._native_payload_signature(row, native_content, sender, direction)
+        reference, share_card = {}, {}
+        if kind == "app_message":
+            app = self._app_node(content)
             if app is not None:
                 subtype = _integer(app.findtext("type"))
                 content = app.findtext("title") or content
                 kind = {57: "text", 5: "share_card", 6: "file"}.get(subtype, "app_message")
+                if kind == "share_card":
+                    share_card = self._share_metadata(app)
                 quoted = app.find("refermsg")
                 if quoted is not None:
-                    reference = {"sender_name": quoted.findtext("displayname") or "",
-                                 "sender_id": quoted.findtext("chatusr") or quoted.findtext("fromusr") or "",
-                                 "content": quoted.findtext("content") or "",
-                                 "content_type": "text" if _integer(quoted.findtext("type")) == 1 else "unsupported",
-                                 "source_message_id": quoted.findtext("svrid") or "", "depth": 1,
-                                 "resolved": True, "strategy": "database"}
+                    reference = self._parse_reference(quoted)
         at_users = set()
         for raw in (row["source"], row["packed_info_data"]):
             # msgsource may be wrapped in a binary protobuf field. Inspect only its XML island.
@@ -598,8 +863,9 @@ class WechatDatabaseReader:
             sender_id=sender or f"db-sender:{sender_num}", sender_name=sender_name, content_type=kind,
             content=content or f"[{kind}]", direction=direction, is_group=is_group,
             is_at=is_group and (self.owner_wxid in at_users or "notify@all" in at_users),
-            source_type="group" if is_group else "private", reference=reference,
+            source_type="group" if is_group else "private", reference=reference, share_card=share_card,
             message_stable_id=source_id, target_key=source_id, event_id="db-message:" + source_id,
+            content_signature=content_signature,
             account_id=self.account_id, source_stream_id=stream.stream_id, source_message_id=source_id,
             source_local_id=local_id, native_timestamp=_integer(row["create_time"]), receipt_phase=phase,
         )
@@ -607,16 +873,19 @@ class WechatDatabaseReader:
 
     def poll_batch(self, checkpoints, boot_highwaters):
         """游标按 local_id 分页，sort_seq 仅用于历史排序，避免并列序号漏消息。"""
-        with self._lock:
+        with self._lock, ExitStack() as stack:
             signature = (self._index_revision, tuple(sorted(
                 (stream_id, _integer(checkpoint.get("cursor")), checkpoint.get("generation", ""))
                 for stream_id, checkpoint in checkpoints.items())))
             if signature == self._idle_poll_signature:
                 return None
-            records, advances = [], []
+            records, advances, context_rows = [], [], {}
             streams = sorted(self._streams.values(), key=lambda item: item.stream_id)
             if not streams:
                 return None
+            # 所有消息行与上下文查询共用这些已验证快照；缓存刷新须等待批次完成。
+            connections = {database: stack.enter_context(self.caches[database].read())
+                           for database in sorted({stream.database for stream in streams})}
             offset = self._scan_offset % len(streams)
             streams = streams[offset:] + streams[:offset]
             self._scan_offset = (offset + 1) % len(streams)
@@ -638,13 +907,12 @@ class WechatDatabaseReader:
                     continue
                 counts = self._backlog_counts.setdefault(stream.stream_id, {})
                 if previous not in counts:
-                    with self.caches[stream.database].read() as conn:
-                        counts[previous] = int(conn.execute(
-                            f"SELECT count(*) FROM {_quote(stream.table)} WHERE local_id>?", (previous,)).fetchone()[0])
+                    counts[previous] = int(connections[stream.database].execute(
+                        f"SELECT count(*) FROM {_quote(stream.table)} WHERE local_id>?", (previous,)).fetchone()[0])
                 backlog[stream.stream_id] = counts[previous]
                 if budget <= 0:
                     continue
-                rows = self._rows(stream, after=previous, limit=budget)
+                rows = self._rows(stream, after=previous, limit=budget, connection=connections[stream.database])
                 if not rows:
                     continue
                 high = boot_highwaters.get(stream.stream_id, 0)
@@ -653,13 +921,16 @@ class WechatDatabaseReader:
                 for row in rows:
                     phase = ("startup_unread" if (stream.stream_id, int(row["local_id"])) in self._startup_unread_ids else
                              "offline_backfill" if int(row["local_id"]) <= int(high) else "live")
-                    records.append(self._parse(stream, row, phase))
+                    record = self._parse(stream, row, phase)
+                    records.append(record)
+                    context_rows[record.source_message_id] = row
                 advances.append(SourceCheckpoint(stream.stream_id, int(rows[-1]["local_id"]), previous,
                                                  _integer(checkpoint.get("baseline_high_water")), stream.generation))
                 # local_id可能有空洞，必须按实际读取行数扣除，不能用游标差值。
                 self._backlog_counts[stream.stream_id] = {
                     previous: counts[previous], int(rows[-1]["local_id"]): counts[previous] - len(rows)}
                 budget -= len(rows)
+            self._attach_reply_context(records, context_rows, connections)
             self._backlog = backlog
             self._idle_poll_signature = signature if not records else None
             return SourceBatch(self.account_id, uuid.uuid4().hex, tuple(records), tuple(advances)) if records else None
@@ -686,8 +957,46 @@ class WechatDatabaseReader:
                 return False, "source_message_filtered"
             if current.source_message_id != event.source_message_id or current.conversation_id != event.conversation_id:
                 return False, "source_message_identity_mismatch"
-            if current.content != event.content or current.content_type != event.content_type:
+            if (current.sender_id != event.sender_id or current.direction != event.direction or
+                    current.content_type != event.content_type or
+                    event.native_timestamp is not None and current.native_timestamp != event.native_timestamp):
                 return False, "source_message_changed"
+            if event.content_signature:
+                if current.content_signature != event.content_signature:
+                    return False, "source_message_changed"
+            else:
+                # 兼容没有签名的旧合成事件；不把物化状态或 UIA 路径当作原生证据。
+                native_reference = ("source_message_id", "sender_id", "content_type", "content", "url")
+                if (current.content != event.content or
+                        any(current.reference.get(key, "") != event.reference.get(key, "")
+                            for key in native_reference) or current.share_card != event.share_card):
+                    return False, "source_message_changed"
+            if event.reference.get("source_native_message_id"):
+                with ExitStack() as stack:
+                    databases = {item.database for item in self._streams.values() if item.talker == stream.talker}
+                    connections = {database: stack.enter_context(self.caches[database].read())
+                                   for database in sorted(databases)}
+                    reference = event.reference
+                    origin_stream = self._streams.get(reference.get("source_stream_id"))
+                    if (reference.get("source_account_id") != self.account_id or origin_stream is None or
+                            origin_stream.talker != stream.talker):
+                        return False, "reference_source_identity_mismatch"
+                    if reference.get("source_generation") != origin_stream.generation:
+                        return False, "reference_source_generation_changed"
+                    candidate = self._reference_origin(event, connections, {})
+                    if candidate is None:
+                        return False, "reference_source_unavailable"
+                    _, origin = candidate
+                    if (origin.source_message_id != reference.get("source_native_message_id") or
+                            origin.source_stream_id != reference.get("source_stream_id") or
+                            origin.source_local_id != reference.get("source_local_id")):
+                        return False, "reference_source_identity_mismatch"
+                    if (origin.content_signature != reference.get("content_signature") or
+                            origin.native_timestamp != reference.get("native_timestamp") or
+                            origin.sender_id != reference.get("source_sender_id") or
+                            origin.direction != reference.get("source_direction") or
+                            origin.content_type != reference.get("source_content_type")):
+                        return False, "reference_source_changed"
             return True, ""
 
     def read_history(self, native_talker, limit=20):
@@ -699,8 +1008,7 @@ class WechatDatabaseReader:
             limit = max(1, min(50, int(limit)))
             rows = [(stream, row) for stream in self._streams.values() if stream.talker == native_talker
                     for row in self._rows(stream, limit=limit + 1, descending=True)]
-            rows.sort(key=lambda pair: (_integer(pair[1]["sort_seq"], _integer(pair[1]["create_time"])),
-                                        pair[0].stream_id, int(pair[1]["local_id"])), reverse=True)
+            rows.sort(key=lambda pair: self._row_order(*pair), reverse=True)
             messages = []
             for stream, row in reversed(rows[:limit]):
                 record = self._parse(stream, row, include_filtered=True)

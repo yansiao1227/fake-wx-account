@@ -1,30 +1,38 @@
 ---
 title: "微信桌面版项目启动与关闭"
-description: "在 Windows 和 cowagent-wechat Conda 环境中管理 CowAgent"
+description: "在 Windows 和 cowagent-wechat Conda 环境中管理数据库接收与 UIA 操作通道"
 ---
 
 # 微信桌面版项目启动与关闭
 
-当前项目的推荐入口是项目根目录下的 `cow.ps1`。脚本固定使用 Conda 环境
-`cowagent-wechat`，并在当前终端以前台方式运行 CowAgent。运行日志直接打印到
-终端，默认不会自动打开浏览器。
+推荐入口是根目录 `cow.ps1`。脚本通过 Conda 查找 `cowagent-wechat` 环境，在当前终端以前台方式执行 `app.py`，日志直接打印到终端，默认不自动打开浏览器。脚本只支持 `start`、`stop`、`restart`、`status`，没有后台启动或其他参数。
+
+微信通道仅提供 `db_uia`：数据库接收入站消息、查询联系人和历史；UIA 负责发送和必要附件操作。普通观察被动轮询，不切换聊天窗口、不执行 OCR。UIA 消息接收和 Shell Hook 已移除。
 
 ## 启动前准备
 
-1. 使用 Windows PowerShell 进入项目目录：
+1. 进入项目根目录：
 
    ```powershell
    Set-Location D:\workshop\repositories\fake-wx-account
    ```
 
-2. 确认 Conda 可以在当前终端中使用，并且环境存在：
+2. 确认环境及解释器。第一次执行 Python 命令必须先核验路径：
 
    ```powershell
-   conda env list
+   D:\Miniconda\Scripts\conda.exe env list
+   D:\Miniconda\envs\cowagent-wechat\python.exe -c "import sys; print(sys.executable)"
    ```
 
-3. 使用微信桌面自动化时，只登录并保留一个微信 4.1.9.30 主窗口。微信处于风控、
-   白屏或要求重新验证时，不要启动自动化。
+   核验输出必须为 `D:\Miniconda\envs\cowagent-wechat\python.exe`。`cow.ps1` 还要求终端能通过 PATH 找到 `conda`。不要使用裸 `python`、`pip`、`pytest`，也不要将依赖安装到 `base`。
+
+3. 保留一个已登录的微信 4.1.9.30 实例。数据库账号必须唯一认证；多账号歧义时，在通道配置里显式指定 `db_data_dir` 和 `db_account`。
+
+4. 根 `config.json` 只配置模型、Agent、Web 与 `channel_type` 等通用项。启用微信和 Web 时写 `"channel_type": "web,wechat_desktop"`。微信业务项只改 `channel/wechat_desktop/config.py`，不要放回根 JSON；云厂商密钥优先放 `~/.cow/.env`。
+
+5. 首次验证先设置通道 `shadow_mode=True`，检查账号、历史和受控消息落账，再按需要启用发送。当前默认 `shadow_mode=False`；当前私聊和群聊全部放行开关均已开启，群聊仍按 `at_only` 触发。正式运行前检查黑名单、全部放行开关与白名单。
+
+`shadow_mode` 只禁止向微信发送内容，正式通道仍可能执行 Agent 和必要附件物化。若需要不执行 Agent、不操作附件的数据库验证，使用下文的 `--shadow-seconds` 专用诊断。
 
 ## 常用命令
 
@@ -34,87 +42,93 @@ description: "在 Windows 和 cowagent-wechat Conda 环境中管理 CowAgent"
 .\cow.ps1 start
 ```
 
-启动后必须保持当前 PowerShell 窗口打开，运行日志会持续显示在终端中。按
-`Ctrl+C` 即可结束项目。Web 控制台仍监听 `http://127.0.0.1:9899`，但不会自动
-打开；确有需要时可以手动访问。重复执行启动命令不会创建第二个实例。
+保持当前 PowerShell 窗口打开。按仓库当前配置，Web 控制台监听 `http://127.0.0.1:9899`，可手动访问；脚本设置 `COW_OPEN_BROWSER=0`，运行结束后恢复原环境变量。
 
-### 查看状态
+脚本发现 `9899` 已由对应 Conda 解释器的 `app.py` 使用时，会报告已运行。端口被其他进程占用时会报错，不会替你终止该进程。该检查基于端口，不能将其理解为对所有未监听该端口的进程进行单实例管理。
+
+需要绕过入口进行前台排错时，实际应用命令为：
+
+```powershell
+$env:COW_OPEN_BROWSER = "0"
+D:\Miniconda\envs\cowagent-wechat\python.exe .\app.py
+```
+
+### 状态、重启与停止
 
 ```powershell
 .\cow.ps1 status
-```
-
-状态命令会显示服务是否运行、PID 和监听端口。
-
-### 重启
-
-```powershell
 .\cow.ps1 restart
-```
-
-重启会先停止当前 CowAgent 进程，再使用同一个 Conda 环境重新启动。
-
-### 正常停止
-
-```powershell
 .\cow.ps1 stop
 ```
 
-停止后，微信桌面通道不再接收新事件，内存中的待回复队列不会在下次启动时恢复。
+`status` 根据端口监听显示 PID 或停止状态，不检查数据库健康。`restart` 先执行停止，再前台启动，保持该终端打开。修改通道配置、模型配置或代码后需重启进程。
 
-## 查看日志
+正常结束当前前台运行请按 `Ctrl+C`，使应用有机会执行停止与资源清理。从另一终端执行 `stop` 会直接结束通过脚本校验的监听进程；它不是应用级优雅关闭接口，不能保证当前任务或缓存清理已完成。
 
-`.\cow.ps1 start` 会直接在当前终端打印标准输出和错误日志，不再创建后台日志
-文件。日志可能包含会话名称或消息诊断信息，对外转发前应先检查并脱敏。
+重启不会恢复旧回复队列，也不会自动重发已中断或不确定的发送。离线消息默认只补账本和历史；启动未读必须有可验证边界才可能按配置进入回复流程。
 
-正常结束当前前台进程请按 `Ctrl+C`。如果需要从另一个终端结束它，可以执行
-`.\cow.ps1 stop`。
+## 数据库初始化与状态
 
-## 微信 UIA 冒烟测试
+Reader 延迟创建，第一次观察或数据库查询才定位并认证账号、获取密钥。首次刷新全量解密主库，合并已认证的已提交 WAL；同一 WAL 世代只处理新增有效帧。无变化轮询不解密页面、不重建快照。checkpoint、WAL 重置或库替换触发重建；刷新期间持共享锁，全量重建的锁持有时间随库大小增长。
 
-检查 UIA 树、账号、Shell Hook 以及“颜料盒”和“测试群”两个会话。报告会包含
-原始会话名称和消息内容：
+明文缓存按账号隔离到 Agent 工作区，密钥使用 Windows DPAPI 保存，目录限制当前用户与 LocalSystem 访问。Reader 关闭时删除自己的明文快照，重建 Reader 后仍需首次全量刷新。
 
-```powershell
-conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --standard-targets
-```
+控制台状态应检查 `db_read_healthy`、`db_read_stale`、`db_read_last_success_at`、`db_read_account_id`、`db_read_backlog` 和 `db_read_error_code`。陈旧或失败时保留最后验证副本及游标，暂停新事件交付并重试，不切换为 UIA 接收。数据库健康不代表 UIA 发送目标已核验。
 
-测试群可以在消息任意位置包含 `[有人@我]` 来模拟会话级 @ 标记；脚本使用包含
-判断，不要求该关键字位于消息开头。只有显式传入 `--send-smoke` 才会向两个测试
-会话各发送一条带时间戳的消息：
+联系人及指定 ID 的历史查询不推进实时游标、不触发自动回复；当前会话历史只被动读取 UI 标题，正文仍来自数据库。实际发送和经过身份关联的必要附件操作才允许激活微信。完整架构与自动回复流程见[桌面微信通道](../channels/wechat-desktop)。
 
-```powershell
-conda run -n cowagent-wechat python .\scripts\test_wechat_uia.py --send-smoke
-```
+## 日志与只读诊断
 
-如需诊断会话列表控件，可以将其 UIA 树（包括原始会话名称和消息预览）输出为 JSON：
+`start` 的运行日志输出在当前终端。应用自己的日志和诊断可能包含会话名称或聊天内容，对外共享前需检查并脱敏。不得记录、发布数据库密钥。
+
+以下数据库诊断不执行 Agent，不进入正式回复流水线，也不发送消息：
 
 ```powershell
-conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py
-conda run -n cowagent-wechat python .\scripts\dump_wechat_conversation_tree.py --output .\tmp\wechat-conversations.json
+D:\Miniconda\envs\cowagent-wechat\python.exe .\scripts\wechat_db_doctor.py --schema
+D:\Miniconda\envs\cowagent-wechat\python.exe .\scripts\wechat_db_doctor.py --shadow-seconds 60
 ```
 
-诊断气泡 UIA 边界时可增加 `--geometry-summary`。诊断报告包含原始聊天内容，
-不要未经检查直接对外发送。
+按需增加 `--data-dir "数据目录" --account "账号目录名或完整路径"`、`--cache-dir "缓存根目录"` 或 `--conversation-id "稳定会话ID"`。影子诊断写入账号缓存下独立的 `validation/shadow-ledger.sqlite3`，检查数据库接收与历史查询游标隔离，输出耗时、CPU 和进程文件 I/O 等指标；账本可能含聊天明文。
+
+可选 `--benchmark-uia` 显式读取当前 UI 历史用于比较，可能按需执行 OCR，不是消息接收的后备来源。仅有空闲影子观察或合成库测试，不能证明真实新消息延迟、活跃 WAL 增量性能或附件操作实机可用。
+
+## 手工 UIA 诊断
+
+这些脚本诊断 UIA 控件与动作，不负责正式消息接收，可能定位会话或操作窗口。报告可包含原始名称、消息和 UIA 边界；不要在自动化发送过程中同时运行。
+
+```powershell
+D:\Miniconda\envs\cowagent-wechat\python.exe .\scripts\test_wechat_uia.py --standard-targets
+D:\Miniconda\envs\cowagent-wechat\python.exe .\scripts\test_wechat_uia.py --conversation "文件传输助手" --geometry-summary
+D:\Miniconda\envs\cowagent-wechat\python.exe .\scripts\dump_wechat_conversation_tree.py --output .\tmp\wechat-conversations.json
+```
+
+`--standard-targets` 使用脚本内“颜料盒”和“测试群”两处测试目标，不表示这些目标已获自动回复授权。`--send-smoke` 会向这两处发送时间戳消息；同时传入 `--send-to` 与 `--text` 也会真实发送。UIA 历史或复制链接菜单后备可按需加载 OCR，普通数据库观察和发送不使用 OCR。
+
+附件物化要求聊天底部 ScrollPattern 证据、数据库与可见序列的唯一后缀关联、至少两种不同锚点和唯一目标，并在操作前复核账号、窗口、RuntimeId、原生消息及两端序列。缺失证据时返回 `attachment_identity_unavailable`，拒绝点击；实机 ScrollPattern 覆盖仍待验证。
+
+数据库附件不会按文件名、大小或修改时间跨账号搜索缓存；只使用验证气泡的复制路径或
+下载/另存为结果，等待期间仍复核当前账号和会话。发送按钮已尝试执行后，不因旧输入值或
+未知气泡再次按 Enter；未确认结果禁止自动重发。
 
 ## 常见问题
 
-- 找不到 Conda：打开 Anaconda Prompt，或运行 `conda init powershell` 后重启
-  PowerShell。
-- 找不到 `cowagent-wechat`：通过 `conda env list` 确认环境名称。
-- 端口 `9899` 被其他程序占用：`cow.ps1` 会拒绝停止不属于本项目的进程；应先确认
-  占用者，不要直接强制结束未知进程。
-- 微信处于风控状态：立即执行 `.\cow.ps1 stop`，完成微信验证并确认客户端恢复正常
-  后再启动。
-- 项目启动后不要运行真实发送型 UIA 测试；只读冒烟测试也应在微信状态稳定时手动
-  执行。
+- 找不到 Conda：确保 `D:\Miniconda\Scripts` 对当前终端可见，或打开已初始化 Conda 的 PowerShell。
+- 找不到 `cowagent-wechat`：用 `D:\Miniconda\Scripts\conda.exe env list` 查找环境；不要改用 `base` 绕过。
+- 端口 `9899` 被占用：先确认占用者。`status` 只报告监听状态，`start`/`stop` 会校验解释器与 `app.py` 命令行。
+- `account_ambiguous` 或 `account_changed`：停止项目，核对登录账号与通道数据目录，再重新绑定；不要按同名会话继续发送。
+- 数据库陈旧、密钥或校验失败：恢复账号/数据读取条件并查看错误码。不会自动改为 UIA 读取。
+- `attachment_identity_unavailable`：目标或底部/序列证据不足，不应手工取消验证；可先使用文本与明确引用重试。
+- 微信要求验证或客户端异常：停止项目，恢复客户端后再进行受控验证。
 
 ## 命令速查
 
 | 操作 | 命令 |
 | --- | --- |
-| 启动并查看日志 | `.\cow.ps1 start` |
-| 停止 | `.\cow.ps1 stop` |
-| 重启 | `.\cow.ps1 restart` |
-| 状态 | `.\cow.ps1 status` |
+| 前台启动并查看日志 | `.\cow.ps1 start` |
+| 正常结束当前前台运行 | `Ctrl+C` |
+| 从另一终端结束监听进程 | `.\cow.ps1 stop` |
+| 停止后前台重启 | `.\cow.ps1 restart` |
+| 端口运行状态 | `.\cow.ps1 status` |
 | Web 控制台（手动打开） | `http://127.0.0.1:9899` |
+
+数据库实现参考 wechatauto-replica 的固定提交，来源和 Apache 2.0 许可证保留于 `channel/wechat_desktop/db/NOTICE`、`UPSTREAM_LICENSE.txt`；本项目没有安装其完整自动化包。

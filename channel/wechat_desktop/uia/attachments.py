@@ -374,12 +374,39 @@ class WechatAttachmentReader:
             return False
 
     def fetch_message_file(
-        self, message: UiaChatMessage, tmp_root: Optional[Path] = None
+        self, message: UiaChatMessage, tmp_root: Optional[Path] = None,
+        *, allow_filename_cache: bool = True, validate_target=None,
     ) -> str:
         """Copy a visible WeChat file bubble's local file into project tmp."""
         client = self.client
         if message.message_type != "file":
             return ""
+        strict_identity = None
+
+        def current_identity():
+            return (int(client.get_owner_window_handle()), int(client.get_owner_window_process_id()),
+                    str(client.get_title().title or ""))
+
+        def require_target():
+            if validate_target is not None and validate_target() is False:
+                raise RuntimeError("attachment_target_changed")
+            if strict_identity is not None and current_identity() != strict_identity:
+                raise RuntimeError("attachment_target_changed")
+
+        def find_control(root):
+            control = client._find_message_control(root, message)
+            if not allow_filename_cache and (
+                    control is None or _runtime_id(control) != message.runtime_id):
+                return None
+            return control
+
+        if not allow_filename_cache:
+            if not message.runtime_id:
+                return ""
+            require_target()
+            strict_identity = current_identity()
+            if not strict_identity[0] or not strict_identity[1] or not strict_identity[2]:
+                return ""
         target_root = tmp_root or (
             Path(__file__).resolve().parents[2] / "tmp" / "wechat_files"
         )
@@ -391,24 +418,31 @@ class WechatAttachmentReader:
         deadline = time.time() + timeout
         ui_attempted = False
         while True:
-            cached = client._find_cached_message_file(message.content)
+            cached = client._find_cached_message_file(message.content) if allow_filename_cache else ""
             if cached:
                 stored = client._store_file_in_tmp(cached, Path(target_root))
                 if stored:
                     logger.info("[WechatDesktop] cached file copied to tmp: %s", stored)
                     return stored
-            if ui_attempted:
+            if ui_attempted and allow_filename_cache:
                 if time.time() >= deadline:
                     break
                 time.sleep(min(0.5, max(0.0, deadline - time.time())))
                 continue
+            if ui_attempted and time.time() >= deadline:
+                break
+            first_attempt = not ui_attempted
             ui_attempted = True
+            require_target()
             client.focus_window()
+            require_target()
             with client.operation_lock, client._uia_root() as root:
-                control = client._find_message_control(root, message)
+                require_target()
+                control = find_control(root)
                 if control is None:
                     break
                 paths = client._copy_control_file_paths(control)
+                require_target()
                 for path in paths:
                     try:
                         stored = client._store_file_in_tmp(path, Path(target_root))
@@ -421,18 +455,27 @@ class WechatAttachmentReader:
                     if stored:
                         logger.info("[WechatDesktop] file copied to tmp: %s", stored)
                         return stored
-                if timeout > 0:
+                if first_attempt and timeout > 0:
                     download = client._download_button(control)
                     if download is not None:
+                        require_target()
                         client._click_and_restore(download)
             if time.time() >= deadline:
                 break
+            if not allow_filename_cache:
+                # 数据库事件必须重读同一已验证气泡复制出的路径；下载完成后也不能
+                # 根据跨账号目录中的同名文件推断归属。下载按钮只在首次读取时点击。
+                time.sleep(min(0.5, max(0.0, deadline - time.time())))
         if bool(client.config.get("uia_file_save_as_enabled", True)):
             try:
+                require_target()
                 client.focus_window()
+                require_target()
                 with client.operation_lock, client._uia_root() as root:
-                    control = client._find_message_control(root, message)
+                    require_target()
+                    control = find_control(root)
                     if control is not None:
+                        require_target()
                         saved = client._save_control_file_as(
                             control,
                             message.content,
@@ -440,11 +483,15 @@ class WechatAttachmentReader:
                             max(timeout, 5.0),
                         )
                         if saved:
+                            require_target()
                             return saved
             except Exception as exc:
                 logger.warning(
                     "[WechatDesktop] native Save As fallback failed: %s", exc
                 )
+        if not allow_filename_cache:
+            logger.warning("[WechatDesktop] verified file bubble has no attributable local path")
+            return ""
         filename, expected_size = client._file_card_metadata(message.content)
         logger.warning(
             "[WechatDesktop] file bubble was detected but no local file path "
@@ -460,6 +507,7 @@ class WechatAttachmentReader:
         self,
         point: tuple[int, int],
         target: Path,
+        *, validate_before_click=None, validate_context=None,
     ) -> str:
         """点击一个已验证的图片命中区域并截取新打开的微信图片查看器。"""
         client = self.client
@@ -467,8 +515,12 @@ class WechatAttachmentReader:
         import win32gui
         from PIL import ImageGrab
 
+        if validate_context is not None:
+            validate_context()
         main_hwnd = client.get_owner_window_handle()
         visible_before = client._visible_top_level_window_handles()
+        if validate_before_click is not None:
+            validate_before_click()
         client._left_click_point(point)
         client._paced_wait(
             "uia_image_viewer_settle_ms_min",
@@ -476,6 +528,8 @@ class WechatAttachmentReader:
         )
         viewer_hwnd = client._find_opened_image_viewer(main_hwnd, visible_before)
         if not viewer_hwnd:
+            if validate_context is not None:
+                validate_context()
             logger.warning(
                 "[WechatDesktop] image click did not open a strictly "
                 "verified viewer"
@@ -487,13 +541,18 @@ class WechatAttachmentReader:
             return ""
 
         captured = False
+        context_valid = True
         viewer_closed = False
         main_restored = False
         try:
+            if validate_context is not None:
+                validate_context()
             viewer_bounds = tuple(
                 int(value) for value in win32gui.GetWindowRect(viewer_hwnd)
             )
             image = ImageGrab.grab(bbox=viewer_bounds, all_screens=True)
+            if validate_context is not None:
+                validate_context()
             if image.width >= 2 and image.height >= 2:
                 image.save(target, format="PNG")
                 captured = True
@@ -509,6 +568,11 @@ class WechatAttachmentReader:
                 "uia_image_viewer_before_close_ms_min",
                 "uia_image_viewer_before_close_ms_max",
             )
+            if validate_context is not None:
+                try:
+                    validate_context()
+                except Exception:
+                    context_valid = False
             viewer_closed = client._close_image_viewer(viewer_hwnd, main_hwnd)
             # Qt may keep the closed viewer HWND alive while asynchronously
             # transferring activation.  Let that transition finish before
@@ -518,7 +582,10 @@ class WechatAttachmentReader:
                 "uia_image_viewer_close_settle_ms_min",
                 "uia_image_viewer_close_settle_ms_max",
             )
-            if not viewer_closed:
+            if not context_valid:
+                # 仍仅关闭本次已验证查看器；账号/会话变化后不再抢前台恢复旧窗口。
+                pass
+            elif not viewer_closed:
                 logger.warning(
                     "[WechatDesktop] image viewer remained open: hwnd=%s",
                     viewer_hwnd,
@@ -539,7 +606,36 @@ class WechatAttachmentReader:
                         "image viewer focus restore failure",
                         main_hwnd,
                     )
-        return str(target) if captured and viewer_closed and main_restored else ""
+        return str(target) if captured and viewer_closed and main_restored and context_valid else ""
+
+    def _bound_image_guard(self, message, validate_target):
+        client = self.client
+        if not message.runtime_id:
+            raise RuntimeError("attachment_control_identity_unavailable")
+
+        def identity():
+            return (int(client.get_owner_window_handle()), int(client.get_owner_window_process_id()),
+                    str(client.get_title().title or ""))
+
+        if validate_target is not None and validate_target() is False:
+            raise RuntimeError("attachment_target_changed")
+        expected = identity()
+        if not all(expected):
+            raise RuntimeError("attachment_target_unavailable")
+
+        def require_context():
+            if validate_target is not None and validate_target() is False:
+                raise RuntimeError("attachment_target_changed")
+            if identity() != expected:
+                raise RuntimeError("attachment_target_changed")
+
+        return require_context
+
+    def _bound_image_control(self, root, message):
+        control = self.client._find_message_control(root, message)
+        if control is None or _runtime_id(control) != message.runtime_id:
+            return None
+        return control
 
     @staticmethod
     def _reference_image_activation_point(
@@ -562,6 +658,7 @@ class WechatAttachmentReader:
         self,
         message: UiaChatMessage,
         tmp_root: Optional[Path] = None,
+        *, strict: bool = False, validate_target=None,
     ) -> str:
         """直接点击当前引用节点的引用区域并截取被引用图片的大图。"""
         client = self.client
@@ -591,9 +688,17 @@ class WechatAttachmentReader:
             hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] + ".png"
         )
         try:
+            require_context = self._bound_image_guard(message, validate_target) if strict else None
+            if require_context is not None:
+                require_context()
             client.focus_window()
             with client.operation_lock, client._uia_root() as root:
-                control = client._find_message_control(root, message)
+                if require_context is not None:
+                    require_context()
+                control = (self._bound_image_control(root, message) if strict else
+                           client._find_message_control(root, message))
+                if strict and control is None:
+                    return ""
                 click_bounds = _bounds(control) if control is not None else message.bounds
                 if not click_bounds:
                     return ""
@@ -607,6 +712,15 @@ class WechatAttachmentReader:
                 point,
                 click_bounds,
             )
+            if strict:
+                def before_click():
+                    require_context()
+                    with client.operation_lock, client._uia_root() as root:
+                        current = self._bound_image_control(root, message)
+                        if current is None or _bounds(current) != click_bounds:
+                            raise RuntimeError("attachment_image_control_changed")
+                return client._capture_image_viewer_from_point(
+                    point, target, validate_before_click=before_click, validate_context=require_context)
             return client._capture_image_viewer_from_point(point, target)
         except Exception as exc:
             logger.warning(
@@ -619,6 +733,7 @@ class WechatAttachmentReader:
         message: UiaChatMessage,
         tmp_root: Optional[Path] = None,
         prefer_viewer: bool = True,
+        *, strict: bool = False, validate_target=None,
     ) -> str:
         """Open WeChat's image viewer and capture it, falling back to the bubble."""
         client = self.client
@@ -642,13 +757,26 @@ class WechatAttachmentReader:
         target = target_root / (
             hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16] + ".png"
         )
+        require_context = None
+        if strict:
+            try:
+                require_context = self._bound_image_guard(message, validate_target)
+            except Exception:
+                return ""
         if prefer_viewer and bool(client.config.get("uia_image_viewer_enabled", True)):
             try:
+                if require_context is not None:
+                    require_context()
                 client.focus_window()
                 with client.operation_lock, client._uia_root() as root:
-                    control = client._find_message_control(root, message)
+                    if require_context is not None:
+                        require_context()
+                    control = (self._bound_image_control(root, message) if strict else
+                               client._find_message_control(root, message))
+                    if strict and control is None:
+                        return ""
                     click_bounds = client._image_activation_bounds(
-                        control, message.bounds
+                        control, _bounds(control) if strict else message.bounds
                     )
                     if not click_bounds:
                         raise RuntimeError("image activation bounds are unavailable")
@@ -657,15 +785,46 @@ class WechatAttachmentReader:
                         int((click_left + click_right) / 2),
                         int((click_top + click_bottom) / 2),
                     )
-                captured = client._capture_image_viewer_from_point(point, target)
+                if strict:
+                    def before_click():
+                        require_context()
+                        with client.operation_lock, client._uia_root() as root:
+                            current = self._bound_image_control(root, message)
+                            current_bounds = (client._image_activation_bounds(current, _bounds(current))
+                                              if current is not None else None)
+                            if current_bounds != click_bounds:
+                                raise RuntimeError("attachment_image_control_changed")
+                    captured = client._capture_image_viewer_from_point(
+                        point, target, validate_before_click=before_click, validate_context=require_context)
+                else:
+                    captured = client._capture_image_viewer_from_point(point, target)
                 if captured:
                     return captured
+                if strict:
+                    return ""
             except Exception as exc:
+                if strict:
+                    return ""
                 logger.warning(
                     "[WechatDesktop] image viewer capture failed; using bubble: %s",
                     exc,
                 )
         try:
+            if strict:
+                require_context()
+                client.focus_window()
+                with client.operation_lock, client._uia_root() as root:
+                    require_context()
+                    control = self._bound_image_control(root, message)
+                    if control is None:
+                        return ""
+                    current_bounds = client._image_activation_bounds(control, _bounds(control))
+                    if not current_bounds:
+                        return ""
+                    left, top, right, bottom = current_bounds
+                import win32gui
+                if int(win32gui.GetForegroundWindow()) != int(client.get_owner_window_handle()):
+                    return ""
             # Bounding rectangles returned by UIA use virtual-screen coordinates.
             # Pillow's all_screens flag preserves negative coordinates on multi-monitor
             # Windows setups and captures only the image-card anchor, not the full row.
@@ -675,6 +834,16 @@ class WechatAttachmentReader:
                 bbox=(left, top, right, bottom),
                 all_screens=True,
             )
+            if require_context is not None:
+                require_context()
+                with client.operation_lock, client._uia_root() as root:
+                    current = self._bound_image_control(root, message)
+                    bounds = (client._image_activation_bounds(current, _bounds(current))
+                              if current is not None else None)
+                    if bounds != (left, top, right, bottom):
+                        return ""
+                if int(win32gui.GetForegroundWindow()) != int(client.get_owner_window_handle()):
+                    return ""
             if image.width < 2 or image.height < 2:
                 return ""
             image.save(target, format="PNG")

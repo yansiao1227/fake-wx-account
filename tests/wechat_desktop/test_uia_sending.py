@@ -1,13 +1,12 @@
 """微信桌面 uia_sending 回归测试。"""
-import time
 import pytest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from channel.wechat_desktop.models import HeaderInfo, UiaChatMessage
+from channel.wechat_desktop.contracts import SendResult, SendStatus
+from channel.wechat_desktop.models import HeaderInfo
 from channel.wechat_desktop.uia.client import WechatUiaClient
 from channel.wechat_desktop.uia.controls import _encode_cf_hdrop
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
-from .helpers import FakeClient, FakeHook, GeometryControl, row
+from .helpers import GeometryControl
 
 
 @pytest.mark.parametrize("override, expected_seconds", [({}, 0.017), (
@@ -345,7 +344,7 @@ def test_send_message_splits_and_verifies_each_chunk(monkeypatch):
     monkeypatch.setattr(
         client, "get_title", lambda: HeaderInfo("target", "private", 1)
     )
-    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
 
@@ -371,21 +370,12 @@ def test_send_message_splits_and_verifies_each_chunk(monkeypatch):
     }
 
 
-def test_send_message_retries_uncleared_input_with_enter_after_verification(
-    monkeypatch,
-):
+@pytest.mark.parametrize("verified", [False, True])
+def test_send_message_keeps_uncleared_input_submission_without_enter_retry(monkeypatch, verified):
+    from channel.wechat_desktop.send_control import mark_send_submitted
+
     client = WechatUiaClient({})
-    enter_retries = []
-    verification_results = iter(
-        [
-            {
-                "success": True,
-                "verified": False,
-                "message": "not visible yet",
-            },
-            {"success": True, "verified": True, "runtime_id": "sent-1"},
-        ]
-    )
+    submissions = []
 
     @contextmanager
     def fake_clipboard(unicode_text=None, files=None):
@@ -398,31 +388,28 @@ def test_send_message_retries_uncleared_input_with_enter_after_verification(
     monkeypatch.setattr(
         client, "get_title", lambda: HeaderInfo("Alice", "private", 1)
     )
-    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
-    monkeypatch.setattr(
-        client,
-        "_paste_and_send",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("WeChat Send button did not clear the reply input")
-        ),
-    )
+    def paste_and_send(**kwargs):
+        mark_send_submitted()
+        submissions.append(kwargs["expected_text"])
+        raise RuntimeError("WeChat Send button did not clear the reply input")
+
+    monkeypatch.setattr(client, "_paste_and_send", paste_and_send)
     monkeypatch.setattr(
         client,
         "_verify_send",
-        lambda *_args, **_kwargs: next(verification_results),
-    )
-    monkeypatch.setattr(
-        client,
-        "_send_existing_input_with_enter",
-        lambda text: enter_retries.append(text) or True,
+        lambda *_args, **_kwargs: {"success": True, "verified": verified},
     )
 
     result = client.send_message("Alice", "working", expedited=True)
 
-    assert enter_retries == ["working"]
-    assert result["success"] is True
-    assert result["verified"] is True
+    assert submissions == ["working"]
+    assert result["verified"] is verified
+    assert result["submitted_chunks"] == 1
+    if not verified:
+        assert result["status"] == "uncertain"
+        assert result["retryable"] is False
 
 
 def test_expedited_send_skips_pacing_and_does_not_delay_next_reply(monkeypatch):
@@ -441,7 +428,7 @@ def test_expedited_send_skips_pacing_and_does_not_delay_next_reply(monkeypatch):
     monkeypatch.setattr(
         client, "get_title", lambda: HeaderInfo("Alice", "private", 1)
     )
-    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
     monkeypatch.setattr(
@@ -489,7 +476,7 @@ def test_send_pacing_waits_outside_the_uia_section(monkeypatch):
     monkeypatch.setattr(
         client, "get_title", lambda: HeaderInfo("target", "private", 1)
     )
-    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
     monkeypatch.setattr(
@@ -538,7 +525,7 @@ def test_send_file_pacing_waits_outside_the_uia_section(monkeypatch, tmp_path):
 
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
-    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(
         client,
@@ -559,8 +546,8 @@ def test_send_file_pacing_waits_outside_the_uia_section(monkeypatch, tmp_path):
     assert timeline == [("pacing_wait", 0), ("paste", 1)]
 
 
-def test_unverified_send_registers_text_to_suppress_echo(monkeypatch):
-    """Text sent but unverified must still register to prevent self-reply loops."""
+def test_unverified_send_returns_conservative_receipt_without_replay(monkeypatch):
+    """Unverified UI submission stays non-retryable and is never submitted twice."""
     client = WechatUiaClient({"uia_text_chunk_chars": 500})
 
     @contextmanager
@@ -572,68 +559,20 @@ def test_unverified_send_registers_text_to_suppress_echo(monkeypatch):
     monkeypatch.setattr(
         client, "get_title", lambda: HeaderInfo("Alice", "private", 1)
     )
-    monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
-    monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: None)
+    submitted = []
+    monkeypatch.setattr(client, "_paste_and_send", lambda expected_text: submitted.append(expected_text))
     monkeypatch.setattr(
         client,
         "_verify_send",
         lambda *_args, **_kwargs: {"success": True, "verified": False},
     )
-    # Do NOT monkeypatch remember_outgoing_message — we need the real cache written.
 
     result = client.send_message("Alice", "hello")
 
     assert result["verified"] is False
-    # Unverified send must still populate the outgoing cache so that
-    # is_known_outgoing_message can suppress the echo on the next scan.
-    echo_message = UiaChatMessage("Alice", "hello", direction="unknown")
-    assert client.is_known_outgoing_message("Alice", echo_message) is True
-
-
-def test_outgoing_echo_uses_short_text_and_long_runtime_windows(monkeypatch):
-    clock = [1000.0]
-    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
-    client = WechatUiaClient(
-        {
-            "outgoing_echo_suppression_seconds": 1800,
-            "outgoing_echo_text_suppression_seconds": 120,
-        }
-    )
-    client.remember_outgoing_message("Alice", "收到", "bot-runtime")
-
-    clock[0] += 121
-
-    same_text_from_user = UiaChatMessage(
-        "Alice", "收到", direction="unknown", runtime_id="user-runtime"
-    )
-    rebuilt_outgoing = UiaChatMessage(
-        "", "内容可能变化", direction="unknown", runtime_id="bot-runtime"
-    )
-    assert client.is_known_outgoing_message("Alice", same_text_from_user) is False
-    assert client.is_known_outgoing_message("Alice", rebuilt_outgoing) is True
-
-    clock[0] += 1680
-    assert client.is_known_outgoing_message("Alice", rebuilt_outgoing) is False
-
-
-def test_select_reply_target_skips_outgoing_bubbles_in_private_chat(monkeypatch):
-    """OCR-confirmed outgoing direction acts as backstop against self-reply loops."""
-    client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
-    # Message history: two incoming, then one outgoing (OCR labeled it).
-    # The outgoing bubble is not in known_outgoing_message cache (e.g., after restart).
-    client.histories["Alice"] = [
-        UiaChatMessage("Alice", "how are you?", direction="incoming", runtime_id="1"),
-        UiaChatMessage("Alice", "please reply", direction="incoming", runtime_id="2"),
-        UiaChatMessage("Me", "I'm fine", direction="outgoing", runtime_id="3"),
-    ]
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-
-    # Should select "please reply" (last incoming), not "I'm fine" (outgoing).
-    assert len(events) == 1
-    assert events[0].content == "please reply"
+    receipt = SendResult.from_backend(result)
+    assert receipt.status == SendStatus.UNVERIFIED
+    assert receipt["retryable"] is False
+    assert submitted == ["hello"]

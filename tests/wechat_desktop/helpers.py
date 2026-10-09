@@ -94,6 +94,7 @@ class FakeClient:
         self.owner_calls = 0
         self.file_paths = {}
         self.file_fetches = []
+        self.file_cache_policies = []
         self.image_paths = {}
         self.image_fetches = []
 
@@ -143,11 +144,16 @@ class FakeClient:
         self.history_ensure_conversation.append(ensure_conversation)
         return list(self.histories.get(runtime_id or name, []))[-limit:]
 
-    def fetch_message_file(self, message):
+    def fetch_message_file(self, message, *, allow_filename_cache=True, validate_target=None):
+        if validate_target is not None:
+            validate_target()
         self.file_fetches.append(message.content)
+        self.file_cache_policies.append(allow_filename_cache)
         return self.file_paths.get(message.content, "")
 
-    def fetch_message_image(self, message):
+    def fetch_message_image(self, message, *, prefer_viewer=True, strict=False, validate_target=None):
+        if validate_target is not None:
+            validate_target()
         self.image_fetches.append(message.content)
         return self.image_paths.get(message.content, "")
 

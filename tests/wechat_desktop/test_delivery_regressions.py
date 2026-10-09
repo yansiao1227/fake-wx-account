@@ -10,7 +10,6 @@ from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.config import load_wechat_desktop_config
 from channel.wechat_desktop.contracts import SendResult, SendStatus
 from channel.wechat_desktop.hybrid import WechatDatabaseBackend
-from channel.wechat_desktop.models import ReplyTargetValidation
 from channel.wechat_desktop.pipeline.delivery import DeliveryBlocked, DeliveryService
 from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
 from channel.wechat_desktop.storage.store import WechatDesktopStore
@@ -121,45 +120,3 @@ def test_reply_with_valid_native_source_still_submits(tmp_path, store, kind):
 
     assert len(submitted) == 1
     assert context["wechat_desktop_queue_terminal"] == "completed"
-
-
-@pytest.mark.parametrize("kind", [ReplyType.IMAGE, ReplyType.IMAGE_URL])
-def test_image_stale_source_accepts_replacement_without_submitting(tmp_path, store, kind):
-    _, _, _, channel, context = _reply_setup(tmp_path, store)
-    replacement = replace(context["msg"].event, content="replacement input")
-    accepted = []
-    submitted = []
-    channel._driver.validate_reply_target = lambda event: ReplyTargetValidation(False, "replacement", replacement)
-    channel._accept_replacement_event = accepted.append
-    channel._deliver = lambda *args, **kwargs: submitted.append(args) or SendResult(SendStatus.SENT)
-
-    channel._send_reply_impl(Reply(kind, "synthetic reply"), context)
-
-    assert accepted == [replacement]
-    assert submitted == []
-    assert context["wechat_desktop_queue_terminal"] == "skipped"
-
-
-@pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, ReplyType.IMAGE_URL])
-def test_replacement_admission_failure_preserves_skipped_reply_and_audit(tmp_path, store, kind):
-    _, _, _, channel, context = _reply_setup(tmp_path, store)
-    replacement = replace(context["msg"].event, content="replacement input")
-    submitted = []
-    stages = []
-    channel._driver.validate_reply_target = lambda event: ReplyTargetValidation(False, "source_message_changed", replacement)
-
-    def fail_admission(event):
-        raise RuntimeError("synthetic replacement admission failure")
-
-    channel._accept_replacement_event = fail_admission
-    channel._deliver = lambda *args, **kwargs: submitted.append(args) or SendResult(SendStatus.SENT)
-    channel._mark_lifecycle = lambda ids, stage, **kwargs: stages.append(stage)
-
-    channel._send_reply_impl(Reply(kind, "synthetic reply"), context)
-
-    assert submitted == []
-    assert stages == []
-    assert context["wechat_desktop_queue_terminal"] == "skipped"
-    audit = store._get_connection().execute("SELECT action_type,result,detail FROM audit ORDER BY id DESC LIMIT 1").fetchone()
-    assert tuple(audit) == ("send_text" if kind == ReplyType.TEXT else "send_image",
-                            "stale_target", "source_message_changed")

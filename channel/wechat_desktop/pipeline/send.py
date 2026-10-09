@@ -197,21 +197,9 @@ class WechatDesktopSendMixin:
             )
             return True
 
-    def _finish_reply_cycle(self, context):
-        """幂等释放后端回复周期，防止回调和异常路径重复解锁。"""
-        if not context or not bool(
-            context.get("wechat_desktop_reply_cycle", False)
-        ):
-            return
-        context["wechat_desktop_reply_cycle"] = False
-        token = str(context.get("wechat_desktop_queue_token") or "")
-        if not token or self._reply_queue.is_active(token):
-            self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
-
     def _success_callback(self, session_id, **kwargs):
-        """Agent 成功结束时释放后端并唤醒等待中的 FIFO 消费者。"""
+        """Agent 成功结束时唤醒等待中的 FIFO 消费者。"""
         context = kwargs.get("context")
-        self._finish_reply_cycle(context)
         if context:
             self._mark_lifecycle(
                 context.get("wechat_desktop_source_event_ids", []),
@@ -224,9 +212,8 @@ class WechatDesktopSendMixin:
         return super()._success_callback(session_id, **kwargs)
 
     def _fail_callback(self, session_id, exception, **kwargs):
-        """Agent 失败时释放后端，并把当前队列项标记为失败。"""
+        """Agent 失败时把当前队列项标记为失败并唤醒消费者。"""
         context = kwargs.get("context")
-        self._finish_reply_cycle(context)
         if context:
             try:
                 self._send_agent_failure_notice(
@@ -263,11 +250,6 @@ class WechatDesktopSendMixin:
         self._trace("11-send-target-invalid", "target=%s reason=%s", target_name, validation.reason)
         self._store.audit(f"send_{content_type}", target_name, "stale_target",
                           self._content_hash(content), detail=validation.reason)
-        if validation.replacement_event is not None:
-            try:
-                self._accept_replacement_event(validation.replacement_event)
-            except Exception as exc:
-                logger.warning("[WechatDesktop] replacement admission failed target=%s: %s", target_name, exc)
         return False
 
     def _send_reply_impl(self, reply: Reply, context: Context):

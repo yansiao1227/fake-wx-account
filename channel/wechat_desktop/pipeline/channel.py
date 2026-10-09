@@ -75,7 +75,6 @@ class WechatDesktopChannel(
         self._stop_event = threading.Event()
         self._runtime_lock = threading.RLock()
         self._runtime_state = "stopped"
-        self._warmup_thread = None
         # 最终回复必须全局串行；队列项同时固化入队时的上下文快照。
         self._reply_queue = WechatReplyQueue(
             capacity=self.config["reply_queue_capacity"],
@@ -120,7 +119,6 @@ class WechatDesktopChannel(
                 "[WechatDesktop] removed %s duplicate stored messages",
                 migration_result["deduplicated"],
             )
-        self._bootstrapped = False
         self._last_cleanup_at = 0.0
         self.login_status = "idle"
         self.user_id = "wechat_desktop_self"
@@ -147,27 +145,8 @@ class WechatDesktopChannel(
     def _finish_lifecycle(self, event_ids, terminal: str):
         self._lifecycle.finish(event_ids, terminal)
 
-    def _warmup_group_sender_ocr(self) -> None:
-        """后台预加载 RapidOCR，避免首次群聊扫描被模型加载拖慢。"""
-        try:
-            preload = getattr(self._driver, "preload_group_sender_ocr", None)
-            if not callable(preload):
-                return
-            ready = bool(preload())
-            if ready:
-                logger.info("[WechatDesktop] RapidOCR preloaded at channel startup")
-            elif bool(self.config.get("uia_group_sender_ocr_enabled", True)):
-                logger.warning(
-                    "[WechatDesktop] RapidOCR preload finished without a ready engine"
-                )
-        except Exception as exc:
-            logger.warning(
-                "[WechatDesktop] RapidOCR preload failed (non-fatal): %s",
-                exc,
-            )
-
     def _live_workers(self):
-        workers = [self._scan_thread, self._materialize_thread, self._queue_thread, self._warmup_thread]
+        workers = [self._scan_thread, self._materialize_thread, self._queue_thread]
         alive = [worker.name for worker in workers if worker and worker.is_alive()]
         return alive
 
@@ -179,7 +158,6 @@ class WechatDesktopChannel(
             self._runtime_state = "starting"
             self._stop_event = threading.Event()
             stop_event = self._stop_event
-            self._bootstrapped = False
             try:
                 self._start_workers()
                 self._runtime_state = "running"
@@ -201,25 +179,6 @@ class WechatDesktopChannel(
             resume()
         recovery = self._store.recover_interrupted_events()
         self._service.update_status(event_recovery=recovery)
-        if not getattr(self._driver, "capabilities", {}).get("background_observation", False):
-            # UIA 读取需要前台与 OCR；数据库后台观察不触碰窗口和截图。
-            self._warmup_thread = threading.Thread(
-                target=self._warmup_group_sender_ocr,
-                name="cow-wechat-rapidocr-warmup",
-                daemon=True,
-            )
-            self._warmup_thread.start()
-            try:
-                activated = self._driver.ensure_foreground()
-                logger.info(
-                    "[WechatDesktop] WeChat foreground check completed; activated=%s",
-                    activated,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "[WechatDesktop] unable to bring WeChat to the foreground at startup: %s",
-                    exc,
-                )
         self._reply_queue = WechatReplyQueue(
             capacity=self.config["reply_queue_capacity"],
             max_wait_seconds=self.config["reply_queue_max_wait_seconds"],
@@ -275,9 +234,8 @@ class WechatDesktopChannel(
         )
         self._trace(
             "00-startup",
-            "reconcile_enabled=%s reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
-            bool(self.config.get("shell_hook_reconcile_enabled", False)),
-            self.config.get("shell_hook_reconcile_seconds"),
+            "backend=db_uia poll_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
+            self.config["db_poll_interval_seconds"],
             bool(self.config.get("auto_reply_private_all")),
             self.config.get("group_reply_mode"),
             list(self.config.get("auto_reply_blacklist", [])),
@@ -298,7 +256,7 @@ class WechatDesktopChannel(
                 self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, "stopped", "channel_stopped")
             self._best_effort("finish_lifecycle", self._finish_lifecycle, pending_ids, "stopped")
             # 消费者有短轮询，不依赖往满队列里写入哨兵来唤醒。
-            for worker in (self._scan_thread, self._materialize_thread, self._queue_thread, self._warmup_thread):
+            for worker in (self._scan_thread, self._materialize_thread, self._queue_thread):
                 if worker and worker.ident is not None and worker is not threading.current_thread():
                     worker.join(timeout=timeout)
             alive = self._live_workers()

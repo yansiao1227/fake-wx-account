@@ -57,7 +57,6 @@ def channel(tmp_path):
 
     channel._driver = SimpleNamespace(
         send_text=send, send_image=send, send_interim_text=send,
-        begin_reply_cycle=lambda *a: None, end_reply_cycle=lambda: None,
         close=lambda: None,
         resolve_target=lambda name: TargetResolution(TargetStatus.RESOLVED, ConversationTarget(name, name)),
     )
@@ -66,7 +65,7 @@ def channel(tmp_path):
     channel._store._get_connection().close()
 
 
-@pytest.mark.parametrize("failure", ["mark_event_processed", "audit", "end_reply_cycle"])
+@pytest.mark.parametrize("failure", ["mark_event_processed", "audit"])
 def test_reply_consumer_survives_cleanup_failures(channel, monkeypatch, failure):
     for text in ("one", "two"):
         channel._reply_queue.enqueue(event(text))
@@ -79,8 +78,7 @@ def test_reply_consumer_survives_cleanup_failures(channel, monkeypatch, failure)
     def broken(*args, **kwargs):
         raise RuntimeError("injected failure")
 
-    target = channel._driver if failure == "end_reply_cycle" else channel._store
-    monkeypatch.setattr(target, failure, broken)
+    monkeypatch.setattr(channel._store, failure, broken)
     channel._dispatch_message = dispatch
     finish = channel._reply_queue.finish
 
