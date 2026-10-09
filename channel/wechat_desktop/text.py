@@ -20,4 +20,3 @@ def split_message_text(value: str, limit: int) -> list[str]:
     if text:
         chunks.append(text)
     return chunks
-
