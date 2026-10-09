@@ -18,7 +18,7 @@ from channel.wechat_desktop.pipeline.prompts import (
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.models import WechatHistoryReadError
 from common.log import file_logger, logger
-from channel.wechat_desktop.contracts import SendResult
+from channel.wechat_desktop.contracts import SendResult, TargetStatus
 
 
 class WechatDesktopSendMixin:
@@ -252,11 +252,29 @@ class WechatDesktopSendMixin:
             **kwargs,
         )
 
+    def _validate_source_before_reply(self, event, context, target_name, content, content_type):
+        """文本和图片共用原消息复核；失效回复不进入发送或额度预留。"""
+        if event is None:
+            return True
+        validation = self._driver.validate_reply_target(event)
+        if validation.valid:
+            return True
+        context["wechat_desktop_queue_terminal"] = "skipped"
+        self._trace("11-send-target-invalid", "target=%s reason=%s", target_name, validation.reason)
+        self._store.audit(f"send_{content_type}", target_name, "stale_target",
+                          self._content_hash(content), detail=validation.reason)
+        if validation.replacement_event is not None:
+            try:
+                self._accept_replacement_event(validation.replacement_event)
+            except Exception as exc:
+                logger.warning("[WechatDesktop] replacement admission failed target=%s: %s", target_name, exc)
+        return False
+
     def _send_reply_impl(self, reply: Reply, context: Context):
         """执行最终发送安全门、目标复核、微信发送和审计。
 
         队列令牌首先阻止超时后的迟到结果；随后检查来源、暂停状态、回复策略和
-        限流。文本发送前还会让后端复核原消息目标，避免 Agent 推理期间会话变化
+        限流。文本和图片发送前都让后端复核原消息目标，避免 Agent 推理期间会话变化
         导致回错人。发送成功但无法验证气泡时记为 ``unverified``，不会自动重试，
         以避免重复发送。
         """
@@ -351,28 +369,8 @@ class WechatDesktopSendMixin:
             if can_auto:
                 try:
                     event = getattr(msg, "event", None)
-                    if event is not None:
-                        validation = self._driver.validate_reply_target(event)
-                        if not validation.valid:
-                            if validation.replacement_event is not None:
-                                self._accept_replacement_event(
-                                    validation.replacement_event
-                                )
-                            context["wechat_desktop_queue_terminal"] = "skipped"
-                            self._trace(
-                                "11-send-target-invalid",
-                                "target=%s reason=%s",
-                                target_name,
-                                validation.reason,
-                            )
-                            self._store.audit(
-                                "send_text",
-                                target_name,
-                                "stale_target",
-                                self._content_hash(reply_text),
-                                detail=validation.reason,
-                            )
-                            return
+                    if not self._validate_source_before_reply(event, context, target_name, reply_text, "text"):
+                        return
                     self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._deliver(send_target, reply_text, policy_target=target_name,
                                            is_group=is_group, token=queue_token, source_event_ids=source_event_ids)
@@ -463,6 +461,9 @@ class WechatDesktopSendMixin:
             )
             if can_auto:
                 try:
+                    event = getattr(msg, "event", None)
+                    if not self._validate_source_before_reply(event, context, target_name, reply.content, "image"):
+                        return
                     self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._deliver(send_target, str(reply.content), policy_target=target_name,
                                            is_group=is_group, content_type="image", token=queue_token, source_event_ids=source_event_ids)
@@ -499,6 +500,9 @@ class WechatDesktopSendMixin:
                         "[WechatDesktop] automatic image send returned unsuccessful: %s",
                         result,
                     )
+                except DeliveryBlocked:
+                    context["wechat_desktop_queue_terminal"] = "skipped"
+                    return
                 except Exception as exc:
                     logger.warning(
                         "[WechatDesktop] automatic image send failed: %s path=%s",
@@ -579,12 +583,12 @@ class WechatDesktopSendMixin:
         )
 
     def _execute_agent_action(self, action: str, **params) -> dict:
-        """供 Agent 读取当前会话历史或主动发送文字的受限入口。
+        """供 Agent 读取历史、查询联系人或主动发送文字的受限入口。
 
         读取为只读操作，不触发会话切换或持久化；发送路径继续遵守暂停、
         黑名单、白名单和限流规则，并要求后端验证发送结果。
         """
-        if action not in {"read_history", "send_text"}:
+        if action not in {"read_history", "search_contacts", "send_text"}:
             return {
                 "status": "error",
                 "message": f"unsupported wechat_desktop action: {action}",
@@ -595,12 +599,12 @@ class WechatDesktopSendMixin:
                 "message": "desktop takeover is paused",
             }
 
-        if action == "read_history":
+        if action in {"read_history", "search_contacts"}:
             max_messages = max(
                 1,
                 min(
                     int(self.config.get("wechat_history_max_messages", 50)),
-                    200,
+                    50,
                 ),
             )
             try:
@@ -617,16 +621,43 @@ class WechatDesktopSendMixin:
                     "code": "invalid_limit",
                     "message": "limit must be at least 1",
                 }
+            conversation_id = params.get("conversation_id", "")
+            if not isinstance(conversation_id, str):
+                return {
+                    "status": "error", "code": "invalid_conversation_id",
+                    "message": "conversation_id must be a string",
+                }
+            conversation_id = conversation_id.strip()
             try:
-                result = self._driver.read_current_chat_history(
-                    min(raw_limit, max_messages)
-                )
+                if action == "search_contacts":
+                    query = params.get("query", "")
+                    if not isinstance(query, str):
+                        return {
+                            "status": "error", "code": "invalid_query",
+                            "message": "query must be a string",
+                        }
+                    search = getattr(self._driver, "search_contacts", None)
+                    if not callable(search):
+                        raise NotImplementedError("backend does not support contact search")
+                    result = search(query.strip(), min(raw_limit, 50))
+                    return {"status": "success", **result}
+                if conversation_id:
+                    read = getattr(self._driver, "read_chat_history", None)
+                    if not callable(read):
+                        raise NotImplementedError("backend does not support history by conversation_id")
+                    result = read(conversation_id, min(raw_limit, max_messages))
+                else:
+                    result = self._driver.read_current_chat_history(
+                        min(raw_limit, max_messages)
+                    )
                 payload = asdict(result)
                 return {
                     "status": "success",
                     "conversation": {
                         "title": result.conversation_title,
                         "type": result.conversation_type,
+                        "id": getattr(result, "conversation_id", ""),
+                        "source": getattr(result, "source", "wechat_history_dialog"),
                     },
                     **{
                         key: value
@@ -634,6 +665,12 @@ class WechatDesktopSendMixin:
                         if key
                         not in {"conversation_title", "conversation_type"}
                     },
+                }
+            except NotImplementedError:
+                return {
+                    "status": "error",
+                    "code": "capability_unavailable",
+                    "message": "the current backend does not support this database read capability",
                 }
             except WechatHistoryReadError as exc:
                 return {
@@ -643,21 +680,36 @@ class WechatDesktopSendMixin:
                 }
             except Exception as exc:
                 file_logger.exception(
-                    "[WechatDesktop][history] current conversation read failed"
+                    "[WechatDesktop][read] backend read failed"
                 )
                 return {
                     "status": "error",
-                    "code": "uia_error",
+                    "code": "database_read_error" if self.config.get("desktop_backend") == "db_uia" else "uia_error",
                     "message": str(exc),
                 }
 
         conversation = str(params.get("conversation", "") or "").strip()
         text = str(params.get("text", "") or "").strip()
-        is_group = bool(params.get("is_group", False))
         if not conversation:
             return {"status": "error", "message": "conversation is required"}
         if not text:
             return {"status": "error", "message": "text is required"}
+        try:
+            resolution = self._driver.resolve_send_target(conversation)
+        except Exception as exc:
+            return {"status": "blocked", "code": "target_resolution_failed", "message": str(exc)}
+        target = resolution.target
+        if (resolution.status != TargetStatus.RESOLVED or target is None
+                or not target.conversation_id or not target.display_name
+                or not isinstance(target.is_group, bool)):
+            return {
+                "status": "blocked", "code": "target_unverified",
+                "message": resolution.reason or "conversation identity or type could not be verified",
+            }
+        # 显示名和群类型都来自后端；Agent 的 is_group 仅保留为兼容参数。
+        conversation_id = target.conversation_id
+        conversation = target.display_name
+        is_group = target.is_group
         if self._policy.is_blocked(conversation):
             return {
                 "status": "blocked",
@@ -678,7 +730,8 @@ class WechatDesktopSendMixin:
             }
 
         try:
-            result = self._deliver(conversation, text, policy_target=conversation, is_group=is_group)
+            result = self._deliver(conversation_id, text, policy_target=conversation,
+                                   is_group=is_group, authorized_target=target)
             if result.get("status") == "not_sent":
                 return {"status": "failed", "conversation": conversation,
                         "verified": False, "retryable": False,
@@ -697,7 +750,7 @@ class WechatDesktopSendMixin:
                     self._content_hash(text),
                 )
                 self._store.append_conversation_history(
-                    conversation_id=conversation,
+                    conversation_id=conversation_id,
                     conversation_name=conversation,
                     sender_name=str(
                         self.config.get("self_display_name") or "我"

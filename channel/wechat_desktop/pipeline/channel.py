@@ -17,7 +17,6 @@
 - ``scan``：扫描、策略过滤、私聊聚合
 - ``materialize``：附件物化与入队
 - ``reply``：FIFO 任务准备、分流和收尾
-- ``broadcast``：每日热点目标展开、任务认领和预写发送
 - ``agent_reply``：Agent 上下文、回调通知和超时取消
 - ``lifecycle``：独立的耗时诊断记录
 - ``send``：最终发送、失败处理、Agent 动作
@@ -29,7 +28,6 @@ import threading
 from bridge.reply import ReplyType
 from channel.chat_channel import ChatChannel
 from channel.wechat_desktop.config import load_wechat_desktop_config
-from channel.wechat_desktop.daily_hot.scheduler import DailyHotScheduler
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
@@ -40,7 +38,7 @@ from channel.wechat_desktop.pipeline.reply import WechatDesktopReplyMixin
 from channel.wechat_desktop.pipeline.scan import WechatDesktopScanMixin
 from channel.wechat_desktop.pipeline.send import WechatDesktopSendMixin
 from channel.wechat_desktop.storage.service import get_wechat_desktop_service
-from channel.wechat_desktop.uia.backend import create_wechat_desktop_backend
+from channel.wechat_desktop.backend import create_wechat_desktop_backend
 from common.log import file_logger, logger
 from common.singleton import singleton
 
@@ -78,9 +76,6 @@ class WechatDesktopChannel(
         self._runtime_lock = threading.RLock()
         self._runtime_state = "stopped"
         self._warmup_thread = None
-        # 后端通过工厂创建，为未来迁移到非 UIA 实现保留稳定替换点。
-        self._driver = create_wechat_desktop_backend(self.config)
-
         # 最终回复必须全局串行；队列项同时固化入队时的上下文快照。
         self._reply_queue = WechatReplyQueue(
             capacity=self.config["reply_queue_capacity"],
@@ -103,13 +98,14 @@ class WechatDesktopChannel(
         self._queue_thread = None
         self._scan_thread = None
         self._materialize_thread = None
-        self._daily_hot_scheduler: DailyHotScheduler | None = None
 
         # 生命周期表只用于诊断耗时，不参与消息业务判断。
         self._lifecycle = LifecycleRecorder()
         self._failure_notice_lock = threading.RLock()
         self._service = get_wechat_desktop_service()
         self._store = self._service.store
+        # 来源读取器从已提交账本恢复游标，因此后端必须在账本创建之后注入。
+        self._driver = create_wechat_desktop_backend(self.config, store=self._store)
         self._policy = WechatDesktopPolicy(self.config, self._store)
         migration_result = self._store.run_startup_migrations(
             normalizer=_normalize_auto_reply_text
@@ -173,8 +169,6 @@ class WechatDesktopChannel(
     def _live_workers(self):
         workers = [self._scan_thread, self._materialize_thread, self._queue_thread, self._warmup_thread]
         alive = [worker.name for worker in workers if worker and worker.is_alive()]
-        if self._daily_hot_scheduler and self._daily_hot_scheduler.is_alive():
-            alive.append("daily_hot")
         return alive
 
     def startup(self):
@@ -202,27 +196,30 @@ class WechatDesktopChannel(
                 break
 
     def _start_workers(self):
+        resume = getattr(self._driver, "resume", None)
+        if callable(resume):
+            resume()
         recovery = self._store.recover_interrupted_events()
         self._service.update_status(event_recovery=recovery)
-        # 尽早加载 RapidOCR 模型，避免首次识别群聊发送者时付出数秒加载延迟。
-        self._warmup_thread = threading.Thread(
-            target=self._warmup_group_sender_ocr,
-            name="cow-wechat-rapidocr-warmup",
-            daemon=True,
-        )
-        self._warmup_thread.start()
-        try:
-            activated = self._driver.ensure_foreground()
-            logger.info(
-                "[WechatDesktop] WeChat foreground check completed; activated=%s",
-                activated,
+        if not getattr(self._driver, "capabilities", {}).get("background_observation", False):
+            # UIA 读取需要前台与 OCR；数据库后台观察不触碰窗口和截图。
+            self._warmup_thread = threading.Thread(
+                target=self._warmup_group_sender_ocr,
+                name="cow-wechat-rapidocr-warmup",
+                daemon=True,
             )
-        except Exception as exc:
-            # 通道继续运行，后续常规校准循环可在微信稍后启动或恢复时自行接上。
-            logger.warning(
-                "[WechatDesktop] unable to bring WeChat to the foreground at startup: %s",
-                exc,
-            )
+            self._warmup_thread.start()
+            try:
+                activated = self._driver.ensure_foreground()
+                logger.info(
+                    "[WechatDesktop] WeChat foreground check completed; activated=%s",
+                    activated,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[WechatDesktop] unable to bring WeChat to the foreground at startup: %s",
+                    exc,
+                )
         self._reply_queue = WechatReplyQueue(
             capacity=self.config["reply_queue_capacity"],
             max_wait_seconds=self.config["reply_queue_max_wait_seconds"],
@@ -265,23 +262,12 @@ class WechatDesktopChannel(
             ),
             auto_reply_contacts=list(self.config.get("auto_reply_contacts", [])),
             auto_reply_groups=list(self.config.get("auto_reply_groups", [])),
-            daily_hot_broadcast_groups=list(
-                self.config.get("daily_hot_broadcast_groups", [])
-            ),
             group_reply_mode=str(self.config.get("group_reply_mode", "at_or_prefix")),
             last_error="",
         )
         self._queue_thread.start()
         self._materialize_thread.start()
         self._scan_thread.start()
-        self._daily_hot_scheduler = DailyHotScheduler(
-            config=self.config,
-            store=self._store,
-            enqueue_callback=self.enqueue_daily_hot_broadcast,
-            is_paused=lambda: bool(self._service.status().get("paused")),
-        )
-        self._daily_hot_scheduler.start()
-        self._service.update_status(**self._daily_hot_scheduler.status())
         self.report_startup_success()
         logger.info(
             "[WechatDesktop] Channel started in %s mode",
@@ -289,14 +275,12 @@ class WechatDesktopChannel(
         )
         self._trace(
             "00-startup",
-            "reconcile_enabled=%s reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s daily_hot=%s@%s",
+            "reconcile_enabled=%s reconcile_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
             bool(self.config.get("shell_hook_reconcile_enabled", False)),
             self.config.get("shell_hook_reconcile_seconds"),
             bool(self.config.get("auto_reply_private_all")),
             self.config.get("group_reply_mode"),
             list(self.config.get("auto_reply_blacklist", [])),
-            bool(self.config.get("daily_hot_broadcast_enabled", False)),
-            self.config.get("daily_hot_broadcast_time", "18:00"),
         )
 
     def stop(self):
@@ -308,8 +292,6 @@ class WechatDesktopChannel(
             queued_ids = self._reply_queue.stop()
             self._best_effort("driver_close", self._driver.close)
             timeout = self.config["worker_join_timeout_seconds"]
-            if self._daily_hot_scheduler is not None:
-                self._best_effort("scheduler_stop", self._daily_hot_scheduler.stop, join_timeout=timeout)
             pending_ids = queued_ids + self._clear_pending_private_batches()
             pending_ids.extend(self._clear_pending_materializations())
             for event_id in pending_ids:

@@ -266,7 +266,7 @@ class WechatDesktopMaterializeMixin:
         source_event_ids = list(
             event.task.source_event_ids or [event.event_id]
         )
-        if not event.task.proactive_send and any(
+        if any(
             self._store.event_state(event_id).get("state") in EVENT_TERMINALS
             for event_id in source_event_ids
         ):

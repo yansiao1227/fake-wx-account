@@ -217,6 +217,7 @@ def test_image_viewer_native_identity_rejects_main_and_other_process(monkeypatch
 
 
 def test_image_viewer_close_prefers_uia_without_global_keyboard(monkeypatch):
+    import win32api
     import win32gui
 
     client = WechatUiaClient({})
@@ -237,9 +238,9 @@ def test_image_viewer_close_prefers_uia_without_global_keyboard(monkeypatch):
         lambda *args: calls.append(("wm_close", *args)),
     )
     monkeypatch.setattr(
-        client,
-        "_press_escape_key",
-        lambda: (_ for _ in ()).throw(
+        win32api,
+        "keybd_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("image viewer must never use global Escape")
         ),
     )

@@ -7,7 +7,7 @@ from typing import Callable
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.text import split_message_text
 from channel.wechat_desktop.send_control import SendCancelled, send_scope
-from channel.wechat_desktop.contracts import SendResult, SendStatus
+from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus
 
 
 class DeliveryBlocked(SendCancelled):
@@ -26,41 +26,36 @@ class DeliveryService:
 
     def send(self, target: str, content: str, *, policy_target: str,
              is_group: bool = False, content_type: str = "text",
-             daily_hot: bool = False, interim: bool = False, token: str = "",
-             before_send: Callable[[], None] | None = None,
-             source_event_ids: list[str] | None = None) -> SendResult:
+             interim: bool = False, token: str = "",
+             source_event_ids: list[str] | None = None,
+             authorized_target: ConversationTarget | None = None) -> SendResult:
         def check_cancelled():
             if self.is_stopped() or self.is_paused() or (token and not self.is_active(token)):
                 raise DeliveryBlocked("send cancelled, paused or expired")
 
         check_cancelled()
-        if not self.policy.allows_send(policy_target, is_group, content_type, daily_hot=daily_hot):
+        if not self.policy.allows_send(policy_target, is_group, content_type):
             raise DeliveryBlocked("send blocked by policy")
         limit = self.config.get("uia_text_chunk_chars", DEFAULT_CONFIG["uia_text_chunk_chars"])
         units = len(split_message_text(content, limit)) if content_type == "text" else 1
-        if not self.policy.reserve_send(units):
-            raise DeliveryBlocked("send rate limit exceeded")
-        # 额度按气泡数一次性预留；UI 操作开始后不退款，避免不确定发送结果引发重复。
         with send_scope(check_cancelled):
             delivery_id = ""
             if self.store is not None:
                 digest = hashlib.sha256(f"{content_type}:{interim}:{content}".encode("utf-8")).hexdigest()
-                delivery_id, previous = self.store.claim_delivery(source_event_ids or [], target, digest, retry_not_sent=daily_hot)
+                delivery_id, previous = self.store.claim_delivery(source_event_ids or [], target, digest)
                 if previous is not None:
                     return previous
-            if before_send is not None:
-                try:
-                    before_send()
-                except Exception as exc:
-                    if self.store is not None:
-                        self.store.finish_delivery(delivery_id, SendResult(SendStatus.NOT_SENT, str(exc)))
-                    raise
             try:
+                # 只有获得新幂等 claim 的调用才预留额度；旧回执直接复用。
+                # 限流失败也写为未提交，避免留下 sending；UI 操作开始后不退款。
+                if not self.policy.reserve_send(units):
+                    raise DeliveryBlocked("send rate limit exceeded")
+                authorization = {"authorized_target": authorized_target} if authorized_target is not None else {}
                 if content_type == "image":
-                    raw = self.backend.send_image(target, content)
+                    raw = self.backend.send_image(target, content, **authorization)
                 else:
                     method = getattr(self.backend, "send_interim_text", None) if interim else None
-                    raw = (method or self.backend.send_text)(target, content)
+                    raw = (method or self.backend.send_text)(target, content, **authorization)
                 result = SendResult.from_backend(raw)
             except SendCancelled as exc:
                 if self.store is not None:

@@ -8,43 +8,14 @@ from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import unquote
 
+# 保留旧导入路径；标题规则只有通道根模块这一份实现。
+from channel.wechat_desktop.conversation import (
+    conversation_titles_match,
+    strip_member_count_suffix,
+)
 from channel.wechat_desktop.models import ConversationInfo
 from channel.wechat_desktop.contracts import SendResult, SendStatus
 from channel.wechat_desktop.send_control import SendCancelled, SendNotSubmitted
-
-# WeChat group headers often append the member count, e.g. "项目群(9)" / "项目群（9）".
-# Session list AutomationId usually keeps the bare name (session_item_项目群).
-_MEMBER_COUNT_SUFFIX = re.compile(
-    r"^(?P<base>.*?)[\s\u00a0]*[（(](?P<count>\d+)[）)]\s*$"
-)
-
-
-def strip_member_count_suffix(title: str) -> str:
-    """Remove a trailing ``(n)`` / ``（n）`` member-count suffix from a chat title."""
-    value = str(title or "").strip()
-    if not value:
-        return ""
-    match = _MEMBER_COUNT_SUFFIX.match(value)
-    if not match:
-        return value
-    base = str(match.group("base") or "").strip()
-    return base or value
-
-
-def conversation_titles_match(left: str, right: str) -> bool:
-    """Compare chat titles, allowing optional group member-count suffixes.
-
-    Exact match wins. Otherwise compare after stripping a trailing ``(n)`` /
-    ``（n）`` from either side (group detail headers often include the count;
-    session rows / config usually do not).
-    """
-    a = str(left or "").strip()
-    b = str(right or "").strip()
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    return strip_member_count_suffix(a) == strip_member_count_suffix(b)
 
 
 @dataclass(frozen=True)
@@ -61,8 +32,8 @@ def resolve_conversation_selector(
 ) -> WechatConversationSelector:
     """把内部会话 ID 转成客户端可使用的标题和 UIA 定位信息。
 
-    优先按内部 key（``uia-session:...``）精确查找。若调用方传入的是显示名
-    （例如每日热点广播使用 ``daily_hot_broadcast_groups`` 里的群名），再按标题唯一匹配。
+    优先按内部 key（``uia-session:...``）精确查找。若调用方传入的是显示名，
+    再按标题唯一匹配。
     标题歧义时不猜测，退回仅标题定位。
     """
 
@@ -155,7 +126,7 @@ class WechatSendOperations:
     """微信发送动作集合。
 
     该类只依赖一个兼容 ``send_message``/``send_file`` 的客户端，以及三个回调。
-    锁调度、会话缓存和状态采集仍由 Driver 持有，因此本类可以独立单测，也便于
+    锁调度、会话绑定和状态采集由网关或调用方提供，因此本类可以独立单测，也便于
     未来把 UIA 客户端换成其他桌面自动化实现。
     """
 

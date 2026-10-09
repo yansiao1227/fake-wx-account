@@ -10,20 +10,31 @@ class WechatDesktopTool(BaseTool):
     name = "wechat_desktop"
     description = (
         "Send text through the dedicated wechat_desktop policy executor, or "
-        "report desktop WeChat status. For reading chat history, use the "
-        "separate wechat_history tool."
+        "report desktop WeChat status. With db_uia, search_contacts reads contacts "
+        "and returns stable conversation_id values without switching chats or "
+        "changing live message cursors. For chat history, use wechat_history."
     )
     params = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["status", "read_history", "send_text"],
+                "enum": ["status", "read_history", "search_contacts", "send_text"],
             },
             "conversation": {
                 "type": "string",
                 "default": "",
-                "description": "Exact contact or group name.",
+                "description": "Exact contact/group name or stable conversation_id returned by search_contacts.",
+            },
+            "conversation_id": {
+                "type": "string",
+                "default": "",
+                "description": "Stable ID from search_contacts when action=read_history; requires db_uia.",
+            },
+            "query": {
+                "type": "string",
+                "default": "",
+                "description": "Contact/group name, remark, alias or username to find when action=search_contacts.",
             },
             "text": {
                 "type": "string",
@@ -33,14 +44,14 @@ class WechatDesktopTool(BaseTool):
             "is_group": {
                 "type": "boolean",
                 "default": False,
-                "description": "Set true only when conversation is a group.",
+                "description": "Compatibility hint only; the backend verifies the real conversation type before authorizing send.",
             },
             "limit": {
                 "type": "integer",
                 "default": 20,
                 "minimum": 1,
                 "maximum": 50,
-                "description": "Recent message count when action=read_history.",
+                "description": "Message or contact count when reading history or searching contacts; at most 50.",
             },
         },
         "required": ["action"],
@@ -53,7 +64,7 @@ class WechatDesktopTool(BaseTool):
             return ToolResult.success(
                 json.dumps(service.status(), ensure_ascii=False)
             )
-        if action == "read_history":
+        if action in {"read_history", "search_contacts"}:
             raw_limit = params.get("limit", 20)
             try:
                 limit = int(raw_limit)
@@ -61,9 +72,19 @@ class WechatDesktopTool(BaseTool):
                 return ToolResult.fail("limit must be an integer")
             if limit < 1:
                 return ToolResult.fail("limit must be at least 1")
-            result = service.execute_agent_action(
-                "read_history", limit=min(limit, 50)
-            )
+            action_params = {"limit": min(limit, 50)}
+            if action == "read_history":
+                conversation_id = params.get("conversation_id", "")
+                if not isinstance(conversation_id, str):
+                    return ToolResult.fail("conversation_id must be a string")
+                if conversation_id.strip():
+                    action_params["conversation_id"] = conversation_id.strip()
+            else:
+                query = params.get("query", "")
+                if not isinstance(query, str):
+                    return ToolResult.fail("query must be a string")
+                action_params["query"] = query.strip()
+            result = service.execute_agent_action(action, **action_params)
             payload = json.dumps(result, ensure_ascii=False)
             if result.get("status") == "error":
                 return ToolResult.fail(payload)

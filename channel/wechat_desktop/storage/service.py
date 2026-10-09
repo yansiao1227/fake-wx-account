@@ -45,8 +45,15 @@ class WechatDesktopService:
             "queue_timeout": 0,
             "auto_reply_contacts": [],
             "auto_reply_groups": [],
-            "daily_hot_broadcast_groups": [],
             "group_reply_mode": "at_only",
+            "db_read_healthy": False,
+            "db_read_stale": False,
+            "db_read_last_success_at": 0,
+            "db_read_account_id": "",
+            "db_read_backlog": {},
+            "db_read_error_code": "",
+            "account_binding": {},
+            "db_read_metadata": {},
         }
 
     def set_agent_executor(self, executor: Optional[Callable]):

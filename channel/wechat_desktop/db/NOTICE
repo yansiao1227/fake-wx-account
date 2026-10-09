@@ -1,0 +1,7 @@
+微信数据库格式和只读 WCDB Cipher 对象识别方式参考：
+https://github.com/fanyuantaier/wechatauto-replica
+固定提交：fbfb02677f8f5c8d52be166dc2a662a836f1354d
+参考文件：wechatauto/db.py（Apache License 2.0）
+
+本项目重新实现了密钥 DPAPI 保存、页认证、提交边界 WAL 校验、增量缓存、
+来源账本、当前版本结构探测和 UIA 混合后端。没有引入上游 UIA 热激活或写进程内存。

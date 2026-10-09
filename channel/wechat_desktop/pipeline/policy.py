@@ -36,11 +36,6 @@ class WechatDesktopPolicy:
             target, self.config.get("auto_reply_blacklist", [])
         )
 
-    def is_daily_hot_target(self, target: str) -> bool:
-        """检查群聊是否属于每日热点目标数组。"""
-
-        return self._matches(target, self.config.get("daily_hot_broadcast_groups", []))
-
     def group_triggered(self, event: WechatDesktopEvent) -> bool:
         """根据群回复模式判断消息是否触发 Agent。"""
 
@@ -48,12 +43,10 @@ class WechatDesktopPolicy:
             return True
         return group_message_triggered(self.config, event.content, event.is_at)
 
-    def allows_send(self, target: str, is_group: bool, content_type: str, *, daily_hot: bool = False) -> bool:
+    def allows_send(self, target: str, is_group: bool, content_type: str) -> bool:
         """无副作用的策略检查；发送额度由发送服务在操作前预留。"""
         if bool(self.config.get("shadow_mode", True)) or self.is_blocked(target):
             return False
-        if daily_hot:
-            return content_type == "text" and self.is_daily_hot_target(target)
         if not self.is_allowlisted(target, is_group):
             return False
         return content_type == "text" or (

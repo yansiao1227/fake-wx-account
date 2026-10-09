@@ -1,7 +1,7 @@
 """wechat_desktop 通道配置。
 
 本通道的**全部业务配置**只写在本文件 ``DEFAULT_CONFIG``。包括 UIA 节拍、白名单、
-``shadow_mode``、限流、通知模板、每日热点、引用/附件策略等。
+``shadow_mode``、限流、通知模板、引用/附件策略等。
 
 根目录 ``config.json`` / ``config-template.json`` / ``config.py`` 只放跨通道通用项
 （模型、Agent、``channel_type``、Web 控制台等），**不要**再写 ``wechat_desktop`` 段。
@@ -18,8 +18,17 @@ from common.log import logger
 from config import conf
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    # 后端与 UI 操作节奏。后端名称是迁移扩展点，当前实现为 Windows UIA。
+    # 后端与 UI 操作节奏。db_uia 从加密库读取，发送仍使用 Windows UIA。
     "desktop_backend": "uia",
+    # 数据库读取配置唯一来源。空路径自动定位，空账号仅在可唯一确定时绑定。
+    "db_data_dir": "",
+    "db_account": "",
+    "db_poll_interval_seconds": 1.0,
+    # 空值使用 Agent 工作区的 wechat_desktop_db，按账号隔离。
+    "db_cache_dir": "",
+    "db_batch_size": 200,
+    "db_snapshot_retry_attempts": 3,
+    "db_key_scan_timeout_seconds": 30.0,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
     "uia_selection_settle_ms": 150,
@@ -88,7 +97,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "reply_queue_max_wait_seconds": 300,
     "worker_join_timeout_seconds": 2.0,
 
-    # 当前会话聊天记录窗口读取。仅通过 UIA 读取，不写入本地会话历史库。
+    # 聊天记录只读查询。UIA 读取当前会话，db_uia 也支持稳定会话 ID。
     "wechat_history_read_enabled": True,
     "wechat_history_max_messages": 50,
     "wechat_history_open_timeout_seconds": 4.0,
@@ -159,8 +168,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
     ],
     "auto_reply_contacts": [],
-    # 自动回复群白名单。与每日热点目标列表相互独立，互不影响。
-    "auto_reply_groups": ["小小地下联络站", "JY生活问候群", "22~25级实验室科研天才们"],
+    # 自动回复群白名单。
+    "auto_reply_groups": ["小小地下联络站", "JY生活问候群", "22~25级实验室科研天才们", "816吃喝玩乐群"],
     "group_reply_mode": "at_only",
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",
@@ -212,14 +221,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bootstrap_existing_messages": False,
     "process_startup_unread_messages": True,
 
-    # 每日热点广播（通道专属）：到点后在子线程准备百度热搜首条，再入全局回复 FIFO。
-    "daily_hot_broadcast_enabled": False,
-    "daily_hot_broadcast_time": "18:00",
-    "daily_hot_broadcast_tab": "livelihood",
-    "daily_hot_broadcast_message_prefix": "📰 今日热点",
-    # 每日热点目标群。只看本数组，不复用 auto_reply_groups / auto_reply_groups_all。
-    "daily_hot_broadcast_groups": ["小小地下联络站"],
-    
     # False：正式发送；True：只观察不发
     "shadow_mode": False,
 }
@@ -247,20 +248,6 @@ def load_wechat_desktop_config(
     return validate_config(merged)
 
 
-def parse_hhmm(value: str) -> tuple[int, int]:
-    """Parse ``HH:MM`` into hour/minute. Raises ValueError on invalid input."""
-    text = str(value or "").strip()
-    parts = text.split(":")
-    if len(parts) != 2:
-        raise ValueError(f"invalid daily hot time: {value!r}")
-    hour = int(parts[0])
-    minute = int(parts[1])
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise ValueError(f"invalid daily hot time: {value!r}")
-    return hour, minute
-
-
-
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     """在启动前报告配置错误，业务层无需维护另一套默认值。"""
     for key, default in DEFAULT_CONFIG.items():
@@ -276,9 +263,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(default, list):
             if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
                 raise ValueError(f"{key} must be a list of strings")
-    for key in ("reply_queue_capacity", "materialize_queue_capacity", "event_receipt_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds"):
+    for key in ("reply_queue_capacity", "materialize_queue_capacity", "event_receipt_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds", "db_poll_interval_seconds", "db_batch_size", "db_snapshot_retry_attempts", "db_key_scan_timeout_seconds"):
         if config[key] <= 0:
             raise ValueError(f"{key} must be positive")
+    if config["desktop_backend"] not in {"uia", "db_uia"}:
+        raise ValueError("desktop_backend must be uia or db_uia")
+    for key in ("db_data_dir", "db_account", "db_cache_dir"):
+        if not isinstance(config[key], str):
+            raise ValueError(f"{key} must be a string")
     for key in config:
         if key.endswith("_min") and key[:-4] + "_max" in config:
             if config[key] > config[key[:-4] + "_max"]:
@@ -287,5 +279,4 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("uia_text_chunk_chars must be between 100 and 4000")
     if config["group_reply_mode"] not in {"all", "at_only", "prefix", "at_or_prefix"}:
         raise ValueError("invalid group_reply_mode")
-    parse_hhmm(config["daily_hot_broadcast_time"])
     return config
