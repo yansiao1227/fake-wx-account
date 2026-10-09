@@ -692,7 +692,7 @@ class WechatDatabaseReader:
         """
         from channel.wechat_desktop.config import DEFAULT_CONFIG
         limit = max(0, min(50, int(self.config.get(
-            "wechat_history_max_messages", DEFAULT_CONFIG["wechat_history_max_messages"]))))
+            "reply_context_max_messages", DEFAULT_CONFIG["reply_context_max_messages"]))))
         targets = {}
         reference_lookup_cache = {}
         for record in records:

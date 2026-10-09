@@ -105,6 +105,46 @@ def test_dispatch_regular_prompt_requests_context_relevance_filtering():
     assert "关联度低、已结束或属于其他话题的内容直接忽略" in prompt
 
 
+def test_dispatch_passes_original_message_and_separate_session_budget():
+    channel = _bare_wechat_channel()
+    channel.config = {"reply_context_max_chars": 80, "reply_session_max_turns": 1, "reply_session_max_chars": 90}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+    channel._compose_context = lambda _ctype, content, **kwargs: captured.update(content=content, kwargs=kwargs)
+    original = "当前完整问题" + "问" * 2000
+    event = WechatDesktopEvent("message", "stable-conversation", "Alice", "alice", "Alice", "text", original,
+                               history=[{"content": "旧" * 2000}])
+
+    assert AgentReplyCoordinator(channel).dispatch(event) is False
+    assert original in captured["content"]
+    assert "conversation_id 使用 \"stable-conversation\"" in captured["content"]
+    metadata = captured["kwargs"]
+    assert metadata["wechat_desktop_user_message"] == original
+    assert metadata["wechat_desktop_is_reference"] is False
+    assert metadata["wechat_desktop_session_max_turns"] == 1
+    assert metadata["wechat_desktop_session_max_chars"] == 90
+    assert "[回复要求]" not in metadata["wechat_desktop_user_message"]
+
+
+def test_group_reference_session_metadata_keeps_sender_and_attachment_pointer():
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._trace = lambda *_args, **_kwargs: None
+    captured = {}
+    channel._compose_context = lambda _ctype, content, **kwargs: captured.update(content=content, kwargs=kwargs)
+    attachment = r"D:\synthetic\quoted.pdf"
+    event = WechatDesktopEvent("message", "stable-group", "Group", "alice", "Alice", "text",
+                               "@颜料盒bot 请帮 @Bob 总结", is_group=True,
+                               reference={"content_type": "file", "file_path": attachment})
+
+    assert AgentReplyCoordinator(channel).dispatch(event) is False
+    metadata = captured["kwargs"]
+    assert metadata["wechat_desktop_user_message"] == "Alice: 请帮 @Bob 总结"
+    assert metadata["wechat_desktop_is_reference"] is True
+    assert metadata["wechat_desktop_input_artifact_paths"] == [attachment]
+    assert attachment in captured["content"]
+
+
 @pytest.mark.parametrize("reference", [
     None,
     {"content_type": "text", "content": "看看 https://example.invalid/quoted?token=synthetic"},

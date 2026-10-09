@@ -96,6 +96,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "wechat_history_no_progress_limit": 2,
     "wechat_history_close_timeout_seconds": 2.0,
 
+    # 自动回复上下文独立于按需历史查询上限；0 可关闭对应的历史注入。
+    "reply_context_max_messages": 3,
+    "reply_context_max_chars": 1500,
+    # 普通回复仅保留少量原消息与最终回复；引用回复不带旧 Agent 会话。
+    "reply_session_max_turns": 2,
+    "reply_session_max_chars": 1500,
+
     # 自动回复准入策略。shadow_mode=True 时只观察，不向微信发送内容。
     "auto_reply_private_all": True,
     "auto_reply_groups_all": True,

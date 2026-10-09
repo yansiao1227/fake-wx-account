@@ -73,7 +73,10 @@ def test_invalid_predecessor_is_removed_by_source_identity_and_never_appended(id
 
 def test_valid_predecessor_is_still_aggregated_with_native_history_identity():
     first = synthetic_event(1, "valid predecessor text")
-    second = synthetic_event(2, "continue the discussion")
+    second = synthetic_event(2, "continue the discussion", history=[{
+        "sender_name": first.sender_name, "content": "native preview", "content_type": "text",
+        "_message_stable_id": first.message_stable_id, "source_message_id": first.source_message_id,
+    }])
     harness = BatchHarness(SimpleNamespace(materialize_event=lambda event: (event, 0)))
 
     result = harness._materialize_batch([first, second])
@@ -93,6 +96,29 @@ def receive_batch(native_channel):
     store.receive_source_batch(batch)
     backend.acknowledge_events([batch.batch_id])
     return sorted(events, key=lambda event: event.source_local_id)
+
+
+def test_five_native_aggregated_messages_keep_recent_database_window_and_fifo(native_channel):
+    backend, reader, _, talker, _, _ = native_channel
+    cache = reader.caches["message/message_0.db"]
+    for local_id in range(1, 6):
+        add_message(cache, talker, local_id, content=f"synthetic {local_id}", created=local_id)
+    events = receive_batch(native_channel)
+    harness = BatchHarness(backend)
+    result = harness._materialize_batch(events)
+
+    assert [item["content"] for item in result.history] == ["synthetic 2", "synthetic 3", "synthetic 4"]
+    assert result.task.source_event_ids == [event.event_id for event in events]
+    assert len(result.task.context_source_events) == 4
+    reply_queue = WechatReplyQueue()
+    assert reply_queue.enqueue(result)
+    queued = reply_queue.get()
+    queued.event.history = []
+    queued.restore_context()
+    try:
+        assert [item["content"] for item in queued.event.history] == ["synthetic 2", "synthetic 3", "synthetic 4"]
+    finally:
+        reply_queue.finish(queued, "skipped")
 
 
 def change_source(cache, talker, local_ids):

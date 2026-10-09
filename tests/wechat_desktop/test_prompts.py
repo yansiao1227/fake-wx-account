@@ -189,6 +189,35 @@ def _link_event(content="看看这个", **kwargs):
     )
 
 
+def test_regular_context_only_renders_three_latest_messages():
+    event = _link_event(history=[{"content": f"synthetic {index}"} for index in range(7)])
+    _, lines = _render_event_context_lines(event)
+    assert lines == [f"历史消息: synthetic {index}" for index in (4, 5, 6)]
+
+
+@pytest.mark.parametrize("budget", [0, 12, 1500])
+def test_regular_context_char_budget_counts_sender_labels_and_newlines(budget):
+    event = _link_event(is_group=True, history=[
+        {"sender_name": "Old", "content": "old context"},
+        {"sender_name": "Newest", "content": "最新内容" + "长" * 2000},
+    ])
+    _, lines = _render_event_context_lines(event, {"reply_context_max_chars": budget})
+    assert len("\n".join(lines)) <= budget
+    assert "old context" not in "\n".join(lines)
+    if budget == 1500:
+        assert "Newest: 最新内容" in lines[0]
+        assert "历史片段已截断" in lines[0]
+
+
+def test_reference_and_current_link_are_not_truncated_by_history_budget():
+    reference = {"content_type": "text", "sender_name": "Quoted", "content": "原文" * 1000}
+    event = _link_event("读取 https://example.invalid/post?signature=synthetic", reference=reference,
+                        history=[{"content": "unrelated old context"}])
+    _, lines = _render_event_context_lines(event, {"reply_context_max_messages": 0, "reply_context_max_chars": 1})
+    assert lines == [f"Quoted: {reference['content']}"]
+    assert "signature=synthetic" in _link_reading_instruction(event)
+
+
 def test_link_targets_include_current_text_and_direct_quote_preserving_query():
     first = "https://example.invalid/post?a=1&xsec_token=synthetic%2Fvalue%3D&mode=share"
     second = "https://example.invalid/file.pdf?signature=synthetic+value=="

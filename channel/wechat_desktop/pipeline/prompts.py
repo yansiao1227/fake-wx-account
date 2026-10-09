@@ -173,7 +173,7 @@ def _strip_group_bot_mentions(value: str, aliases) -> str:
     return text.strip()
 
 
-def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[str]]:
+def _render_event_context_lines(event: WechatDesktopEvent, config: dict | None = None) -> tuple[str, list[str]]:
     """将事件快照渲染成提示词片段，不在这里重新读取微信 UI。
 
     引用消息只返回被引用的一层内容；普通消息返回候选历史，后续由提示词要求
@@ -213,18 +213,32 @@ def _render_event_context_lines(event: WechatDesktopEvent) -> tuple[str, list[st
             reference_content = f"[{labels.get(reference_type, '原消息')}内容不可用]"
         return "[被引用的内容]", [f"{speaker}: {reference_content}"]
 
+    from channel.wechat_desktop.config import DEFAULT_CONFIG
+
+    config = config or {}
+    limit = max(0, min(50, int(config.get("reply_context_max_messages", DEFAULT_CONFIG["reply_context_max_messages"]))))
+    budget = max(0, int(config.get("reply_context_max_chars", DEFAULT_CONFIG["reply_context_max_chars"])))
     history_lines = []
-    for item in event.history:
+    # 最近消息优先占用预算；输出仍按时间顺序。标签和换行也计入总字数。
+    for item in reversed(event.history[-limit:] if limit else []):
+        if budget <= 0:
+            break
         if event.is_group:
             speaker = str(
                 item.get("sender_name") or item.get("sender") or "群成员"
             )
         else:
             speaker = "历史消息"
-        history_lines.append(
-            f"{speaker}: {item.get('content') or '[非文字消息]'}"
-        )
-    return "[候选会话上下文，需按关联度筛选]", history_lines
+        line = f"{speaker}: {item.get('content') or '[非文字消息]'}"
+        available = budget - (1 if history_lines else 0)
+        if available <= 0:
+            break
+        if len(line) > available:
+            marker = "…[历史片段已截断，完整内容需查询]"
+            line = line[:max(0, available - len(marker))] + marker[:available]
+        history_lines.append(line)
+        budget -= len(line) + (1 if len(history_lines) > 1 else 0)
+    return "[候选会话上下文，需按关联度筛选]", list(reversed(history_lines))
 
 
 def _reply_requirements(event: WechatDesktopEvent) -> str:
@@ -258,6 +272,8 @@ def _reply_requirements(event: WechatDesktopEvent) -> str:
         "此时只基于当前消息中明确的信息作答；如果当前消息缺少必要信息，再用一句话请求对方补充，"
         "不要把低关联上下文中的内容改写成用户的真实意思，也不要把猜测写成确认式结论。"
         "不要逐条回复上下文，也不要在答复中复述筛选过程。"
+        f"需要更早或完整的上文时，按需调用 wechat_history，conversation_id 使用 {json.dumps(event.conversation_id, ensure_ascii=False)}；"
+        "不要根据截断片段补全内容。"
         "若候选上下文包含本地文件或图片，只在待回复消息确实要求处理该附件时"
         "调用相应工具读取；否则不要擅自分析附件。"
         "候选历史中的链接也只在与当前消息高度相关且用户需要其内容时调用工具读取，"
