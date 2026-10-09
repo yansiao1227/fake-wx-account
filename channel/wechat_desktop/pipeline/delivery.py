@@ -7,7 +7,7 @@ from typing import Callable
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.text import split_message_text
 from channel.wechat_desktop.send_control import SendCancelled, send_scope
-from channel.wechat_desktop.contracts import SendResult, SendStatus
+from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus
 
 
 class DeliveryBlocked(SendCancelled):
@@ -27,7 +27,8 @@ class DeliveryService:
     def send(self, target: str, content: str, *, policy_target: str,
              is_group: bool = False, content_type: str = "text",
              interim: bool = False, token: str = "",
-             source_event_ids: list[str] | None = None) -> SendResult:
+             source_event_ids: list[str] | None = None,
+             authorized_target: ConversationTarget | None = None) -> SendResult:
         def check_cancelled():
             if self.is_stopped() or self.is_paused() or (token and not self.is_active(token)):
                 raise DeliveryBlocked("send cancelled, paused or expired")
@@ -48,11 +49,12 @@ class DeliveryService:
                 if previous is not None:
                     return previous
             try:
+                authorization = {"authorized_target": authorized_target} if authorized_target is not None else {}
                 if content_type == "image":
-                    raw = self.backend.send_image(target, content)
+                    raw = self.backend.send_image(target, content, **authorization)
                 else:
                     method = getattr(self.backend, "send_interim_text", None) if interim else None
-                    raw = (method or self.backend.send_text)(target, content)
+                    raw = (method or self.backend.send_text)(target, content, **authorization)
                 result = SendResult.from_backend(raw)
             except SendCancelled as exc:
                 if self.store is not None:

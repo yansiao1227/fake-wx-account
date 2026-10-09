@@ -24,7 +24,7 @@ class WechatDesktopTool(BaseTool):
             "conversation": {
                 "type": "string",
                 "default": "",
-                "description": "Exact contact or group name.",
+                "description": "Exact contact/group name or stable conversation_id returned by search_contacts.",
             },
             "conversation_id": {
                 "type": "string",
@@ -44,7 +44,7 @@ class WechatDesktopTool(BaseTool):
             "is_group": {
                 "type": "boolean",
                 "default": False,
-                "description": "Set true only when conversation is a group.",
+                "description": "Compatibility hint only; the backend verifies the real conversation type before authorizing send.",
             },
             "limit": {
                 "type": "integer",

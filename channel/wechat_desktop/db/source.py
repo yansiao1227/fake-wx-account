@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 
 from channel.wechat_desktop.db.errors import DatabaseReadError
+from common.log import logger
 
 
 class WechatDatabaseSource:
@@ -20,7 +21,9 @@ class WechatDatabaseSource:
         self._lock = threading.RLock()
         self._pending_batch = None
         self._boot_highwaters = None
+        self._baseline_streams = set()
         self._startup_unread_bounds = {}
+        self._cleanup_readers = []
         self._closed = threading.Event()
         self._lifecycle_lock = threading.RLock()
         self._closed_cleaned = False
@@ -47,7 +50,8 @@ class WechatDatabaseSource:
                 from channel.wechat_desktop.db.reader import WechatDatabaseReader
                 candidate = WechatDatabaseReader(self.config)
                 if self._frozen_account_id is not None and candidate.account_id != self._frozen_account_id:
-                    candidate.close()
+                    self._cleanup_readers.append(candidate)
+                    self._cleanup_retired_readers()
                     self._account_changed = True
                     raise DatabaseReadError("account_changed", "登录账号已变化，请停止并重新绑定通道")
                 self._reader = candidate
@@ -92,16 +96,27 @@ class WechatDatabaseSource:
         old_reader = self._reader
         self._reader = None
         if old_reader is not None:
-            try:
-                old_reader.close()
-            except Exception:
-                pass
+            self._cleanup_readers.append(old_reader)
+        self._cleanup_retired_readers()
         self._session_epoch += 1
         self._boot_highwaters = None
+        self._baseline_streams = set()
         self._startup_unread_bounds = {}
         self._startup_unread_allowed = False
         # 丢失 ACK 的已提交批次由持久游标覆盖；未提交行按新高水位补历史。
         self._pending_batch = None
+
+    def _cleanup_retired_readers(self):
+        """清理失败的读取器保留到后续关闭或恢复时重试，不泄露异常细节。"""
+        pending = []
+        for reader in self._cleanup_readers:
+            try:
+                reader.close()
+            except Exception:
+                pending.append(reader)
+        self._cleanup_readers = pending
+        if pending:
+            logger.warning("数据库快照清理失败：code=snapshot_cleanup_failed pending_readers=%s", len(pending))
 
     def status(self, **extra):
         with self._lock:
@@ -112,6 +127,8 @@ class WechatDatabaseSource:
                 result.update(self._reader.status())
             if self._closed.is_set():
                 result.update(db_read_healthy=False, db_read_error_code="source_closed")
+            result.update(db_cleanup_error_code="snapshot_cleanup_failed" if self._cleanup_readers else "",
+                          db_cleanup_pending=len(self._cleanup_readers))
             result.update(extra)
             self._last_status = result
             return result
@@ -129,16 +146,20 @@ class WechatDatabaseSource:
                         if high is None or (checkpoint.generation and checkpoint.generation != high.get("generation")):
                             raise DatabaseReadError("source_generation_changed", "待接收批次的来源库已替换，暂停交付")
                     return self.status(source_batch=batch, redelivery=True), [r.event for r in batch.records if r.event]
+                checkpoints = ledger.get_source_checkpoints(reader.account_id)
                 if self._boot_highwaters is None:
                     self._boot_highwaters = dict(highwaters)
-                    if self._startup_unread_allowed and self.config.get("process_startup_unread_messages", True):
+                    # 只有账号从未建立过接收账本时才跳过初始历史。
+                    # 已有账号停机期间新增的流必须从安全起点补账。
+                    self._baseline_streams = set(highwaters) if not checkpoints else set()
+                    if (not checkpoints and self._startup_unread_allowed and
+                            self.config.get("process_startup_unread_messages", True)):
                         unread = getattr(reader, "startup_unread_boundaries", None)
                         if callable(unread):
                             self._startup_unread_bounds = unread(highwaters)
-                checkpoints = ledger.get_source_checkpoints(reader.account_id)
                 for stream_id, high in highwaters.items():
                     if stream_id not in checkpoints:
-                        initial_stream = stream_id in self._boot_highwaters
+                        initial_stream = stream_id in self._baseline_streams
                         cursor = (self._startup_unread_bounds.get(stream_id, high["cursor"] + 1) - 1) if initial_stream else 0
                         checkpoints[stream_id] = ledger.initialize_source_checkpoint(
                             reader.account_id, stream_id, cursor,
@@ -171,10 +192,13 @@ class WechatDatabaseSource:
                 if not self._closed_cleaned:
                     self._reset_for_relogin()
                     self._closed_cleaned = True
+                elif self._cleanup_readers:
+                    self._cleanup_retired_readers()
 
     def resume(self):
         """通道明确重新启动后重建读取器，并按持久游标补历史。"""
         with self._lifecycle_lock, self._lock:
+            self._cleanup_retired_readers()
             self._closed.clear()
             self._closed_cleaned = False
             self._last_status.update(db_read_healthy=False, db_read_stale=False, db_read_error_code="")

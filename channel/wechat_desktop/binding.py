@@ -101,16 +101,19 @@ class DatabaseUiaTargetBinder:
                 gateway.bind_target(cid, row)
                 self._bindings[cid] = binding
                 self._identity_verification = "display_name"
-                return TargetResolution(TargetStatus.RESOLVED, ConversationTarget(cid, row.conversation_title),
+                return TargetResolution(TargetStatus.RESOLVED,
+                                        ConversationTarget(cid, contact["display_name"], contact["is_group"]),
                                         "display_name_verified; native_identity_unavailable")
         except Exception as exc:
             return TargetResolution(TargetStatus.STALE, reason=getattr(exc, "code", "target_resolution_failed"))
 
-    def require_target(self, conversation, *, session_epoch=None):
+    def require_target(self, conversation, *, session_epoch=None, authorized_target=None):
         """每个发送 UI 段开始前重验；失败明确表示本段尚未提交。"""
         result = self.resolve_target(conversation, session_epoch=session_epoch)
-        if result.target is None:
+        if result.status != TargetStatus.RESOLVED or result.target is None:
             raise SendNotSubmitted(result.reason)
+        if authorized_target is not None and result.target != authorized_target:
+            raise SendNotSubmitted("authorized_target_changed")
         return result.target
 
     def current_conversation(self):

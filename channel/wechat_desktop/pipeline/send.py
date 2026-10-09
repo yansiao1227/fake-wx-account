@@ -18,7 +18,7 @@ from channel.wechat_desktop.pipeline.prompts import (
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.models import WechatHistoryReadError
 from common.log import file_logger, logger
-from channel.wechat_desktop.contracts import SendResult
+from channel.wechat_desktop.contracts import SendResult, TargetStatus
 
 
 class WechatDesktopSendMixin:
@@ -686,11 +686,26 @@ class WechatDesktopSendMixin:
 
         conversation = str(params.get("conversation", "") or "").strip()
         text = str(params.get("text", "") or "").strip()
-        is_group = bool(params.get("is_group", False))
         if not conversation:
             return {"status": "error", "message": "conversation is required"}
         if not text:
             return {"status": "error", "message": "text is required"}
+        try:
+            resolution = self._driver.resolve_send_target(conversation)
+        except Exception as exc:
+            return {"status": "blocked", "code": "target_resolution_failed", "message": str(exc)}
+        target = resolution.target
+        if (resolution.status != TargetStatus.RESOLVED or target is None
+                or not target.conversation_id or not target.display_name
+                or not isinstance(target.is_group, bool)):
+            return {
+                "status": "blocked", "code": "target_unverified",
+                "message": resolution.reason or "conversation identity or type could not be verified",
+            }
+        # 显示名和群类型都来自后端；Agent 的 is_group 仅保留为兼容参数。
+        conversation_id = target.conversation_id
+        conversation = target.display_name
+        is_group = target.is_group
         if self._policy.is_blocked(conversation):
             return {
                 "status": "blocked",
@@ -711,7 +726,8 @@ class WechatDesktopSendMixin:
             }
 
         try:
-            result = self._deliver(conversation, text, policy_target=conversation, is_group=is_group)
+            result = self._deliver(conversation_id, text, policy_target=conversation,
+                                   is_group=is_group, authorized_target=target)
             if result.get("status") == "not_sent":
                 return {"status": "failed", "conversation": conversation,
                         "verified": False, "retryable": False,
@@ -730,7 +746,7 @@ class WechatDesktopSendMixin:
                     self._content_hash(text),
                 )
                 self._store.append_conversation_history(
-                    conversation_id=conversation,
+                    conversation_id=conversation_id,
                     conversation_name=conversation,
                     sender_name=str(
                         self.config.get("self_display_name") or "我"

@@ -903,13 +903,16 @@ class WechatUiaClient:
     def get_title(self) -> HeaderInfo:
         title = ""
         count = 1
+        count_label_seen = False
         count_from_label = False
+        count_from_title = False
         with self.operation_lock, self._uia_root() as root:
             for control in self._walk(root):
                 automation_id = _text(control.AutomationId)
                 if automation_id.endswith("current_chat_name_label"):
                     title = _text(control.Name)
                 elif automation_id.endswith("current_chat_count_label"):
+                    count_label_seen = True
                     match = re.search(r"(\d+)", _text(control.Name))
                     if match:
                         count = max(1, int(match.group(1)))
@@ -919,14 +922,21 @@ class WechatUiaClient:
         # group name so callers compare cleanly with session_item_* / config.
         base = strip_member_count_suffix(title)
         if base and base != title:
+            count_from_title = True
             if not count_from_label:
                 match = re.search(r"[（(](\d+)[）)]\s*$", title)
                 if match:
                     count = max(1, int(match.group(1)))
             title = base
+        # 人数控件或人数后缀本身标识群聊；仅剩一人的群仍须执行群策略。
+        # 人数控件存在却不可解析时拒绝把不明类型降级为私聊。
+        kind = "unknown"
+        if title:
+            kind = ("group" if count_from_label or count_from_title
+                    else "unknown" if count_label_seen else "private")
         return HeaderInfo(
             title,
-            "group" if count > 1 else ("private" if title else "unknown"),
+            kind,
             count,
         )
 

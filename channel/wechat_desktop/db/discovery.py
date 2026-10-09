@@ -173,10 +173,10 @@ class DatabaseCatalog:
                    for pid, key in self._candidates)
 
     def list_databases(self, binding: AccountBinding) -> list[Path]:
-        # v1 限定联系人/消息/会话辅助输入；不扫描媒体或朋友圈库。
+        # 发送者资源映射也是消息解析输入；不扫描媒体或朋友圈库。
         return sorted((path for path in binding.db_storage.rglob("*.db")
                        if "migrate" not in path.relative_to(binding.db_storage).parts
-                       and (path.name == "contact.db" or path.name == "session.db"
+                       and (path.name in {"contact.db", "session.db", "message_resource.db"}
                             or re.fullmatch(r"message_\d+\.db", path.name))), key=str)
 
     @property

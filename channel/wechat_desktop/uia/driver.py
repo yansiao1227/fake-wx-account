@@ -35,6 +35,7 @@ from channel.wechat_desktop.uia.operations import (
 )
 from channel.wechat_desktop.uia.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia.client import WechatUiaClient
+from channel.wechat_desktop.send_control import SendNotSubmitted
 
 
 class WechatUiaDriver(WechatDesktopBackend):
@@ -1298,6 +1299,38 @@ class WechatUiaDriver(WechatDesktopBackend):
             selectors = dict(self._conversation_selectors)
         return resolve_conversation_selector(selectors, conversation)
 
+    def resolve_send_target(self, conversation: str) -> TargetResolution:
+        """主动发送按真实聊天头部确认类型，不信任调用者或配置中的群类型。"""
+        from channel.wechat_desktop.conversation import conversation_titles_match
+
+        try:
+            # UI 租约先于状态锁，与接收扫描和最终发送保持相同锁顺序。
+            with self._reply_uia(), self._operation_lock:
+                resolution = self.resolve_target(conversation)
+                if resolution.status != TargetStatus.RESOLVED or resolution.target is None:
+                    return resolution
+                identity = resolution.target.conversation_id
+                selector = self._resolve_selector(identity)
+                if not self.client.locate_conversation(selector.title, selector.runtime_id, selector.row_index):
+                    return TargetResolution(TargetStatus.STALE, reason="conversation is no longer visible")
+                header = self.client.get_title()
+                if not conversation_titles_match(header.title, selector.title):
+                    return TargetResolution(TargetStatus.STALE, reason="conversation header does not match target")
+                if header.header_type not in {"private", "group"}:
+                    return TargetResolution(TargetStatus.STALE, reason="conversation type could not be verified")
+                return TargetResolution(TargetStatus.RESOLVED,
+                                        ConversationTarget(identity, resolution.target.display_name,
+                                                           header.header_type == "group"))
+        except Exception as exc:
+            return TargetResolution(TargetStatus.STALE, reason=str(exc))
+
+    def _require_authorized_target(self, authorized_target):
+        resolution = self.resolve_send_target(authorized_target.conversation_id)
+        if (resolution.status != TargetStatus.RESOLVED or resolution.target is None
+                or resolution.target != authorized_target):
+            raise SendNotSubmitted(resolution.reason or "authorized_target_changed")
+        return resolution.target
+
     def validate_reply_target(self, event: WechatDesktopEvent) -> ReplyTargetValidation:
         """Re-read the UI and return a replacement event when the target changed."""
         try:
@@ -1540,26 +1573,26 @@ class WechatUiaDriver(WechatDesktopBackend):
         self._trace("history_close", "conversation=%s", result.conversation_title)
         return result
 
-    def send_text(self, conversation: str, text: str) -> SendResult:
-        """通过独立发送组件发送普通回复。"""
-
-        resolution = self.resolve_target(conversation)
-        if resolution.target is None:
+    def _send_content(self, method, conversation, content, *, authorized_target=None):
+        resolution = (self.resolve_send_target(conversation) if authorized_target is not None
+                      else self.resolve_target(conversation))
+        if resolution.status != TargetStatus.RESOLVED or resolution.target is None:
             return SendResult(SendStatus.NOT_SENT, resolution.reason)
-        return self.gateway.send_text(resolution.target.conversation_id, text)
+        if authorized_target is not None and resolution.target != authorized_target:
+            return SendResult(SendStatus.NOT_SENT, "authorized_target_changed")
+        validate = (lambda: self._require_authorized_target(authorized_target)) if authorized_target is not None else None
+        return getattr(self.gateway, method)(resolution.target.conversation_id, content, validate=validate)
 
-    def send_interim_text(self, conversation: str, text: str) -> SendResult:
+    def send_text(self, conversation: str, text: str, *, authorized_target=None) -> SendResult:
+        """通过独立发送组件发送普通回复。"""
+        return self._send_content("send_text", conversation, text, authorized_target=authorized_target)
+
+    def send_interim_text(self, conversation: str, text: str, *, authorized_target=None) -> SendResult:
         """发送进度提示，不等待普通回复的拟人化节流间隔。"""
 
-        resolution = self.resolve_target(conversation)
-        if resolution.target is None:
-            return SendResult(SendStatus.NOT_SENT, resolution.reason)
-        return self.gateway.send_interim_text(resolution.target.conversation_id, text)
+        return self._send_content("send_interim_text", conversation, text, authorized_target=authorized_target)
 
-    def send_image(self, conversation: str, image_path: str) -> SendResult:
+    def send_image(self, conversation: str, image_path: str, *, authorized_target=None) -> SendResult:
         """通过独立发送组件发送图片。"""
 
-        resolution = self.resolve_target(conversation)
-        if resolution.target is None:
-            return SendResult(SendStatus.NOT_SENT, resolution.reason)
-        return self.gateway.send_image(resolution.target.conversation_id, image_path)
+        return self._send_content("send_image", conversation, image_path, authorized_target=authorized_target)

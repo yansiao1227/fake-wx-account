@@ -124,6 +124,40 @@ def test_uncommitted_wal_is_not_visible_then_publishes_incrementally(tmp_path):
     assert refreshed.decrypted_pages - initial.decrypted_pages == 1
 
 
+def test_incremental_commit_does_not_run_full_database_check(tmp_path, monkeypatch):
+    frames = [(encrypt_page(plain_page(10)), 1)]
+    cache = create_cache(tmp_path, wal_bytes(frames))
+    assert cache.refresh().healthy
+
+    def unexpected_full_check(path):
+        pytest.fail("WAL 增量提交不得扫描整库")
+
+    monkeypatch.setattr(cache, "_check", unexpected_full_check)
+    for value in (20, 30):
+        frames.append((encrypt_page(plain_page(value)), 1))
+        cache.source.with_name("encrypted.db-wal").write_bytes(wal_bytes(frames))
+        refreshed = cache.refresh()
+        assert refreshed.healthy and version(cache) == value
+        assert refreshed.full_rebuilds == 1
+    assert refreshed.incremental_refreshes == 2
+
+
+def test_full_rebuild_still_checks_database_structure(tmp_path, monkeypatch):
+    cache = create_cache(tmp_path)
+    check = cache._check
+    checks = []
+
+    def checked(path):
+        checks.append(path)
+        check(path)
+
+    monkeypatch.setattr(cache, "_check", checked)
+    assert cache.refresh().healthy
+    cache.source.write_bytes(encrypt_page(plain_page(20)))
+    assert cache.refresh().healthy and version(cache) == 20
+    assert len(checks) == 2
+
+
 def test_only_frames_before_last_commit_are_published(tmp_path):
     cache = create_cache(tmp_path, wal_bytes([
         (encrypt_page(plain_page(15)), 1), (encrypt_page(plain_page(99)), 0)]))
@@ -284,14 +318,28 @@ def test_preallocated_frame_overwrite_with_unchanged_mtime_is_read(tmp_path):
     assert refreshed.decrypted_pages == first.decrypted_pages + 1
 
 
-def test_authenticated_structural_corruption_keeps_verified_snapshot(tmp_path):
+@pytest.mark.parametrize("corruption", ["page_type", "page_size", "reserve", "cell_count", "content_offset", "child_pointer"])
+def test_authenticated_structural_corruption_keeps_verified_snapshot(tmp_path, corruption):
     frames = [(encrypt_page(plain_page(10)), 1)]
     cache = create_cache(tmp_path, wal_bytes(frames))
     previous = cache.refresh()
     verified_bytes = cache.path.read_bytes()
     consumed_frames = cache._wal_state.frames
     corrupt = bytearray(plain_page(20))
-    corrupt[100] = 0  # 非法 B-tree 页类型，但密钥、页 HMAC 和 WAL 校验和都有效。
+    # 结构非法，但密钥、页 HMAC 和 WAL 校验和都有效。
+    if corruption == "page_type":
+        corrupt[100] = 0
+    elif corruption == "page_size":
+        struct.pack_into(">H", corrupt, 16, PAGE_SIZE * 2)
+    elif corruption == "reserve":
+        corrupt[20] = 0
+    elif corruption == "cell_count":
+        struct.pack_into(">H", corrupt, 103, PAGE_SIZE)
+    elif corruption == "content_offset":
+        struct.pack_into(">H", corrupt, 105, 100)
+    else:
+        corrupt[100] = 5
+        struct.pack_into(">I", corrupt, 108, 2)
     encrypted = encrypt_page(bytes(corrupt))
     assert verify_key(FAKE_KEY, encrypted)
     frames.append((encrypted, 1))

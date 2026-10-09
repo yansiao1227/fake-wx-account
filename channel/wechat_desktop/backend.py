@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Optional
-from channel.wechat_desktop.contracts import SendResult, TargetResolution
+from channel.wechat_desktop.contracts import ConversationTarget, SendResult, TargetResolution
 
 from channel.wechat_desktop.models import (
     ReplyTargetValidation,
@@ -50,6 +50,10 @@ class WechatDesktopBackend(ABC):
     def resolve_target(self, conversation: str) -> TargetResolution:
         """返回不透明会话 ID；失效 ID 不得悄悄降级为同名会话。"""
 
+    def resolve_send_target(self, conversation: str) -> TargetResolution:
+        """主动发送授权前解析可信显示名与类型；无法确认类型时必须拒绝发送。"""
+        return self.resolve_target(conversation)
+
     @abstractmethod
     def validate_reply_target(self, event: WechatDesktopEvent) -> ReplyTargetValidation:
         """发送前确认目标消息仍然有效。"""
@@ -77,12 +81,16 @@ class WechatDesktopBackend(ABC):
         """可选接收钩子：移除 UIA 进度提示记录。"""
 
     @abstractmethod
-    def send_text(self, conversation: str, text: str) -> SendResult:
-        """向指定会话发送普通文本。"""
+    def send_text(self, conversation: str, text: str, *,
+                  authorized_target: ConversationTarget | None = None) -> SendResult:
+        """向指定会话发送普通文本；每段提交前复核已授权身份。"""
 
-    def send_interim_text(self, conversation: str, text: str) -> SendResult:
+    def send_interim_text(self, conversation: str, text: str, *,
+                          authorized_target: ConversationTarget | None = None) -> SendResult:
         """发送进度提示；不支持加速的后端可退化为普通文本。"""
-        return self.send_text(conversation, text)
+        if authorized_target is None:
+            return self.send_text(conversation, text)
+        return self.send_text(conversation, text, authorized_target=authorized_target)
 
     def read_chat_history(self, conversation_id: str, limit: int = 20) -> WechatHistoryReadResult:
         """可选能力：按稳定会话身份查询历史；UIA 后端仍使用当前会话入口。"""
@@ -93,7 +101,8 @@ class WechatDesktopBackend(ABC):
         raise NotImplementedError("当前后端不支持数据库联系人检索")
 
     @abstractmethod
-    def send_image(self, conversation: str, image_path: str) -> SendResult:
+    def send_image(self, conversation: str, image_path: str, *,
+                   authorized_target: ConversationTarget | None = None) -> SendResult:
         """向指定会话发送图片文件。"""
 
 

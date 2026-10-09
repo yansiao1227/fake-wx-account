@@ -84,26 +84,29 @@ class WechatDatabaseBackend(WechatDesktopBackend):
         except Exception as exc:
             return ReplyTargetValidation(False, getattr(exc, "code", "source_validation_failed"))
 
-    def _send(self, method, conversation, payload):
+    def _send(self, method, conversation, payload, *, authorized_target=None):
         epoch = self.source.session_epoch
         result = self.resolve_target(conversation)
-        if result.target is None:
+        if result.status != TargetStatus.RESOLVED or result.target is None:
             return SendResult(SendStatus.NOT_SENT, result.reason)
+        if authorized_target is not None and result.target != authorized_target:
+            return SendResult(SendStatus.NOT_SENT, "authorized_target_changed")
         if epoch != self.source.session_epoch:
             return SendResult(SendStatus.NOT_SENT, "account_binding_changed")
         cid = result.target.conversation_id
         response = SendResult.from_backend(getattr(self._actions(), method)(
-            cid, payload, validate=lambda: self._binder.require_target(cid, session_epoch=epoch)))
+            cid, payload, validate=lambda: self._binder.require_target(
+                cid, session_epoch=epoch, authorized_target=authorized_target)))
         return replace(response, accepted_by="db_uia", observation={**response.observation, **self._status()})
 
-    def send_text(self, conversation, text):
-        return self._send("send_text", conversation, text)
+    def send_text(self, conversation, text, *, authorized_target=None):
+        return self._send("send_text", conversation, text, authorized_target=authorized_target)
 
-    def send_interim_text(self, conversation, text):
-        return self._send("send_interim_text", conversation, text)
+    def send_interim_text(self, conversation, text, *, authorized_target=None):
+        return self._send("send_interim_text", conversation, text, authorized_target=authorized_target)
 
-    def send_image(self, conversation, image_path):
-        return self._send("send_image", conversation, image_path)
+    def send_image(self, conversation, image_path, *, authorized_target=None):
+        return self._send("send_image", conversation, image_path, authorized_target=authorized_target)
 
     @staticmethod
     def _mark_attachment_capability(event):

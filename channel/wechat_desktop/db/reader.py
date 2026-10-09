@@ -136,6 +136,9 @@ class WechatDatabaseReader:
         self._idle_poll_signature = None
         self._error_code = ""
         self._last_success_at = 0.0
+        self._closed_caches = set()
+        self._cleanup_error_code = ""
+        self._cleanup_pending = 0
 
     @staticmethod
     def _supported_database(name):
@@ -156,6 +159,8 @@ class WechatDatabaseReader:
             "db_read_stale": stale, "db_read_last_success_at": self._last_success_at,
             "db_read_account_id": self.account_id, "db_read_backlog": dict(self._backlog),
             "db_read_error_code": self._error_code,
+            "db_cleanup_error_code": self._cleanup_error_code,
+            "db_cleanup_pending": self._cleanup_pending,
             "account_binding": {"account_id": self.account_id, "pid": self.binding.pid,
                                 "version": self.binding.version, "verification": "database_key_hmac"},
             "db_read_conversations": len(self._contacts),
@@ -602,7 +607,22 @@ class WechatDatabaseReader:
                                            conversation_id=contact["conversation_id"], account_id=self.account_id)
 
     def close(self):
-        for cache in self.caches.values():
-            close = getattr(cache, "close", None)
-            if callable(close):
-                close()
+        """各分片独立清理，失败项可重试，对外异常不携带明文路径。"""
+        with self._lock:
+            self._initialized = False
+            failed = 0
+            for relative, cache in self.caches.items():
+                if relative in self._closed_caches:
+                    continue
+                try:
+                    close = getattr(cache, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    failed += 1
+                else:
+                    self._closed_caches.add(relative)
+            self._cleanup_pending = failed
+            self._cleanup_error_code = "snapshot_cleanup_failed" if failed else ""
+            if failed:
+                raise DatabaseReadError("snapshot_cleanup_failed", "数据库快照清理失败") from None

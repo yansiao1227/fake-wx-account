@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .crypto import PAGE_SIZE, decrypt_page, hmac_key, key_parts, wal_checksum
+from .crypto import PAGE_SIZE, RESERVE_SIZE, SQLITE_HEADER, decrypt_page, hmac_key, key_parts, wal_checksum
 from .errors import DatabaseReadError
 from .security import private_directory
 from .snapshot_lock import read_wal_index, source_snapshot_lock
@@ -180,6 +180,41 @@ class EncryptedDatabaseCache:
         finally:
             connection.close()
 
+    @staticmethod
+    def _check_increment(path: Path, commit_pages: int):
+        # 增量帧已经通过 WAL 校验和、页 HMAC 和提交边界验证；源锁内只读首页。
+        # 不遍历数据/索引/溢出页，全库 quick_check 仅用于全量重建。
+        with path.open("rb") as handle:
+            page = handle.read(PAGE_SIZE)
+            size = os.fstat(handle.fileno()).st_size
+        invalid = DatabaseReadError("snapshot_invalid", "解密数据库结构校验失败")
+        if (commit_pages < 1 or size != commit_pages * PAGE_SIZE or len(page) != PAGE_SIZE
+                or page[:16] != SQLITE_HEADER or struct.unpack_from(">H", page, 16)[0] != PAGE_SIZE
+                or page[18:24] != bytes((1, 1, RESERVE_SIZE, 64, 32, 32))):
+            raise invalid
+        # sqlite_schema 的根页始终是首页的 table B-tree，检查其页内结构边界。
+        if page[100] not in (5, 13):
+            raise invalid
+        usable = PAGE_SIZE - RESERVE_SIZE
+        header_end = 112 if page[100] == 5 else 108
+        freeblock, cells, content = struct.unpack_from(">HHH", page, 101)
+        pointers_end = header_end + cells * 2
+        if (not pointers_end <= content <= usable or page[107] > 60
+                or (freeblock and not content <= freeblock <= usable - 4)):
+            raise invalid
+        offsets = [struct.unpack_from(">H", page, pos)[0]
+                   for pos in range(header_end, pointers_end, 2)]
+        if len(set(offsets)) != cells or any(not content <= pos < usable for pos in offsets):
+            raise invalid
+        if page[100] == 5:
+            children = [struct.unpack_from(">I", page, 108)[0]]
+            for pos in offsets:
+                if pos > usable - 5:
+                    raise invalid
+                children.append(struct.unpack_from(">I", page, pos)[0])
+            if any(not 1 < child <= commit_pages for child in children):
+                raise invalid
+
     def _rebuild(self, mac_key, wal, salt, byteorder, seed, source_sig, wal_sig, probe,
                  wal_read_size, validate_source, first_page):
         temporary = self.path.with_name(self.path.name + ".building")
@@ -227,7 +262,7 @@ class EncryptedDatabaseCache:
                 output.truncate(commit_pages * PAGE_SIZE)
                 output.flush()
                 os.fsync(output.fileno())
-                self._check(self.path)
+                self._check_increment(self.path, commit_pages)
             except Exception:
                 for number, page in old_pages.items():
                     output.seek((number - 1) * PAGE_SIZE)
@@ -309,7 +344,11 @@ class EncryptedDatabaseCache:
 
     def close(self):
         with self._lock:
-            self.path.unlink(missing_ok=True)
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                self.status = replace(self.status, healthy=False, stale=True, error_code="snapshot_cleanup_failed")
+                raise DatabaseReadError("snapshot_cleanup_failed", "数据库快照清理失败") from None
             self.status = replace(self.status, healthy=False, stale=True, error_code="snapshot_closed")
 
     @contextmanager
