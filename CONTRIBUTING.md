@@ -7,10 +7,12 @@ features.
 ## Language policy
 
 To keep the project accessible to a global community, **please write issues,
-pull requests, code comments, and commit messages in English.**
+pull requests, and code comments in English.** Commit messages follow the
+repository-specific format in [AGENTS.md](AGENTS.md): a lowercase English type
+prefix followed by a Chinese description, with any optional body in Chinese.
 
-> 为方便全球开发者协作，请尽量使用**英文**提交 issue、PR、代码注释与
-> commit message。不必担心英文不完美——表达清楚即可，工具翻译也完全没问题。感谢理解 ❤️
+> 为方便全球开发者协作，请尽量使用**英文**提交 issue、PR 与代码注释。
+> commit message 必须遵循 `type: 中文说明` 格式，类型前缀使用英文小写，正文使用中文。
 
 ## Reporting issues
 
@@ -33,13 +35,14 @@ happy to help polish details during review.
 
 ### Commit & PR titles
 
-Use a short, imperative summary. The [Conventional Commits](https://www.conventionalcommits.org/)
-style is preferred but not required:
+Use a short, clear summary for PR titles. Commit titles must use `type: 中文说明`,
+with a lowercase English type such as `feat`, `fix`, `docs`, `refactor`, `perf`,
+or `test`, followed by a space and a Chinese description:
 
 ```
-feat: add web search tool
-fix: reconnect WeChat desktop websocket on timeout
-docs: clarify Docker setup
+feat: 新增联网搜索工具
+fix: 修复微信桌面连接超时
+docs: 补充 Docker 配置说明
 ```
 
 ## Development setup
