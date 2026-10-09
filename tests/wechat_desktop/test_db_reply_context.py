@@ -19,7 +19,7 @@ from .test_db_reader import add_message, checkpoints, make_reader, table
 
 def test_reply_context_is_before_current_message_and_uses_native_identity(tmp_path):
     reader, talker = make_reader(tmp_path, shards=2)
-    reader.config["wechat_history_max_messages"] = 3
+    reader.config["reply_context_max_messages"] = 3
     first, second = (reader.caches[f"message/message_{index}.db"] for index in range(2))
     add_message(first, talker, 1, content="same body", created=100, sort_seq=1)
     add_message(second, talker, 1, content="same body", created=100, sort_seq=1)
@@ -50,6 +50,25 @@ def test_context_never_adds_later_local_id_when_native_clock_rolls_back(tmp_path
     assert [item["content"] for item in event.history] == ["previous"]
 
 
+def test_default_reply_context_is_three_messages_independent_of_history_query(tmp_path):
+    reader, talker = make_reader(tmp_path)
+    # 按需查询配置不能再作为自动回复的默认上下文配置。
+    reader.config["wechat_history_max_messages"] = 1
+    cache = reader.caches["message/message_0.db"]
+    for local_id in range(1, 9):
+        add_message(cache, talker, local_id, content=f"synthetic {local_id}", created=local_id)
+    reader.refresh()
+    cursors = checkpoints(reader)
+    previous = copy.deepcopy(cursors)
+    batch = reader.poll_batch(cursors, {})
+    current = next(record.event for record in batch.records if record.local_id == 8)
+
+    assert [item["content"] for item in current.history] == ["synthetic 5", "synthetic 6", "synthetic 7"]
+    assert len(batch.records) == 8
+    assert reader.read_history(talker, limit=6).returned_count == 6
+    assert cursors == previous
+
+
 def test_pagination_same_timestamp_and_shard_ids_keep_context_order(tmp_path):
     reader, talker = make_reader(tmp_path, shards=2, batch_size=1)
     for index in range(2):
@@ -67,7 +86,7 @@ def test_pagination_same_timestamp_and_shard_ids_keep_context_order(tmp_path):
     history_ids = [message.source_message_id for message in reader.read_history(talker).messages]
     for event in events:
         position = history_ids.index(event.source_message_id)
-        assert [item["source_message_id"] for item in event.history] == history_ids[:position]
+        assert [item["source_message_id"] for item in event.history] == history_ids[:position][-3:]
     assert len({event.source_message_id for event in events}) == 6
 
 
@@ -108,7 +127,7 @@ def test_context_does_not_cross_native_conversation(tmp_path):
 
 def test_batch_reuses_one_context_query_and_same_connections(tmp_path, monkeypatch):
     reader, talker = make_reader(tmp_path)
-    reader.config["wechat_history_max_messages"] = 2
+    reader.config["reply_context_max_messages"] = 2
     cache = reader.caches["message/message_0.db"]
     for local_id in range(1, 31):
         add_message(cache, talker, local_id, created=local_id)
@@ -219,7 +238,7 @@ def test_own_and_quoted_share_cards_keep_metadata_without_network_or_false_resol
 
 def test_disabling_context_limit_does_not_create_candidate_history(tmp_path):
     reader, talker = make_reader(tmp_path)
-    reader.config["wechat_history_max_messages"] = 0
+    reader.config["reply_context_max_messages"] = 0
     cache = reader.caches["message/message_0.db"]
     add_message(cache, talker, 1, created=1)
     add_message(cache, talker, 2, created=2)

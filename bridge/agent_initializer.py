@@ -216,10 +216,18 @@ class AgentInitializer:
             return bool(text)
 
         # Group into turns: each turn starts with a real user message
+        from channel.wechat_desktop.pipeline.session_context import (
+            is_internal_user_hint, is_wechat_session_user,
+        )
         turns = []
         current_turn = None
         for msg in messages:
             if _is_real_user_msg(msg):
+                if (current_turn is not None
+                        and is_wechat_session_user(current_turn["user"])
+                        and is_internal_user_hint(msg)):
+                    # 只在确知的微信轮次中排除固定 Agent 提醒，不吞掉真实原消息。
+                    continue
                 if current_turn is not None:
                     turns.append(current_turn)
                 current_turn = {"user": msg, "assistants": []}
@@ -236,9 +244,28 @@ class AgentInitializer:
             user_text = _extract_text(turn["user"].get("content"))
             if not user_text:
                 continue
+            # 微信自动回复的原文标记位于 content JSON；保留它以便重启后
+            # 将真实用户原文与旧版注入提示词可靠地区分。其他消息仍按原逻辑恢复。
+            user_block = {"type": "text", "text": user_text}
+            raw_blocks = turn["user"].get("content")
+            if isinstance(raw_blocks, list) and any(
+                isinstance(block, dict) and block.get("type") == "text"
+                and block.get("source") == "wechat_desktop_user_v1" for block in raw_blocks
+            ):
+                user_block["source"] = "wechat_desktop_user_v1"
+                input_paths = []
+                for block in raw_blocks:
+                    if isinstance(block, dict) and block.get("source") == "wechat_desktop_user_v1":
+                        if block.get("is_reference") is True:
+                            user_block["is_reference"] = True
+                        paths = block.get("input_artifact_paths")
+                        if isinstance(paths, list):
+                            input_paths.extend(path for path in paths if isinstance(path, str))
+                if input_paths:
+                    user_block["input_artifact_paths"] = input_paths[-2:]
             filtered.append({
                 "role": "user",
-                "content": [{"type": "text", "text": user_text}]
+                "content": [user_block]
             })
             if turn["assistants"]:
                 final_reply = turn["assistants"][-1]
