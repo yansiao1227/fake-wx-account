@@ -2,14 +2,12 @@
 
 import queue
 import threading
-from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus
 from channel.wechat_desktop.config import DEFAULT_CONFIG, load_wechat_desktop_config
-from channel.wechat_desktop.daily_hot.scheduler import DailyHotScheduler
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.pipeline.channel import WechatDesktopChannel
 from channel.wechat_desktop.pipeline.delivery import DeliveryBlocked, DeliveryService
@@ -31,7 +29,6 @@ def channel(tmp_path):
     channel = object.__new__(cls)
     channel.config = load_wechat_desktop_config({
         "shadow_mode": False, "auto_reply_private_all": True,
-        "daily_hot_broadcast_groups": ["A", "B"],
         "max_send_per_minute": 10, "max_send_per_hour": 50,
         "worker_join_timeout_seconds": 0.01,
     })
@@ -43,7 +40,7 @@ def channel(tmp_path):
     channel._runtime_lock = threading.RLock()
     channel._runtime_state = "stopped"
     channel._scan_thread = channel._materialize_thread = channel._queue_thread = None
-    channel._warmup_thread = channel._daily_hot_scheduler = None
+    channel._warmup_thread = None
     channel._pending_private_lock = threading.RLock()
     channel._pending_private_batches = {}
     channel._materialize_submit_lock = threading.RLock()
@@ -212,57 +209,6 @@ def test_baseline_history_does_not_match_arbitrarily_later_records(channel):
     assert channel._store.append_conversation_history(*args, created_at=1000)
 
 
-def test_scheduler_retries_enqueue_with_cached_content(channel):
-    channel.config["daily_hot_broadcast_enabled"] = True
-    attempts, preparations = [], []
-
-    def enqueue(message, fire_date):
-        assert fire_date == "2026-09-20"
-        attempts.append(message)
-        if len(attempts) == 1:
-            raise RuntimeError("queue unavailable")
-        return 1
-
-    scheduler = DailyHotScheduler(
-        config=channel.config, store=channel._store, enqueue_callback=enqueue,
-        prepare_factory=lambda **kw: preparations.append(1) or {"ok": True, "message": "ready"},
-        now_factory=lambda: datetime(2026, 9, 20, 19),
-    )
-    scheduler._tick()
-    assert scheduler.wait_prepare()
-    assert not channel._store.get_state("daily_hot_last_date")
-    scheduler._tick()
-    assert scheduler.wait_prepare()
-    assert attempts == ["ready", "ready"]
-    assert preparations == [1]
-    assert channel._store.get_state("daily_hot_last_date") == "2026-09-20"
-
-
-def test_broadcast_partial_enqueue_retries_only_remaining_target(channel):
-    channel._reply_queue = WechatReplyQueue(capacity=1)
-    with pytest.raises(RuntimeError, match="retry remaining"):
-        channel.enqueue_daily_hot_broadcast("news", "2026-09-20")
-    first = channel._reply_queue.get()
-    assert channel._send_precomposed_reply(first) == "completed"
-    channel._reply_queue.finish(first, "completed")
-    assert channel.enqueue_daily_hot_broadcast("changed", "2026-09-20") == 1
-    second = channel._reply_queue.get()
-    assert channel._send_precomposed_reply(second) == "completed"
-    channel._reply_queue.finish(second, "completed")
-    assert channel.sent == [("A", "news"), ("B", "news")]
-    assert channel.enqueue_daily_hot_broadcast("news", "2026-09-20") == 0
-
-
-def test_broadcast_recovers_queued_jobs_but_not_uncertain_send(channel):
-    channel.enqueue_daily_hot_broadcast("news", "2026-09-20")
-    first = channel._reply_queue.get()
-    channel._store.set_broadcast_status("2026-09-20", first.event.task.broadcast_target, "sending")
-    channel._reply_queue = WechatReplyQueue()  # 模拟进程重启后内存队列丢失。
-    assert channel.enqueue_daily_hot_broadcast("news", "2026-09-20") == 1
-    recovered = channel._reply_queue.get()
-    assert recovered.event.conversation_name != first.event.conversation_name
-
-
 def test_runtime_refuses_restart_until_old_worker_exits(channel):
     release = threading.Event()
     worker = threading.Thread(target=release.wait, name="slow-materializer")
@@ -298,7 +244,7 @@ def test_config_lists_are_isolated_and_invalid_values_fail_early():
     assert "mutated" not in second["auto_reply_groups"]
     assert "mutated" not in DEFAULT_CONFIG["auto_reply_groups"]
     for override in ({"reply_queue_capacity": 0}, {"shadow_mode": "false"},
-                     {"daily_hot_broadcast_time": "25:00"}, {"reply_queue_max_wait_seconds": float("inf")}):
+                     {"reply_queue_max_wait_seconds": float("inf")}):
         with pytest.raises(ValueError):
             load_wechat_desktop_config(override)
 
@@ -336,24 +282,3 @@ def test_partial_send_is_reported_to_queue_and_audit(channel):
     item = channel._reply_queue.get()
     channel._reply_queue.finish(item, context["wechat_desktop_queue_terminal"])
     assert channel._reply_queue.status()["queue_partial"] == 1
-
-
-@pytest.mark.parametrize("outcome", ["cancelled", "partial"])
-def test_broadcast_retries_only_when_no_chunk_was_submitted(channel, outcome):
-    channel.config["daily_hot_broadcast_groups"] = ["A"]
-    channel.enqueue_daily_hot_broadcast("news", "2026-09-20")
-    item = channel._reply_queue.get()
-
-    def deliver(*args, before_send, **kwargs):
-        before_send()
-        if outcome == "cancelled":
-            raise DeliveryBlocked("paused before first chunk")
-        return {"success": False, "verified": False, "status": "partial", "retryable": False}
-
-    channel._deliver = deliver
-    terminal = channel._send_precomposed_reply(item)
-    channel._reply_queue.finish(item, terminal)
-    counts = channel._store.broadcast_status_counts("2026-09-20")
-    assert counts == {"pending" if outcome == "cancelled" else "partial": 1}
-    queued = channel.enqueue_daily_hot_broadcast("news", "2026-09-20")
-    assert queued == (1 if outcome == "cancelled" else 0)

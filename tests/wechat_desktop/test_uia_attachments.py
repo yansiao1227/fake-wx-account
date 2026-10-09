@@ -103,6 +103,7 @@ def test_native_dialog_cancel_refuses_main_window_and_uses_exact_cancel_control(
 
 
 def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp_path):
+    import win32api
     import win32gui
     from PIL import Image, ImageGrab
 
@@ -169,9 +170,9 @@ def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp
         lambda main_hwnd: calls.append(("restore_main", main_hwnd)) or True,
     )
     monkeypatch.setattr(
-        client,
-        "_press_escape_key",
-        lambda: (_ for _ in ()).throw(
+        win32api,
+        "keybd_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("viewer flow must never send global Escape")
         ),
     )

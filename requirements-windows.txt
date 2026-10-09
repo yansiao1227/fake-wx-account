@@ -1,6 +1,7 @@
 # Windows dependencies for the WeChat 4.1.9.30 desktop UI Automation channel.
 -r requirements.txt
 uiautomation==2.0.29
+zstandard==0.25.0
 pywin32>=312
 rapidocr>=3.9.2
 onnxruntime>=1.18.0,<1.19; python_version < "3.13"

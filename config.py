@@ -14,7 +14,7 @@ from common import i18n
 # 根目录 config.py 只加载 config.json 并提供 conf()。
 # available_setting 只登记跨通道通用字段（模型、Agent、channel_type、Web、tools 等），
 # 取值是占位说明，程序不把这里当业务默认值源。
-# 禁止在这里新增 wechat_desktop 白名单、shadow_mode、UIA 节拍、每日热点等通道业务项；
+# 禁止在这里新增 wechat_desktop 白名单、shadow_mode、UIA 节拍等通道业务项；
 # 那些字段只写 channel/wechat_desktop/config.py。
 available_setting = {
     # global UI language for CLI, startup logs, error messages, agent prompts

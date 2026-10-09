@@ -38,7 +38,7 @@ from channel.wechat_desktop.models import (
     WechatHistoryMessage,
     WechatHistoryReadResult,
 )
-from channel.wechat_desktop.uia.operations import (
+from channel.wechat_desktop.conversation import (
     conversation_titles_match,
     strip_member_count_suffix,
 )
@@ -146,7 +146,6 @@ class WechatUiaClient:
         self._stop_event = threading.Event()
         self._last_send_at = 0.0
         self._last_conversation_send: dict[str, float] = {}
-        self._known_outgoing_texts: dict[str, list[str]] = {}
         self._known_outgoing_messages: dict[
             str, list[tuple[str, str, float]]
         ] = {}
@@ -199,17 +198,6 @@ class WechatUiaClient:
         remaining = due - now
         wait_send_delay(remaining, self._stop_event)
 
-    def remember_outgoing_text(self, conversation: str, text: str) -> None:
-        value = _text(text)
-        if not value:
-            return
-        key = _text(conversation)
-        items = self._known_outgoing_texts.setdefault(key, [])
-        if value in items:
-            items.remove(value)
-        items.append(value)
-        del items[:-20]
-
     def remember_outgoing_message(
         self, conversation: str, text: str = "", runtime_id: str = ""
     ) -> None:
@@ -218,8 +206,6 @@ class WechatUiaClient:
         if not value and not runtime:
             return
         key = _text(conversation)
-        if value:
-            self.remember_outgoing_text(key, value)
         records = self._known_outgoing_messages.setdefault(key, [])
         records.append((value, runtime, time.monotonic()))
         del records[:-50]
@@ -294,11 +280,20 @@ class WechatUiaClient:
                     False,
                     process_id,
                 )
-                executable = win32process.GetModuleFileNameEx(process, 0)
-                process.Close()
+                try:
+                    executable = win32process.GetModuleFileNameEx(process, 0)
+                finally:
+                    try:
+                        process.Close()
+                    except Exception:
+                        pass
             except Exception:
                 executable = ""
-            if not executable or Path(executable).name.casefold() == "weixin.exe":
+            # Qt 主窗口类被许多程序共享。无法读取进程路径时只能信任微信独有类，
+            # 否则受保护/提权的非微信 Qt 窗口会造成多个微信主窗口的误判。
+            if (executable and Path(executable).name.casefold() == "weixin.exe") or (
+                not executable and native_class == "mmui::MainWindow"
+            ):
                 windows.append((int(hwnd), int(process_id)))
             return True
 
@@ -883,7 +878,7 @@ class WechatUiaClient:
                 # Critical: a visible message list alone is NOT enough. If the
                 # click fails to switch the detail pane, the previous chat's
                 # message list remains visible and we must not claim success
-                # (that would paste daily-hot / replies into the wrong chat).
+                # (that would paste replies into the wrong chat).
                 for _ in range(2):
                     old_cursor = None
                     try:
@@ -1523,16 +1518,6 @@ class WechatUiaClient:
             )
         )
         return True
-
-    @staticmethod
-    def _press_escape_key() -> None:
-        import win32api
-        import win32con
-
-        win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
-        win32api.keybd_event(
-            win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0
-        )
 
     @classmethod
     def _find_image_viewer_close_control(cls, root):

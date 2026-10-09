@@ -11,6 +11,7 @@ from typing import Iterable, List, Optional
 
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.contracts import EventReceipt, EVENT_TERMINALS, SendResult
+from channel.wechat_desktop.db.types import RECEIPT_PHASES, SourceBatch
 
 # Schema version used to gate one-time startup migrations.
 # Bump this whenever a new migration is added to _run_startup_migrations().
@@ -82,14 +83,6 @@ class WechatDesktopStore:
                     observed_at REAL NOT NULL,
                     processed_at REAL
                 );
-                CREATE TABLE IF NOT EXISTS broadcast_jobs (
-                    fire_date TEXT NOT NULL,
-                    target TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    updated_at REAL NOT NULL,
-                    PRIMARY KEY(fire_date, target)
-                );
                 CREATE TABLE IF NOT EXISTS managed_evidence (
                     path TEXT PRIMARY KEY,
                     created_at REAL NOT NULL
@@ -123,6 +116,34 @@ class WechatDesktopStore:
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS source_checkpoints (
+                    account_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    cursor INTEGER NOT NULL,
+                    baseline_high_water INTEGER NOT NULL,
+                    generation TEXT NOT NULL DEFAULT '',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(account_id, stream_id)
+                );
+                CREATE TABLE IF NOT EXISTS source_records (
+                    account_id TEXT NOT NULL,
+                    stream_id TEXT NOT NULL,
+                    local_id INTEGER NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL DEFAULT '',
+                    filter_reason TEXT NOT NULL DEFAULT '',
+                    receipt_phase TEXT NOT NULL,
+                    received_at REAL NOT NULL,
+                    PRIMARY KEY(account_id, stream_id, local_id),
+                    UNIQUE(account_id, source_message_id)
+                );
+                CREATE TABLE IF NOT EXISTS source_batches (
+                    account_id TEXT NOT NULL,
+                    batch_id TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    received_at REAL NOT NULL,
+                    PRIMARY KEY(account_id, batch_id)
+                );
                 CREATE TABLE IF NOT EXISTS rate_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL,
@@ -149,6 +170,18 @@ class WechatDesktopStore:
                 """
             )
             columns = {row["name"] for row in db.execute("PRAGMA table_info(events)")}
+            for name, definition in {
+                "account_id": "TEXT NOT NULL DEFAULT ''",
+                "source_stream_id": "TEXT NOT NULL DEFAULT ''",
+                "source_message_id": "TEXT NOT NULL DEFAULT ''",
+                "source_local_id": "INTEGER",
+                "native_timestamp": "INTEGER",
+                "receipt_phase": "TEXT NOT NULL DEFAULT ''",
+                "direction": "TEXT NOT NULL DEFAULT 'incoming'",
+                "source_type": "TEXT NOT NULL DEFAULT 'unknown'",
+            }.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE events ADD COLUMN {name} {definition}")
             if "managed_evidence_path" not in columns:
                 # 旧 evidence_path 的所有权未知，不能自动当作可删除的通道副本。
                 db.execute("ALTER TABLE events ADD COLUMN managed_evidence_path TEXT NOT NULL DEFAULT ''")
@@ -209,6 +242,199 @@ class WechatDesktopStore:
     # Event ledger
     # ------------------------------------------------------------------
 
+    def get_source_checkpoints(self, account_id: str) -> dict[str, dict]:
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM source_checkpoints WHERE account_id=?", (account_id,),
+            ).fetchall()
+        return {row["stream_id"]: dict(row) for row in rows}
+
+    def get_source_checkpoint(self, account_id: str, stream_id: str) -> dict:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM source_checkpoints WHERE account_id=? AND stream_id=?",
+                (account_id, stream_id),
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def initialize_source_checkpoint(
+        self, account_id: str, stream_id: str, cursor: int,
+        baseline_high_water: int, generation: str = "",
+    ) -> dict:
+        """只初始化新流；已有游标和初始基线永不被启动/分页覆盖。"""
+        if not account_id or not stream_id or cursor < 0 or baseline_high_water < cursor:
+            raise ValueError("invalid source checkpoint")
+        with self._lock, self._connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO source_checkpoints VALUES (?,?,?,?,?,?)",
+                (account_id, stream_id, int(cursor), int(baseline_high_water), generation, time.time()),
+            )
+            row = db.execute(
+                "SELECT * FROM source_checkpoints WHERE account_id=? AND stream_id=?",
+                (account_id, stream_id),
+            ).fetchone()
+            return dict(row)
+
+    def receive_source_batch(self, batch: SourceBatch) -> tuple[EventReceipt, ...]:
+        """来源去重、事件、过滤行及各流游标一次提交；任意失败整批回滚。"""
+        if not isinstance(batch, SourceBatch) or not batch.account_id or not batch.batch_id:
+            raise ValueError("invalid source batch")
+        checkpoints = {item.stream_id: item for item in batch.checkpoints}
+        if len(checkpoints) != len(batch.checkpoints):
+            raise ValueError("duplicate source checkpoint")
+        seen = set()
+        records_by_stream = {}
+        for record in batch.records:
+            key = (record.stream_id, record.local_id)
+            if key in seen or record.local_id < 0 or not record.source_message_id:
+                raise ValueError("invalid or duplicate source record")
+            seen.add(key)
+            if record.stream_id not in checkpoints or record.receipt_phase not in RECEIPT_PHASES:
+                raise ValueError("source record has no checkpoint or invalid phase")
+            if record.event is None and not record.filter_reason:
+                raise ValueError("filtered source record requires a reason")
+            if record.event is not None:
+                event = record.event
+                if (event.account_id not in {"", batch.account_id}
+                    or event.source_message_id not in {"", record.source_message_id}
+                    or event.source_stream_id not in {"", record.stream_id}
+                    or event.source_local_id not in {None, record.local_id}):
+                    raise ValueError("event identity differs from source record")
+                event.account_id = batch.account_id
+                event.source_stream_id = record.stream_id
+                event.source_message_id = record.source_message_id
+                event.source_local_id = record.local_id
+                event.receipt_phase = record.receipt_phase
+            records_by_stream.setdefault(record.stream_id, []).append(record)
+        for checkpoint in batch.checkpoints:
+            if checkpoint.cursor < checkpoint.expected_cursor or checkpoint.expected_cursor < 0:
+                raise ValueError("source cursor cannot move backwards")
+            records = records_by_stream.get(checkpoint.stream_id, ())
+            if records and max(record.local_id for record in records) != checkpoint.cursor:
+                raise ValueError("checkpoint does not cover the scanned source rows")
+            if any(record.local_id <= checkpoint.expected_cursor for record in records):
+                raise ValueError("source record is outside the scanned cursor interval")
+            if not records and checkpoint.cursor != checkpoint.expected_cursor:
+                raise ValueError("cannot advance source cursor without scanned rows")
+        signature = hashlib.sha256(json.dumps([
+            [(record.stream_id, record.local_id, record.source_message_id,
+              record.filter_reason, record.receipt_phase, record.event is not None) for record in batch.records],
+            [(item.stream_id, item.cursor, item.expected_cursor) for item in batch.checkpoints],
+        ], sort_keys=True).encode()).hexdigest()
+        receipts = []
+        with self._lock:
+            db = self._connect()
+            db.execute("SAVEPOINT receive_source_batch")
+            try:
+                previous_batch = db.execute(
+                    "SELECT source_signature FROM source_batches WHERE account_id=? AND batch_id=?",
+                    (batch.account_id, batch.batch_id),
+                ).fetchone()
+                if previous_batch and previous_batch["source_signature"] != signature:
+                    raise ValueError("source batch id was reused with different rows")
+                if not previous_batch:
+                    for checkpoint in batch.checkpoints:
+                        existing = db.execute(
+                            "SELECT cursor FROM source_checkpoints WHERE account_id=? AND stream_id=?",
+                            (batch.account_id, checkpoint.stream_id),
+                        ).fetchone()
+                        current_cursor = existing["cursor"] if existing else 0
+                        if current_cursor != checkpoint.expected_cursor:
+                            raise ValueError("source cursor changed; rescan from committed checkpoint")
+                    for record in batch.records:
+                        existing = db.execute(
+                            "SELECT source_message_id, event_id FROM source_records "
+                            "WHERE account_id=? AND stream_id=? AND local_id=?",
+                            (batch.account_id, record.stream_id, record.local_id),
+                        ).fetchone()
+                        if existing:
+                            if existing["source_message_id"] != record.source_message_id:
+                                raise ValueError("source message identity changed")
+                            continue
+                        event_id = ""
+                        if record.event is not None:
+                            receipt = self._receive_event_in_transaction(db, record.event)
+                            event_id = receipt.canonical_event_id
+                            receipts.append(receipt)
+                            # 游标提交后即使进程在路由前退出，业务上下文也不能漏行。
+                            if record.event.kind == "message" and record.event.content.strip():
+                                db.execute(
+                                    "INSERT OR IGNORE INTO conversation_history("
+                                    "history_id,source_event_id,conversation_id,conversation_name,"
+                                    "sender_name,direction,content_type,content,source_type,created_at) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                    (uuid.uuid4().hex, event_id, record.event.conversation_id,
+                                     record.event.conversation_name, record.event.sender_name,
+                                     record.event.direction, record.event.content_type, record.event.content.strip(),
+                                     record.event.source_type, record.event.native_timestamp
+                                     if record.event.native_timestamp is not None else record.event.observed_at),
+                                )
+                            if receipt.accepted and record.filter_reason:
+                                db.execute(
+                                    "UPDATE event_runs SET state='skipped',reason=?,updated_at=? WHERE event_id=?",
+                                    (record.filter_reason, time.time(), event_id),
+                                )
+                                db.execute("UPDATE events SET processed_at=? WHERE event_id=?", (time.time(), event_id))
+                                receipts[-1] = EventReceipt(receipt.observed_event_id, event_id, False, "skipped")
+                        db.execute(
+                            "INSERT INTO source_records VALUES (?,?,?,?,?,?,?,?)",
+                            (batch.account_id, record.stream_id, record.local_id,
+                             record.source_message_id, event_id, record.filter_reason,
+                             record.receipt_phase, time.time()),
+                        )
+                    for checkpoint in batch.checkpoints:
+                        db.execute(
+                            "INSERT INTO source_checkpoints VALUES (?,?,?,?,?,?) "
+                            "ON CONFLICT(account_id,stream_id) DO UPDATE SET "
+                            "cursor=excluded.cursor,generation=excluded.generation,updated_at=excluded.updated_at",
+                            (batch.account_id, checkpoint.stream_id, checkpoint.cursor,
+                             checkpoint.baseline_high_water, checkpoint.generation, time.time()),
+                        )
+                    db.execute(
+                        "INSERT INTO source_batches VALUES (?,?,?,?)",
+                        (batch.account_id, batch.batch_id, signature, time.time()),
+                    )
+                else:
+                    for record in batch.records:
+                        if record.event is None:
+                            continue
+                        row = db.execute(
+                            "SELECT r.event_id,s.state FROM source_records r "
+                            "LEFT JOIN event_runs s ON s.event_id=r.event_id "
+                            "WHERE r.account_id=? AND r.stream_id=? AND r.local_id=?",
+                            (batch.account_id, record.stream_id, record.local_id),
+                        ).fetchone()
+                        receipts.append(EventReceipt(record.event.event_id, row["event_id"], False, row["state"] or "legacy"))
+                db.execute("RELEASE receive_source_batch")
+            except Exception:
+                db.execute("ROLLBACK TO receive_source_batch")
+                db.execute("RELEASE receive_source_batch")
+                raise
+        return tuple(receipts)
+
+    @staticmethod
+    def _receive_event_in_transaction(db, event: WechatDesktopEvent) -> EventReceipt:
+        fingerprint = event.fingerprint()
+        row = db.execute("SELECT event_id,fingerprint FROM events WHERE event_id=? OR fingerprint=?",
+                         (event.event_id, fingerprint)).fetchone()
+        if row is not None:
+            if event.source_message_id and row["fingerprint"] != fingerprint:
+                raise ValueError("event id collides with a different source identity")
+            run = db.execute("SELECT state FROM event_runs WHERE event_id=?", (row["event_id"],)).fetchone()
+            return EventReceipt(event.event_id, row["event_id"], False, run["state"] if run else "legacy")
+        db.execute(
+            "INSERT INTO events(event_id,fingerprint,kind,conversation_id,conversation_name,"
+            "sender_id,sender_name,content_type,content,evidence_path,observed_at,account_id,"
+            "source_stream_id,source_message_id,source_local_id,native_timestamp,receipt_phase,direction,source_type) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (event.event_id, fingerprint, event.kind, event.conversation_id, event.conversation_name,
+             event.sender_id, event.sender_name, event.content_type, event.content, event.evidence_path,
+             event.observed_at, event.account_id, event.source_stream_id, event.source_message_id,
+             event.source_local_id, event.native_timestamp, event.receipt_phase, event.direction, event.source_type),
+        )
+        db.execute("INSERT INTO event_runs VALUES (?, 'received', '', ?)", (event.event_id, time.time()))
+        return EventReceipt(event.event_id, event.event_id, True, "received")
+
     def record_event(self, event: WechatDesktopEvent) -> bool:
         with self._lock, self._connect() as db:
             try:
@@ -245,21 +471,7 @@ class WechatDesktopStore:
             # record_event 的兼容入口保留独立事务；接收使用 SAVEPOINT 覆盖两个写入。
             db.execute("SAVEPOINT receive_event")
             try:
-                fingerprint = event.fingerprint()
-                row = db.execute("SELECT event_id FROM events WHERE event_id=? OR fingerprint=?",
-                                 (event.event_id, fingerprint)).fetchone()
-                if row is not None:
-                    run = db.execute("SELECT state FROM event_runs WHERE event_id=?", (row["event_id"],)).fetchone()
-                    receipt = EventReceipt(event.event_id, row["event_id"], False, run["state"] if run else "legacy")
-                else:
-                    db.execute(
-                        "INSERT INTO events(event_id,fingerprint,kind,conversation_id,conversation_name,"
-                        "sender_id,sender_name,content_type,content,evidence_path,observed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                        (event.event_id, fingerprint, event.kind, event.conversation_id, event.conversation_name,
-                         event.sender_id, event.sender_name, event.content_type, event.content, event.evidence_path, event.observed_at),
-                    )
-                    db.execute("INSERT INTO event_runs VALUES (?, 'received', '', ?)", (event.event_id, time.time()))
-                    receipt = EventReceipt(event.event_id, event.event_id, True, "received")
+                receipt = self._receive_event_in_transaction(db, event)
                 db.execute("RELEASE receive_event")
                 return receipt
             except Exception:
@@ -291,7 +503,7 @@ class WechatDesktopStore:
             row = db.execute("SELECT * FROM event_runs WHERE event_id=?", (event_id,)).fetchone()
             return dict(row) if row else {}
 
-    def claim_delivery(self, event_ids: list[str], target: str, content_hash: str, *, retry_not_sent: bool = False) -> tuple[str, SendResult | None]:
+    def claim_delivery(self, event_ids: list[str], target: str, content_hash: str) -> tuple[str, SendResult | None]:
         """同一入站任务的同一输出只提交一次，日志不完整也不自动重放。"""
         ids = json.dumps(sorted(set(event_ids)))
         key = hashlib.sha256(json.dumps([ids, target, content_hash]).encode()).hexdigest() if event_ids else ""
@@ -305,10 +517,6 @@ class WechatDesktopStore:
             if inserted.rowcount:
                 return delivery_id, None
             row = db.execute("SELECT delivery_id,result,status FROM deliveries WHERE dedupe_key=?", (key,)).fetchone()
-            if retry_not_sent and row["status"] == "not_sent":
-                db.execute("UPDATE deliveries SET status='sending',result='{}',updated_at=? WHERE delivery_id=?",
-                           (time.time(), row["delivery_id"]))
-                return row["delivery_id"], None
             return row["delivery_id"], SendResult.from_backend(json.loads(row["result"]))
 
     def finish_delivery(self, delivery_id: str, result: SendResult):
@@ -436,7 +644,7 @@ class WechatDesktopStore:
             content_type=event.content_type,
             content=event.content,
             source_type=event.source_type,
-            created_at=event.observed_at,
+            created_at=event.native_timestamp if event.native_timestamp is not None else event.observed_at,
             source_event_id=event.event_id,
         )
 
@@ -639,30 +847,3 @@ class WechatDesktopStore:
                     # 保留登记，下一轮继续清理，避免永久遗留副本。
                     continue
                 db.execute("DELETE FROM managed_evidence WHERE path=?", (row["path"],))
-
-
-    def ensure_broadcast_job(self, fire_date: str, target: str, message: str) -> dict:
-        with self._lock, self._connect() as db:
-            db.execute("INSERT OR IGNORE INTO broadcast_jobs(fire_date,target,message,status,updated_at) VALUES (?,?,?,'pending',?)",
-                       (fire_date, target, message, time.time()))
-            return dict(db.execute("SELECT * FROM broadcast_jobs WHERE fire_date=? AND target=?", (fire_date, target)).fetchone())
-
-    def set_broadcast_status(self, fire_date: str, target: str, status: str, *, expected: tuple[str, ...] = ()) -> bool:
-        with self._lock, self._connect() as db:
-            sql = "UPDATE broadcast_jobs SET status=?, updated_at=? WHERE fire_date=? AND target=?"
-            params = [status, time.time(), fire_date, target]
-            if expected:
-                sql += " AND status IN (" + ",".join("?" for _ in expected) + ")"
-                params.extend(expected)
-            return db.execute(sql, params).rowcount == 1
-
-    def has_pending_broadcasts(self, fire_date: str) -> bool:
-        with self._lock, self._connect() as db:
-            return db.execute("SELECT 1 FROM broadcast_jobs WHERE fire_date=? AND status IN ('pending','queued') LIMIT 1", (fire_date,)).fetchone() is not None
-
-    def broadcast_status_counts(self, fire_date: str) -> dict[str, int]:
-        with self._lock, self._connect() as db:
-            return {row["status"]: row["count"] for row in db.execute(
-                "SELECT status, COUNT(*) AS count FROM broadcast_jobs WHERE fire_date=? GROUP BY status",
-                (fire_date,),
-            )}

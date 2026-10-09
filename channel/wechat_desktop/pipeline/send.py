@@ -579,12 +579,12 @@ class WechatDesktopSendMixin:
         )
 
     def _execute_agent_action(self, action: str, **params) -> dict:
-        """供 Agent 读取当前会话历史或主动发送文字的受限入口。
+        """供 Agent 读取历史、查询联系人或主动发送文字的受限入口。
 
         读取为只读操作，不触发会话切换或持久化；发送路径继续遵守暂停、
         黑名单、白名单和限流规则，并要求后端验证发送结果。
         """
-        if action not in {"read_history", "send_text"}:
+        if action not in {"read_history", "search_contacts", "send_text"}:
             return {
                 "status": "error",
                 "message": f"unsupported wechat_desktop action: {action}",
@@ -595,12 +595,12 @@ class WechatDesktopSendMixin:
                 "message": "desktop takeover is paused",
             }
 
-        if action == "read_history":
+        if action in {"read_history", "search_contacts"}:
             max_messages = max(
                 1,
                 min(
                     int(self.config.get("wechat_history_max_messages", 50)),
-                    200,
+                    50,
                 ),
             )
             try:
@@ -617,16 +617,43 @@ class WechatDesktopSendMixin:
                     "code": "invalid_limit",
                     "message": "limit must be at least 1",
                 }
+            conversation_id = params.get("conversation_id", "")
+            if not isinstance(conversation_id, str):
+                return {
+                    "status": "error", "code": "invalid_conversation_id",
+                    "message": "conversation_id must be a string",
+                }
+            conversation_id = conversation_id.strip()
             try:
-                result = self._driver.read_current_chat_history(
-                    min(raw_limit, max_messages)
-                )
+                if action == "search_contacts":
+                    query = params.get("query", "")
+                    if not isinstance(query, str):
+                        return {
+                            "status": "error", "code": "invalid_query",
+                            "message": "query must be a string",
+                        }
+                    search = getattr(self._driver, "search_contacts", None)
+                    if not callable(search):
+                        raise NotImplementedError("backend does not support contact search")
+                    result = search(query.strip(), min(raw_limit, 50))
+                    return {"status": "success", **result}
+                if conversation_id:
+                    read = getattr(self._driver, "read_chat_history", None)
+                    if not callable(read):
+                        raise NotImplementedError("backend does not support history by conversation_id")
+                    result = read(conversation_id, min(raw_limit, max_messages))
+                else:
+                    result = self._driver.read_current_chat_history(
+                        min(raw_limit, max_messages)
+                    )
                 payload = asdict(result)
                 return {
                     "status": "success",
                     "conversation": {
                         "title": result.conversation_title,
                         "type": result.conversation_type,
+                        "id": getattr(result, "conversation_id", ""),
+                        "source": getattr(result, "source", "wechat_history_dialog"),
                     },
                     **{
                         key: value
@@ -634,6 +661,12 @@ class WechatDesktopSendMixin:
                         if key
                         not in {"conversation_title", "conversation_type"}
                     },
+                }
+            except NotImplementedError:
+                return {
+                    "status": "error",
+                    "code": "capability_unavailable",
+                    "message": "the current backend does not support this database read capability",
                 }
             except WechatHistoryReadError as exc:
                 return {
@@ -643,11 +676,11 @@ class WechatDesktopSendMixin:
                 }
             except Exception as exc:
                 file_logger.exception(
-                    "[WechatDesktop][history] current conversation read failed"
+                    "[WechatDesktop][read] backend read failed"
                 )
                 return {
                     "status": "error",
-                    "code": "uia_error",
+                    "code": "database_read_error" if self.config.get("desktop_backend") == "db_uia" else "uia_error",
                     "message": str(exc),
                 }
 

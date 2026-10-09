@@ -40,6 +40,20 @@ def send_scope(check: Callable[[], None]):
         _check.reset(token)
 
 
+@contextmanager
+def extend_send_scope(check: Callable[[], None]):
+    """增加一层门禁并保留原任务取消检查；直接捕获回调，避免递归。"""
+    previous = _check.get()
+
+    def combined_check():
+        if previous is not None:
+            previous()
+        check()
+
+    with send_scope(combined_check):
+        yield
+
+
 def check_send_allowed():
     check = _check.get()
     if check is not None:

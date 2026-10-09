@@ -346,13 +346,12 @@ def test_concurrent_store_connections_cannot_claim_same_send_twice(store):
     assert sum(previous is None for _, previous in claims) == 1
 
 
-def test_only_broadcast_can_reclaim_proven_not_sent_delivery(store):
+def test_not_sent_delivery_is_not_automatically_reclaimed(store):
     claim_id, _ = store.claim_delivery(["event"], "Alice", "hash")
     store.finish_delivery(claim_id, SendResult(SendStatus.NOT_SENT, "cancelled before first chunk"))
-    assert store.claim_delivery(["event"], "Alice", "hash")[1].status == SendStatus.NOT_SENT
-    assert store.claim_delivery(["event"], "Alice", "hash", retry_not_sent=True) == (claim_id, None)
-    # 第二次调用已处于 sending，广播也不得再次取得发送权。
-    assert store.claim_delivery(["event"], "Alice", "hash", retry_not_sent=True)[1].status == SendStatus.UNCERTAIN
+    for _ in range(2):
+        duplicate_id, previous = store.claim_delivery(["event"], "Alice", "hash")
+        assert duplicate_id == claim_id and previous.status == SendStatus.NOT_SENT
 
 
 def test_startup_baseline_stays_baseline_after_receipt_retry(store, monkeypatch):

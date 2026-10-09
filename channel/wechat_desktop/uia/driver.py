@@ -19,7 +19,6 @@ from typing import Optional
 from common.log import file_logger, logger
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus, SendResult, SendStatus
-from channel.wechat_desktop.send_control import check_send_allowed
 from channel.wechat_desktop.models import (
     ReplyTargetValidation,
     UNKNOWN_SENDER_NAME,
@@ -28,61 +27,14 @@ from channel.wechat_desktop.models import (
     WechatHistoryReadResult,
 )
 from channel.wechat_desktop.triggers import group_message_triggered, group_requires_mention
-from channel.wechat_desktop.uia.backend import WechatDesktopBackend
+from channel.wechat_desktop.backend import WechatDesktopBackend
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway, _UiaPriorityCoordinator
 from channel.wechat_desktop.uia.operations import (
     WechatConversationSelector,
-    WechatSendOperations,
     resolve_conversation_selector,
 )
 from channel.wechat_desktop.uia.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia.client import WechatUiaClient
-
-
-class _UiaPriorityCoordinator:
-    """Let one bounded UIA operation finish, then prefer waiting replies."""
-
-    def __init__(self):
-        self._condition = threading.Condition(threading.RLock())
-        self._owner: Optional[int] = None
-        self._depth = 0
-        self._reply_waiters = 0
-
-    @contextmanager
-    def lease(self, *, reply: bool):
-        thread_id = threading.get_ident()
-        registered_waiter = False
-        with self._condition:
-            if self._owner == thread_id:
-                self._depth += 1
-            else:
-                if reply:
-                    self._reply_waiters += 1
-                    registered_waiter = True
-                try:
-                    while self._owner is not None or (
-                        not reply and self._reply_waiters > 0
-                    ):
-                        if reply:
-                            check_send_allowed()
-                        self._condition.wait(timeout=0.05)
-                    if reply:
-                        check_send_allowed()
-                    self._owner = thread_id
-                    self._depth = 1
-                finally:
-                    if registered_waiter:
-                        self._reply_waiters -= 1
-                        self._condition.notify_all()
-        try:
-            yield
-        finally:
-            with self._condition:
-                if self._owner != thread_id:
-                    raise RuntimeError("UIA lease released by a non-owner thread")
-                self._depth -= 1
-                if self._depth == 0:
-                    self._owner = None
-                    self._condition.notify_all()
 
 
 class WechatUiaDriver(WechatDesktopBackend):
@@ -121,7 +73,6 @@ class WechatUiaDriver(WechatDesktopBackend):
         self._known_groups = {
             str(x)
             for x in list(config.get("auto_reply_groups", []) or [])
-            + list(config.get("daily_hot_broadcast_groups", []) or [])
         }
         self._known_group_keys: set[str] = set()
         self._reply_in_flight = threading.Event()
@@ -142,12 +93,16 @@ class WechatUiaDriver(WechatDesktopBackend):
         self._owner_name = ""
         self._owner_source = "unknown"
         self._scan_focus_retry_after = 0.0
-        self._send_operations = WechatSendOperations(
-            self.client,
-            self._resolve_selector,
-            self._reply_uia,
-            lambda: self._observation(read_owner=False),
+        self.gateway = WechatUiaGateway(
+            config,
+            client=self.client,
+            selector_resolver=self._resolve_selector,
+            observation_reader=lambda: self._observation(read_owner=False),
+            priority=self._uia_priority,
+            reply_pending=self._reply_ui_pending,
         )
+        # 保留旧局部测试的别名；扫描和发送只有一份 UI 优先级协调器。
+        self._send_operations = self.gateway.send_operations
 
     def preload_group_sender_ocr(self) -> bool:
         """Eagerly load RapidOCR models used for group sender resolution."""
@@ -157,17 +112,12 @@ class WechatUiaDriver(WechatDesktopBackend):
         return bool(preload())
 
     def _scan_uia(self, operation, *args, **kwargs):
-        with self._uia_priority.lease(reply=False):
-            return operation(*args, **kwargs)
+        return self.gateway.scan(operation, *args, **kwargs)
 
     @contextmanager
     def _reply_uia(self):
-        self._reply_ui_pending.set()
-        try:
-            with self._uia_priority.lease(reply=True):
-                yield
-        finally:
-            self._reply_ui_pending.clear()
+        with self.gateway.operation():
+            yield
 
     def _trace(self, stage: str, message: str, *args) -> None:
         """Session-scan diagnostics: file only (run.log), never the console."""
@@ -244,22 +194,22 @@ class WechatUiaDriver(WechatDesktopBackend):
             )
 
     def start(self) -> bool:
-        resume_waits = getattr(self.client, "resume_waits", None)
-        if resume_waits:
-            resume_waits()
+        if self.gateway.closed:
+            return False
         if not self._hook_started:
             self._hook_started = self._hook.start()
         return self._hook_started
 
     def ensure_foreground(self) -> bool:
-        return self.client.ensure_foreground_window()
+        return self.gateway.ensure_foreground()
 
     def close(self):
+        self.gateway.close()
         self._hook.close()
         self._hook_started = False
-        cancel_waits = getattr(self.client, "cancel_waits", None)
-        if cancel_waits:
-            cancel_waits()
+
+    def resume(self) -> None:
+        self.gateway.resume()
 
     def _settle_hook_signal(self, stop_event: threading.Event) -> bool:
         minimum = max(0, int(self.config.get("uia_hook_settle_ms_min", 300)))
@@ -269,6 +219,8 @@ class WechatUiaDriver(WechatDesktopBackend):
 
     def wait_for_changes(self, stop_event: threading.Event) -> str:
         """Wait for a flash or the low-frequency reconciliation deadline."""
+        if self.gateway.closed:
+            return "stopped"
         self.start()
         if self._retry_conversations or self._unacknowledged_events:
             retry_delay = max(0.25, float(self.config.get(
@@ -1429,7 +1381,7 @@ class WechatUiaDriver(WechatDesktopBackend):
     ) -> tuple[WechatDesktopEvent, int]:
         # UIA priority must always be acquired before shared driver state.
         # Reply validation follows the same order, preventing lock inversion.
-        with self._uia_priority.lease(reply=False):
+        with self.gateway.operation(reply=False):
             with self._operation_lock:
                 materialized, resolve_count = self._materialize_event_locked(event)
         # Network fetches must never retain a UIA priority lease or the driver
@@ -1594,7 +1546,7 @@ class WechatUiaDriver(WechatDesktopBackend):
         resolution = self.resolve_target(conversation)
         if resolution.target is None:
             return SendResult(SendStatus.NOT_SENT, resolution.reason)
-        return self._send_operations.send_text(resolution.target.conversation_id, text)
+        return self.gateway.send_text(resolution.target.conversation_id, text)
 
     def send_interim_text(self, conversation: str, text: str) -> SendResult:
         """发送进度提示，不等待普通回复的拟人化节流间隔。"""
@@ -1602,7 +1554,7 @@ class WechatUiaDriver(WechatDesktopBackend):
         resolution = self.resolve_target(conversation)
         if resolution.target is None:
             return SendResult(SendStatus.NOT_SENT, resolution.reason)
-        return self._send_operations.send_text(resolution.target.conversation_id, text, expedited=True)
+        return self.gateway.send_interim_text(resolution.target.conversation_id, text)
 
     def send_image(self, conversation: str, image_path: str) -> SendResult:
         """通过独立发送组件发送图片。"""
@@ -1610,4 +1562,4 @@ class WechatUiaDriver(WechatDesktopBackend):
         resolution = self.resolve_target(conversation)
         if resolution.target is None:
             return SendResult(SendStatus.NOT_SENT, resolution.reason)
-        return self._send_operations.send_image(resolution.target.conversation_id, image_path)
+        return self.gateway.send_image(resolution.target.conversation_id, image_path)
