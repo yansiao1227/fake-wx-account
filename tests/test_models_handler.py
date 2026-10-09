@@ -94,6 +94,192 @@ class TestModelsHandler(unittest.TestCase):
         self.assertIn("provider_models", cap)
         self.assertIn("dashscope", cap["provider_models"])
 
+    def test_image_auto_uses_dedicated_env_credentials_without_chat_credentials(self):
+        from channel.web.web_channel import ModelsHandler
+
+        with patch.dict(os.environ, {
+            "SKILL_IMAGE_GENERATION_API_KEY": "synthetic-image-key",
+            "SKILL_IMAGE_GENERATION_API_BASE": "https://image.example.invalid/v1",
+        }, clear=True):
+            cap = ModelsHandler._image_capability({"bot_type": "deepseek", "deepseek_api_key": "synthetic-chat-key"})
+
+        self.assertEqual(cap["fallback_provider"], "openai")
+        self.assertEqual(cap["fallback_model"], "gpt-image-2")
+        self.assertTrue(cap["runtime_active"])
+        self.assertNotEqual(cap["note"], "router_pending")
+        self.assertNotIn("synthetic-image-key", json.dumps(cap))
+
+    def test_image_auto_recognizes_dedicated_config_credentials(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {
+            "api_key": "synthetic-image-config-key", "api_base": "https://image.example.invalid/v1",
+        }}}
+        with patch.dict(os.environ, {}, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["fallback_provider"], "openai")
+        self.assertTrue(cap["runtime_active"])
+        self.assertNotIn("synthetic-image-config-key", json.dumps(cap))
+
+    def test_image_env_key_has_priority_over_config_key(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {"api_key": "synthetic-config-key"}}}
+        # An explicitly configured placeholder in env takes priority too;
+        # the console must not claim that the shadowed config key is active.
+        with patch.dict(os.environ, {"SKILL_IMAGE_GENERATION_API_KEY": "YOUR_API_KEY"}, clear=True):
+            prediction = ModelsHandler._predict_image_auto(local_config)
+
+        self.assertEqual(prediction, {"provider": "", "model": ""})
+
+    def test_image_env_model_and_provider_override_json_selection(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {
+            "provider": "gemini", "model": "nano-banana",
+        }}}
+        with patch.dict(os.environ, {
+            "SKILL_IMAGE_GENERATION_API_KEY": "synthetic-image-key",
+            "SKILL_IMAGE_GENERATION_MODEL": "gpt-image-2",
+            "SKILL_IMAGE_GENERATION_PROVIDER": "openai",
+        }, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["current_model"], "gpt-image-2")
+        self.assertEqual(cap["current_provider"], "openai")
+        self.assertEqual(cap["strategy"], "specified")
+
+    def test_empty_image_env_model_and_provider_override_json_selection(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {
+            "provider": "gemini", "model": "nano-banana",
+        }}}
+        with patch.dict(os.environ, {
+            "SKILL_IMAGE_GENERATION_API_KEY": "synthetic-image-key",
+            "SKILL_IMAGE_GENERATION_MODEL": "",
+            "SKILL_IMAGE_GENERATION_PROVIDER": "",
+        }, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["current_model"], "")
+        self.assertEqual(cap["current_provider"], "")
+        self.assertEqual(cap["strategy"], "auto")
+        self.assertEqual(cap["fallback_provider"], "openai")
+
+    def test_image_base_only_never_borrows_chat_key(self):
+        from channel.web.web_channel import ModelsHandler
+
+        for source in ("env", "config"):
+            with self.subTest(source=source):
+                local_config = {"open_ai_api_key": "synthetic-openai-chat-key"}
+                environment = {"OPENAI_API_KEY": "synthetic-openai-env-chat-key"}
+                if source == "env":
+                    environment["SKILL_IMAGE_GENERATION_API_BASE"] = "https://image.example.invalid/v1"
+                else:
+                    local_config["skills"] = {"image-generation": {
+                        "api_base": "https://image.example.invalid/v1",
+                    }}
+                with patch.dict(os.environ, environment, clear=True):
+                    cap = ModelsHandler._image_capability(local_config)
+
+                self.assertEqual(cap["fallback_provider"], "")
+                self.assertEqual(cap["fallback_model"], "")
+
+    def test_image_base_only_does_not_predict_silent_fallback_to_another_vendor(self):
+        from channel.web.web_channel import ModelsHandler
+
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "synthetic-chat-key",
+            "SKILL_IMAGE_GENERATION_API_BASE": "https://image.example.invalid/v1",
+            "GEMINI_API_KEY": "synthetic-gemini-image-key",
+        }, clear=True):
+            cap = ModelsHandler._image_capability({})
+
+        self.assertEqual(cap["fallback_provider"], "")
+        self.assertEqual(cap["fallback_model"], "")
+
+    def test_explicit_empty_image_env_credentials_override_config_values(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {
+            "api_key": "synthetic-image-config-key", "api_base": "https://image.example.invalid/v1",
+        }}}
+        with patch.dict(os.environ, {
+            "SKILL_IMAGE_GENERATION_API_KEY": "  ", "SKILL_IMAGE_GENERATION_API_BASE": "  ",
+        }, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["fallback_provider"], "")
+
+    def test_empty_image_credentials_keep_legacy_openai_fallback(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {"api_key": "", "api_base": ""}}}
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "synthetic-legacy-openai-key",
+            "SKILL_IMAGE_GENERATION_API_KEY": "", "SKILL_IMAGE_GENERATION_API_BASE": "",
+        }, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["fallback_provider"], "openai")
+
+    def test_chat_only_provider_keys_are_not_image_credentials(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {
+            "bot_type": "custom", "custom_api_key": "synthetic-custom-chat-key",
+            "deepseek_api_key": "synthetic-deepseek-chat-key", "mimo_api_key": "synthetic-mimo-chat-key",
+        }
+        with patch.dict(os.environ, {
+            "DEEPSEEK_API_KEY": "synthetic-deepseek-env-key",
+            "CUSTOM_API_KEY": "synthetic-custom-env-key",
+        }, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["fallback_provider"], "")
+        self.assertEqual(cap["fallback_model"], "")
+
+    def test_chat_linkai_flag_does_not_hide_dedicated_image_routing(self):
+        from channel.web.web_channel import ModelsHandler
+
+        with patch.dict(os.environ, {"SKILL_IMAGE_GENERATION_API_KEY": "synthetic-image-key"}, clear=True):
+            cap = ModelsHandler._image_capability({"use_linkai": True, "linkai_api_key": "synthetic-linkai-key"})
+
+        self.assertEqual(cap["fallback_provider"], "openai")
+
+    def test_set_image_pins_provider_and_model_and_updates_active_ui_state(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {
+            "api_key": "synthetic-image-key", "api_base": "https://image.example.invalid/v1",
+        }}}
+        file_config = {}
+        handler = ModelsHandler()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("channel.web.web_channel.conf", return_value=local_config):
+                with patch.object(ModelsHandler, "_read_file_config", return_value=file_config):
+                    with patch.object(ModelsHandler, "_write_file_config") as write_file:
+                        result = json.loads(handler._handle_set_capability({
+                            "capability": "image", "provider_id": "openai", "model": "synthetic-image-alias",
+                        }))
+                        cap = ModelsHandler._image_capability(local_config)
+            self.assertEqual(os.environ["SKILL_IMAGE_GENERATION_MODEL"], "synthetic-image-alias")
+            self.assertEqual(os.environ["SKILL_IMAGE_GENERATION_PROVIDER"], "openai")
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["runtime_active"])
+        self.assertFalse(result["router_pending"])
+        self.assertEqual(cap["current_provider"], "openai")
+        self.assertEqual(cap["current_model"], "synthetic-image-alias")
+        self.assertTrue(cap["runtime_active"])
+        self.assertEqual(local_config["skills"]["image-generation"]["api_key"], "synthetic-image-key")
+        self.assertEqual(file_config["skills"]["image-generation"], {
+            "provider": "openai", "model": "synthetic-image-alias",
+        })
+        write_file.assert_called_once_with(file_config)
+
 
 if __name__ == "__main__":
     unittest.main()

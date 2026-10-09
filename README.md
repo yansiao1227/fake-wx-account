@@ -235,6 +235,23 @@ flowchart TD
 
 旧 UIA 接收驱动、任务栏钩子、按文件名或前缀猜测引用附件的缓存、物化层网页预取已移除。
 
+## AI 作图与微信图片回复
+
+作图沿用项目的 [image-generation 技能](skills/image-generation/SKILL.md)，通过 OpenAI 兼容接口调用 `gpt-image-2`。图像凭据与聊天模型独立，推荐在 `~/.cow/.env` 配置：
+
+```dotenv
+SKILL_IMAGE_GENERATION_API_KEY=填写作图专用密钥
+SKILL_IMAGE_GENERATION_API_BASE=https://mediocre-new-api.midway.run/v1
+SKILL_IMAGE_GENERATION_PROVIDER=openai
+SKILL_IMAGE_GENERATION_MODEL=gpt-image-2
+```
+
+真实密钥不写入仓库；非敏感配置可放在根 `config.json` 的 `skills.image-generation` 命名空间，字段样例见 `config-template.json`。`api_base` 填到 `/v1`，脚本会拼接 `/images/generations`；不能填完整生成端点。专用配置不完整时明确报错，不向该服务发送聊天模型的 Key。
+
+收到“画一张……”等请求后，Agent 读取技能并运行生成脚本，提交 `model`、`prompt`、可选尺寸/画质及 `n=1`。API 返回的 URL 立即下载成可验证的本地图片，输出 `images[].url` 为本地绝对路径；现有产物检测将图片交给通道，微信经过图片发送权限与目标校验后由 UIA 发出。生成和下载不需要操作微信，实际发送仍会使用微信窗口。
+
+默认配置可直接用于文生图；空结果、下载失败或返回非图片不能报告成功，错误输出不暴露密钥或签名 URL。自定义服务的 `/images/edits` 编辑能力需由服务支持，本次提供的接口只确认生成协议，不能将编辑失败悄悄变成重新作图。
+
 ## 微信本地数据库：何时解密
 
 ### 读取范围与账号绑定

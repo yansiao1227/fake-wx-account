@@ -5,6 +5,7 @@ metadata:
   cowagent:
     requires:
       anyEnv:
+        - SKILL_IMAGE_GENERATION_API_KEY
         - OPENAI_API_KEY
         - GEMINI_API_KEY
         - ARK_API_KEY
@@ -33,6 +34,14 @@ Run `scripts/generate.py` with a JSON argument. The path is relative to this ski
 python <base_dir>/scripts/generate.py '<json_args>'
 ```
 
+On this Windows project, use the required interpreter `D:\Miniconda\envs\cowagent-wechat\python.exe` rather than bare `python`:
+
+```powershell
+& 'D:\Miniconda\envs\cowagent-wechat\python.exe' '<base_dir>/scripts/generate.py' '{"prompt":"A serene koi pond at sunset, ukiyo-e style.","size":"1024x1024"}'
+```
+
+The configured image provider and model are used automatically. Do not put API keys in the command, prompt, tool output, or generated script.
+
 **Set bash timeout to at least 600 seconds**, as image generation can take 30–200s per provider, and the script may try multiple providers sequentially.
 
 ### Parameters
@@ -40,6 +49,8 @@ python <base_dir>/scripts/generate.py '<json_args>'
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `prompt` | string | yes | — | Image description |
+| `model` | string | no | configured model / auto | Explicit model override; otherwise read `SKILL_IMAGE_GENERATION_MODEL` |
+| `provider` | string | no | configured provider / auto | Explicit provider override; `openai` also supports compatible image endpoints |
 | `image_url` | string / list | no | null | Input image(s) for editing: local file path or URL. Multi-image fusion is supported (pass a list) |
 | `quality` | string | no | auto | `low` / `medium` / `high` (only some backends honour this) |
 | `size` | string | no | auto | `512` / `1K` / `2K` / `3K` / `4K`, or pixel value (`1024x1024`) |
@@ -100,11 +111,30 @@ On error:
 
 ### Setup
 
-The script needs **at least one** of these API keys (set via `env_config` or `config.json`):
+The script loads `~/.cow/.env` before resolving credentials. Store real API keys there, using `env_config` when configuring them through the Agent; do not put production keys in repository JSON or logs.
+
+For a dedicated OpenAI-compatible image service, use:
+
+```dotenv
+SKILL_IMAGE_GENERATION_API_KEY=your-image-api-key
+SKILL_IMAGE_GENERATION_API_BASE=https://mediocre-new-api.midway.run/v1
+SKILL_IMAGE_GENERATION_PROVIDER=openai
+SKILL_IMAGE_GENERATION_MODEL=gpt-image-2
+```
+
+These settings only affect the image skill and do not change `OPENAI_API_KEY`, `OPENAI_API_BASE`, or the chat model. The base includes `/v1`; the script appends `/images/generations` and requests one image (`n=1`). A dedicated base without its dedicated key is a configuration error; never borrow a chat key for that host. A dedicated key without a base uses the official OpenAI image base.
+
+Non-secret defaults may also be set in `config.json` under `skills.image-generation.{provider,model,api_base}`; the matching `SKILL_IMAGE_GENERATION_*` environment variables take precedence. The `api_key` template field is an optional fallback; keep it empty when using `~/.cow/.env`.
+
+When both dedicated fields are absent, the existing provider keys remain supported:
 
 `OPENAI_API_KEY` / `GEMINI_API_KEY` / `ARK_API_KEY` / `DASHSCOPE_API_KEY` / `MINIMAX_API_KEY` / `LINKAI_API_KEY`
 
-Each also has an optional `*_API_BASE` for custom endpoints. The script automatically picks the first configured backend and falls back to the next if it fails — no need to specify a model.
+Each also has an optional `*_API_BASE` for custom endpoints. Automatic routing can try configured providers in order; a pinned provider/model uses its matching provider. Missing dedicated credentials must be corrected before invoking the skill again.
+
+Image URLs returned by the API are downloaded immediately without forwarding the generation Bearer token. The output contains local absolute paths in `images[].url`, which the existing Agent artifact and WeChat sending pipeline consume. Empty results, failed downloads, and non-image responses are failures. Do not paste signed download URLs into progress messages.
+
+The custom service above has only been specified for text-to-image generation. Image editing uses `/images/edits` and depends on the service supporting that endpoint; report an edit failure rather than silently generating a new image.
 
 Seedream uses standard Volcengine Ark (`ARK_API_BASE` defaults to `https://ark.cn-beijing.volces.com/api/v3`).
 

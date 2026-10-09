@@ -22,7 +22,7 @@ By default, "auto routing + automatic fallback" is used:
 
 1. Pick the first configured provider in the order `OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI`
 2. On errors such as 401, model not enabled, or network issues, automatically switch to the next provider
-3. If the user specifies a model in the conversation (e.g. "use seedream to draw a cat"), the corresponding provider is promoted to the front
+3. A specified model or provider uses only its matching configured provider; unpinned requests use the automatic fallback order above
 
 To pin a specific model:
 
@@ -38,11 +38,30 @@ To pin a specific model:
 
 ## Configuring API Keys
 
+### Dedicated OpenAI-compatible image service
+
+Configure an image-only endpoint without changing the chat model. Keep real credentials in `~/.cow/.env`:
+
+```dotenv
+SKILL_IMAGE_GENERATION_API_KEY=your-image-api-key
+SKILL_IMAGE_GENERATION_API_BASE=https://mediocre-new-api.midway.run/v1
+SKILL_IMAGE_GENERATION_PROVIDER=openai
+SKILL_IMAGE_GENERATION_MODEL=gpt-image-2
+```
+
+The base ends at `/v1`; the script appends `/images/generations` and requests one image (`n=1`). A dedicated base without its dedicated key is a configuration error: chat credentials are never sent to that host and another service is not selected. A dedicated key without a base uses the official OpenAI image base. Both dedicated fields must be absent to reuse legacy OpenAI credentials.
+
+Non-secret defaults also fit under `config.json` → `skills.image-generation.{provider,model,api_base}`. Keep the optional `api_key` template field empty when using the environment file. Matching `SKILL_IMAGE_GENERATION_*` environment variables take precedence. Standalone invocation loads `~/.cow/.env`; this Windows project requires `D:\Miniconda\envs\cowagent-wechat\python.exe`.
+
+Signed result URLs are downloaded immediately without the generation Bearer token. Output contains local absolute paths for the existing Agent artifact and WeChat image-sending pipeline. Empty data, failed downloads, and non-image responses fail; errors redact keys and signed URLs. Image editing depends on the custom service supporting `/images/edits`; an edit failure must not silently become a new generation.
+
+### Existing provider credentials
+
 <Tip>
-  It is recommended to configure providers from the "Model Management" page in the [Web console](/channels/web). Chat model keys configured there are automatically reused by the image generation skill — no need to set them twice. You can also edit the configuration file manually or temporarily set keys in a conversation using the `env_config` tool.
+  Existing provider credentials remain available when no dedicated image endpoint is configured. Use `env_config` to save production keys in `~/.cow/.env`; the [Web console](/channels/web) model page selects the image provider and model.
 </Tip>
 
-Credentials are shared with the main model providers:
+Existing provider credentials are still supported:
 
 | Field | Provider |
 | --- | --- |

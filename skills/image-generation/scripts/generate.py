@@ -17,7 +17,7 @@ promoted to the front of the queue):
     - image-01 / minimax-image                     → MiniMax
     - any model                                    → LinkAI (universal proxy)
 
-Dependencies: requests (stdlib: json, sys, os, base64, io, abc, uuid, pathlib, urllib)
+Dependencies: requests, Pillow, python-dotenv (stdlib: json, sys, os, base64, io, abc, uuid, pathlib, urllib)
 """
 
 import json
@@ -174,6 +174,9 @@ def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int
 
 def _save_image(data: bytes, output_dir: str) -> str:
     """Save image bytes to output_dir and return the path."""
+    if not data:
+        raise RuntimeError("Image download returned empty content")
+    output_dir = os.path.abspath(os.path.expanduser(output_dir))
     os.makedirs(output_dir, exist_ok=True)
     ext = "png"
     if data[:3] == b"\xff\xd8\xff":
@@ -185,6 +188,23 @@ def _save_image(data: bytes, output_dir: str) -> str:
     with open(path, "wb") as f:
         f.write(data)
     return path
+
+
+def _safe_error(error, *secrets) -> str:
+    """Keep useful error details without printing credentials or signed URLs."""
+    message = str(error)
+    sensitive = [*secrets, *(value for name, value in os.environ.items()
+                            if name.endswith("API_KEY") or name.endswith("ACCESS_TOKEN"))]
+    for value in sorted((str(value) for value in sensitive if value), key=len, reverse=True):
+        message = message.replace(value, "[credential redacted]")
+    message = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer [redacted]", message)
+    return re.sub(r"(?i)https?://[^\s<>'\"]+", "[URL redacted]", message)
+
+
+def _load_skill_environment():
+    # The standalone skill uses the same canonical environment as the Agent.
+    from dotenv import load_dotenv
+    load_dotenv(os.path.expanduser("~/.cow/.env"), override=False)
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +252,7 @@ class OpenAIProvider(ImageProvider):
             "Authorization": f"Bearer {self.api_key}",
         }
 
-    @staticmethod
-    def _raise_for_api_error(resp):
+    def _raise_for_api_error(self, resp):
         """Raise with server error details instead of bare HTTP status."""
         if resp.status_code >= 400:
             try:
@@ -241,7 +260,7 @@ class OpenAIProvider(ImageProvider):
                 msg = body.get("error", {}).get("message") or body.get("message") or resp.text
             except Exception:
                 msg = resp.text or resp.reason
-            raise RuntimeError(f"API {resp.status_code}: {msg} (url: {resp.url})")
+            raise RuntimeError(_safe_error(f"API {resp.status_code}: {msg}", self.api_key))
 
     def _post_json(self, url: str, payload: dict) -> dict:
         headers = {**self._headers(), "Content-Type": "application/json"}
@@ -288,16 +307,20 @@ class OpenAIProvider(ImageProvider):
         output_dir: str = ".",
     ) -> list[str]:
         # OpenAI Images API expects pixel size like 1024x1024.
-        resolved = resolve_size(size, aspect_ratio) if (size or aspect_ratio) else None
-        if image_url:
-            return self._edit(prompt, image_url=image_url, quality=quality, size=resolved, output_dir=output_dir)
-        return self._create(prompt, quality=quality, size=resolved, output_dir=output_dir)
+        try:
+            resolved = resolve_size(size, aspect_ratio) if (size or aspect_ratio) else None
+            if image_url:
+                return self._edit(prompt, image_url=image_url, quality=quality, size=resolved, output_dir=output_dir)
+            return self._create(prompt, quality=quality, size=resolved, output_dir=output_dir)
+        except Exception as exc:
+            raise RuntimeError(_safe_error(exc, self.api_key)) from None
 
     def _create(self, prompt: str, *, quality: str | None, size: str | None, output_dir: str) -> list[str]:
         url = f"{self.api_base}/images/generations"
         payload: dict = {
             "model": self.model,
             "prompt": prompt,
+            "n": 1,
         }
         if quality:
             payload["quality"] = quality
@@ -337,16 +360,41 @@ class OpenAIProvider(ImageProvider):
         result = self._post_multipart(url, fields, files)
         return self._save_results(result, output_dir)
 
-    @staticmethod
-    def _save_results(result: dict, output_dir: str) -> list[str]:
+    def _save_results(self, result: dict, output_dir: str) -> list[str]:
+        if not isinstance(result, dict):
+            raise RuntimeError("Image API returned an invalid response")
+        if result.get("error"):
+            error = result["error"]
+            message = error.get("message", "Image API request failed") if isinstance(error, dict) else error
+            raise RuntimeError(_safe_error(message, self.api_key))
+        items = result.get("data")
+        if not isinstance(items, list) or not items:
+            raise RuntimeError("Image API returned no image data")
         paths = []
-        for item in result.get("data", []):
-            if "b64_json" in item:
-                raw = base64.b64decode(item["b64_json"])
+        try:
+            for item in items:
+                if not isinstance(item, dict):
+                    raise RuntimeError("Image API returned invalid image data")
+                if item.get("b64_json"):
+                    raw = base64.b64decode(item["b64_json"], validate=True)
+                elif item.get("url"):
+                    raw = _load_image(item["url"])
+                else:
+                    raise RuntimeError("Image API returned no downloadable image")
+                # Expired CDN URLs sometimes return HTML with HTTP 200.
+                if not (raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff") or
+                        raw.startswith((b"GIF87a", b"GIF89a", b"BM", b"II*\0", b"MM\0*")) or
+                        raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"):
+                    raise RuntimeError("Image download returned invalid image content")
+                from PIL import Image
+                try:
+                    with Image.open(io.BytesIO(raw)) as image:
+                        image.verify()
+                except Exception:
+                    raise RuntimeError("Image download returned corrupt image content") from None
                 paths.append(_save_image(raw, output_dir))
-            elif "url" in item:
-                raw = _load_image(item["url"])
-                paths.append(_save_image(raw, output_dir))
+        except Exception as exc:
+            raise RuntimeError(_safe_error(exc, self.api_key)) from None
         return paths
 
 
@@ -1074,9 +1122,20 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
     # Seedream / Ark credentials: ARK_API_KEY + standard /api/v3.
     ark_key = os.environ.get("ARK_API_KEY", "").strip()
     ark_base = _normalize_ark_base(os.environ.get("ARK_API_BASE", "").strip())
+    image_key = os.environ.get("SKILL_IMAGE_GENERATION_API_KEY", "").strip()
+    image_base = os.environ.get("SKILL_IMAGE_GENERATION_API_BASE", "").strip()
+    if image_base and not image_key:
+        raise ValueError("SKILL_IMAGE_GENERATION_API_BASE requires SKILL_IMAGE_GENERATION_API_KEY")
+    if image_key or image_base:
+        # A custom image endpoint must never receive the unrelated chat key.
+        openai_key = image_key
+        openai_base = image_base or "https://api.openai.com/v1"
+    else:
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        openai_base = os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1"
 
     keys = {
-        "OpenAI": os.environ.get("OPENAI_API_KEY", ""),
+        "OpenAI": openai_key,
         "Gemini": os.environ.get("GEMINI_API_KEY", ""),
         "Seedream": ark_key,
         "Qwen": os.environ.get("DASHSCOPE_API_KEY", ""),
@@ -1084,7 +1143,7 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         "LinkAI": os.environ.get("LINKAI_API_KEY", ""),
     }
     bases = {
-        "OpenAI": os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+        "OpenAI": openai_base,
         "Gemini": os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com"),
         "Seedream": ark_base,
         "Qwen": os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com"),
@@ -1136,6 +1195,11 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
 # ---------------------------------------------------------------------------
 
 def main():
+    try:
+        _load_skill_environment()
+    except Exception as exc:
+        print(json.dumps({"error": "Unable to load image environment: " + _safe_error(exc)}, ensure_ascii=False))
+        sys.exit(1)
     if len(sys.argv) < 2:
         print(json.dumps({"error": "Usage: python generate.py '<json_args>'"}))
         sys.exit(1)
@@ -1170,13 +1234,18 @@ def main():
 
     output_dir = os.environ.get("IMAGE_OUTPUT_DIR", os.path.join(os.getcwd(), "images"))
 
-    providers = _build_providers(model, provider_id=provider_id)
+    try:
+        providers = _build_providers(model, provider_id=provider_id)
+    except Exception as exc:
+        print(json.dumps({"error": _safe_error(exc)}, ensure_ascii=False))
+        sys.exit(1)
     if not providers:
         target = f"model '{model}'" if model else "image generation"
         print(json.dumps({
             "error": (
                 f"No API key configured for {target}. "
-                "Set at least one of OPENAI_API_KEY / GEMINI_API_KEY / "
+                "Set SKILL_IMAGE_GENERATION_API_KEY for a dedicated image endpoint, "
+                "or at least one of OPENAI_API_KEY / GEMINI_API_KEY / "
                 "ARK_API_KEY / DASHSCOPE_API_KEY / MINIMAX_API_KEY / "
                 "LINKAI_API_KEY via the env_config tool, then try again."
             )
@@ -1197,6 +1266,9 @@ def main():
                 aspect_ratio=aspect_ratio,
                 output_dir=output_dir,
             )
+            if not paths or any(not os.path.isfile(path) or os.path.getsize(path) == 0 for path in paths):
+                raise RuntimeError("Image provider returned no usable local image")
+            paths = [os.path.abspath(path) for path in paths]
             elapsed = time.time() - t0
             # Resolved model id (after alias expansion) actually sent to the API
             actual_model = getattr(provider, "model", model)
@@ -1213,8 +1285,9 @@ def main():
             return
         except Exception as e:
             elapsed = time.time() - t0
-            print(f"[image-generation] ❌ {label} failed in {elapsed:.1f}s: {e}", file=sys.stderr)
-            errors.append(f"{label}: {e}")
+            safe_error = _safe_error(e, getattr(provider, "api_key", ""))
+            print(f"[image-generation] ❌ {label} failed in {elapsed:.1f}s: {safe_error}", file=sys.stderr)
+            errors.append(f"{label}: {safe_error}")
 
     hint = " | ".join(errors)
     print(json.dumps({
@@ -1222,7 +1295,7 @@ def main():
                  "This is likely an API key or base URL configuration issue. "
                  "Do NOT retry with the same parameters. "
                  "Ask the user to verify their API key / base URL "
-                 "(OPENAI_API_KEY, GEMINI_API_KEY, ARK_API_KEY, "
+                 "(SKILL_IMAGE_GENERATION_API_KEY/API_BASE, OPENAI_API_KEY, GEMINI_API_KEY, ARK_API_KEY, "
                  "DASHSCOPE_API_KEY, MINIMAX_API_KEY, or LINKAI_API_KEY) "
                  "via env_config."
     }, ensure_ascii=False))
