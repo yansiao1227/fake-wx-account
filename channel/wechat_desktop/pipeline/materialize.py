@@ -173,6 +173,15 @@ class WechatDesktopMaterializeMixin:
                         break
             if replaced_history_item:
                 continue
+            if (
+                target.source_message_id and target.source_stream_id
+                and event.source_message_id and event.source_stream_id
+                and event.account_id == target.account_id
+                and event.conversation_id == target.conversation_id
+            ):
+                # 原生历史已经由同一数据库快照选定；不能把批次中更旧的
+                # 前序消息追加回来，挤掉最近的几条。身份与生命周期仍保留。
+                continue
             if key not in existing:
                 history.append(
                     {
