@@ -183,10 +183,11 @@ class WechatDatabaseBackend(WechatDesktopBackend):
             raise SendNotSubmitted("attachment_message_ambiguous")
         if not matched.runtime_id or sum(item.runtime_id == matched.runtime_id for item in visible) != 1:
             raise SendNotSubmitted("attachment_control_identity_unavailable")
+        # UIA 只能补全原生引用，不能把无引用的原生文件升级成引用任务。
+        if bool(matched.reference) != bool(event.reference):
+            raise SendNotSubmitted("attachment_reference_mismatch")
         if event.reference:
             reference = matched.reference
-            if reference is None:
-                raise SendNotSubmitted("attachment_reference_mismatch")
             expected = unicodedata.normalize("NFKC", str(event.reference.get(
                 "preview_content", event.reference.get("content", "")))).strip()
             actual = unicodedata.normalize("NFKC", str(reference.content or "")).strip()

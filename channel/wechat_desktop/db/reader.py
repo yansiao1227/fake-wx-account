@@ -13,14 +13,14 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from xml.etree import ElementTree
 
 from channel.wechat_desktop.db.errors import DatabaseReadError
 from channel.wechat_desktop.db.types import SourceBatch, SourceCheckpoint, SourceRecord
 from channel.wechat_desktop.models import (
-    WechatDesktopEvent, WechatHistoryMessage, WechatHistoryReadResult,
+    ReplyTaskMetadata, WechatDesktopEvent, WechatHistoryMessage, WechatHistoryReadResult,
 )
 
 
@@ -686,18 +686,58 @@ class WechatDatabaseReader:
             f"SELECT {self._select(stream)} FROM {_quote(stream.table)}{predicate} ORDER BY {order} LIMIT ?",
             parameters)]
 
-    def _attach_reply_context(self, records, rows, connections):
-        """同一批次快照构建有界候选历史，不重读 UI，不消费来源游标。
+    def _reply_context_rows(self, stream, events, connection, scan_limit, *, batch_local_ids=()):
+        """只执行可索引定位且无需 SQLite 排序的有界查询。
 
-        每个会话分片仅使用一个倒序游标，本批所有事件复用该游标。
-        无时间索引的库也只需每会话分片一次排序，不为每条消息重扫表。
+        时间索引可直接定位较早的跨分片历史；没有时间索引时沿 local_id
+        索引读取最近的有限行。时间过滤放在内存，避免 LIMIT 前扫描大量
+        不满足时间条件的行。没有可用索引时省略该流的候选上下文。
         """
+        timestamp = _quote(_column(stream.columns, "create_time"))
+        own_events = [event for _, event in events if event.source_stream_id == stream.stream_id]
+        first_own_event = min(own_events, key=lambda event: event.source_local_id) if own_events else None
+        upper_local_id = (first_own_event.source_local_id - 1 if first_own_event
+                          else self._highwaters[stream.stream_id]["cursor"])
+        upper_timestamp = events[0][0][0]
+        excluded = tuple(sorted(batch_local_ids)[:500])
+        if excluded:
+            # 只有单列原生主键才能保证每个排除项最多跳过一行；参数量也有界。
+            # 每流索引最多访问 scan_limit + 500 行，排除项已在同批读过。
+            primary_key = [str(row[1]).lower() for row in connection.execute(
+                f"PRAGMA table_info({_quote(stream.table)})") if row[5]]
+            if primary_key != ["local_id"]:
+                excluded = ()
+        exclusion = (" AND local_id NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else "")
+        queries = [
+            (f"WHERE {timestamp}>=0 AND {timestamp}<=?{exclusion} ORDER BY {timestamp} DESC LIMIT ?",
+             (upper_timestamp, *excluded, scan_limit)),
+            ("WHERE local_id>0 AND local_id<=? ORDER BY local_id DESC LIMIT ?",
+             (upper_local_id, scan_limit)),
+        ]
+        connection.row_factory = sqlite3.Row
+        for predicate, parameters in queries:
+            sql = f"SELECT {self._select(stream)} FROM {_quote(stream.table)} {predicate}"
+            plans = [str(row[3]).upper() for row in connection.execute("EXPLAIN QUERY PLAN " + sql, parameters)]
+            # LIMIT 不能限制无索引范围查询或排序所扫描的行，先确认执行计划。
+            if (not any(plan.startswith("SEARCH ") for plan in plans) or
+                    any("SCAN " in plan or "TEMP B-TREE" in plan for plan in plans)):
+                continue
+            return [dict(row) for row in connection.execute(
+                sql.replace("SELECT ", "SELECT /* reply_context */ ", 1), parameters)]
+        return []
+
+    def _attach_reply_context(self, records, rows, connections):
+        """同批复用已读行，每流额外索引读取有硬上限，完整排序只在内存进行。"""
         from channel.wechat_desktop.config import DEFAULT_CONFIG
         limit = max(0, min(50, int(self.config.get(
             "wechat_history_max_messages", DEFAULT_CONFIG["wechat_history_max_messages"]))))
+        scan_limit = max(1, min(10000, int(self.config.get(
+            "db_reply_context_max_rows_per_stream", DEFAULT_CONFIG["db_reply_context_max_rows_per_stream"]))))
         targets = {}
+        batch_rows = {}
         reference_lookup_cache = {}
         for record in records:
+            batch_rows.setdefault(record.stream_id, {})[record.local_id] = rows[record.source_message_id]
             event = record.event
             if event is None or record.receipt_phase not in {"live", "startup_unread"}:
                 continue
@@ -719,19 +759,17 @@ class WechatDatabaseReader:
                 if all(event.source_stream_id == stream.stream_id and event.source_local_id <= 1
                        for _, event in events):
                     continue  # 首个原生消息没有同来源前序正主键。
-                conn = connections[stream.database]
-                conn.row_factory = sqlite3.Row
-                timestamp = _quote(_column(stream.columns, "create_time"))
-                cursor = iter(conn.execute(
-                    f"SELECT /* reply_context */ {self._select(stream)} FROM {_quote(stream.table)} "
-                    f"WHERE {timestamp}>=0 AND {timestamp}<=? ORDER BY {self._history_order_sql(stream)}",
-                    (events[0][0][0],)))
+                candidates_by_id = dict(batch_rows.get(stream.stream_id, {}))
+                candidates_by_id.update({int(row["local_id"]): row for row in self._reply_context_rows(
+                    stream, events, connections[stream.database], scan_limit,
+                    batch_local_ids=candidates_by_id)})
+                ordered_rows = sorted(candidates_by_id.values(),
+                                      key=lambda row: self._row_order(stream, row), reverse=True)
                 windows = {event.source_message_id: [] for _, event in events}
-                for row in cursor:
-                    row = dict(row)
+                for row in ordered_rows:
                     order = self._row_order(stream, row)
                     eligible = [event for boundary, event in events
-                                if len(windows[event.source_message_id]) < limit and order < boundary
+                                if len(windows[event.source_message_id]) < limit and 0 <= order[0] and order < boundary
                                 and (stream.stream_id != event.source_stream_id or
                                      int(row["local_id"]) < event.source_local_id)]
                     if not eligible:
@@ -749,17 +787,22 @@ class WechatDatabaseReader:
                             "source_stream_id": previous.source_stream_id,
                             "source_local_id": previous.source_local_id,
                             "account_id": previous.account_id, "native_timestamp": previous.native_timestamp,
+                            "content_signature": previous.content_signature,
                             "source": "wechat_database",
                     }
+                    evidence = replace(previous, content="", history=[], reference={}, share_card={},
+                                       task=ReplyTaskMetadata())
                     for target in eligible:
-                        windows[target.source_message_id].append((order, item))
+                        windows[target.source_message_id].append((order, item, evidence))
                     if all(len(window) >= limit for window in windows.values()):
                         break
                 for source_id, window in windows.items():
                     candidates[source_id].extend(window)
             for _, event in events:
                 ordered = sorted(candidates[event.source_message_id], key=lambda pair: pair[0], reverse=True)
-                event.history = [dict(item) for _, item in reversed(ordered[:limit])]
+                selected = list(reversed(ordered[:limit]))
+                event.history = [dict(item) for _, item, _ in selected]
+                event.task.context_source_events = [evidence for _, _, evidence in selected]
 
     def _parse(self, stream, row, phase="live", *, include_filtered=False):
         local_id = int(row["local_id"])
@@ -962,8 +1005,9 @@ class WechatDatabaseReader:
                                    (event.source_local_id,)).fetchone()
             if row is None:
                 return False, "source_message_deleted"
-            current = self._parse(stream, dict(row)).event
-            if current is None:
+            current = self._parse(stream, dict(row), include_filtered=True).event
+            if (current is None or current.direction == "system" or
+                    current.direction == "outgoing" and event.direction != "outgoing"):
                 return False, "source_message_filtered"
             if current.source_message_id != event.source_message_id or current.conversation_id != event.conversation_id:
                 return False, "source_message_identity_mismatch"

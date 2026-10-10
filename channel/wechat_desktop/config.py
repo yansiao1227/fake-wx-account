@@ -27,6 +27,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 空值使用 Agent 工作区的 wechat_desktop_db，按账号隔离。
     "db_cache_dir": "",
     "db_batch_size": 200,
+    # 自动回复上下文每批每个会话分片额外读取的最多行数；先走现有索引再内存排序。
+    "db_reply_context_max_rows_per_stream": 1000,
     "db_snapshot_retry_attempts": 3,
     "db_key_scan_timeout_seconds": 30.0,
     "uia_recovery_attempts": 3,
@@ -242,7 +244,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(default, list):
             if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
                 raise ValueError(f"{key} must be a list of strings")
-    for key in ("reply_queue_capacity", "materialize_queue_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds", "db_poll_interval_seconds", "db_batch_size", "db_snapshot_retry_attempts", "db_key_scan_timeout_seconds"):
+    for key in ("reply_queue_capacity", "materialize_queue_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds", "db_poll_interval_seconds", "db_batch_size", "db_reply_context_max_rows_per_stream", "db_snapshot_retry_attempts", "db_key_scan_timeout_seconds"):
         if config[key] <= 0:
             raise ValueError(f"{key} must be positive")
     if config["desktop_backend"] != "db_uia":

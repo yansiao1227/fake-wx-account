@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import queue
 import time
@@ -116,6 +117,8 @@ class WechatDesktopMaterializeMixin:
         task.source_event_ids 与 batch_id 用于生命周期追踪，原始来源快照用于发送前逐条复核。
         """
         source_validation_events = self._snapshot_reply_sources(events)
+        # 读取器保存的候选历史可能来自已处理的其他批次，不能在聚合时覆盖。
+        context_sources = [source for event in events for source in event.task.context_source_events]
         resolved_events = []
         for event in events:
             event, resolve_count = self._driver.materialize_event(event)
@@ -199,12 +202,21 @@ class WechatDesktopMaterializeMixin:
         target.task.batch_id = batch_id
         # 队列等待期间前序来源也可能被撤回。保存轻量原生证据供投递时复核，
         # 不复制 task 或历史，避免循环引用与重复保存整个聚合上下文。
-        target.task.context_source_events = [
-            WechatDesktopEvent(**{**event.to_dict(), "history": []})
-            for event in resolved_events[:-1]
-            if event.source_message_id and not target.reference
-            and not self._source_invalid_for_context(event)
-        ]
+        history_source_ids = {
+            str(item.get("source_message_id") or "") for item in history
+            if item.get("source_message_id")
+        }
+        context_sources.extend(resolved_events[:-1])
+        snapshots = {}
+        if not target.reference:
+            for source in context_sources:
+                if (source.source_message_id in history_source_ids
+                        and not self._source_invalid_for_context(source)):
+                    # 同批物化后的事件优先，证据只覆盖实际交给 Agent 的历史。
+                    snapshots[source.source_message_id] = WechatDesktopEvent(
+                        **{**source.to_dict(), "history": []}
+                    )
+        target.task.context_source_events = list(snapshots.values())
         target.task.cache_only = bool(resolved_events) and all((event.content_type == 'file' and (not event.reference) for event in resolved_events))
         target.task.file_cache_results = {
             event.event_id: bool(
@@ -356,7 +368,9 @@ class WechatDesktopMaterializeMixin:
         evidence_dir = self._store.evidence_dir
         evidence_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(source).suffix or ".png"
-        target = evidence_dir / f"{event.event_id}{suffix}"
+        # 原生事件 ID 含冒号；账本仍用原 ID，文件名只使用稳定摘要。
+        filename = hashlib.sha256(event.event_id.encode("utf-8")).hexdigest()
+        target = evidence_dir / f"{filename}{suffix}"
         if target.resolve().parent != evidence_dir.resolve():
             raise ValueError("invalid evidence event identifier")
         try:

@@ -19,14 +19,24 @@ class WechatDesktopReplyMixin:
         event = item.event
         target_name = event.conversation_name
         target_id = event.conversation_id
+        context = {"wechat_desktop_queue_token": item.token}
+        target = self._resolve_reply_send_target(
+            target_id or target_name, context, target_name,
+            ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text",
+        )
+        if target is None:
+            return "skipped"
+        target_id, target_name, is_group = (
+            target.conversation_id, target.display_name, target.is_group
+        )
         if bool(self._service.status().get("paused")) or not self._policy.allows_send(
             target_name,
-            event.is_group,
+            is_group,
             "text",
         ):
             return "skipped"
         if not self._validate_source_before_reply(
-            event, None, target_name, ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text"
+            event, context, target_name, ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text"
         ):
             return "skipped"
         send_target = (target_id or target_name)
@@ -34,7 +44,8 @@ class WechatDesktopReplyMixin:
         try:
             result = self._deliver(
                 send_target, ATTACHMENT_REFERENCE_REQUIRED_REPLY,
-                policy_target=target_name, is_group=event.is_group, token=item.token, source_event_ids=item.source_event_ids,
+                policy_target=target_name, is_group=is_group, token=item.token,
+                source_event_ids=item.source_event_ids, authorized_target=target,
             )
         except Exception as exc:
             self._mark_lifecycle(

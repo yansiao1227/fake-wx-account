@@ -10,6 +10,7 @@ from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage, ReplyTargetValidation
 from channel.wechat_desktop.config import DEFAULT_CONFIG
+from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus
 from .helpers import _bare_wechat_channel
 
 
@@ -243,8 +244,10 @@ def test_agent_error_sends_one_final_failure_notice():
         reserve_send=lambda _units=1: True,
     )
     channel._driver = SimpleNamespace(
-        validate_reply_target=lambda event: ReplyTargetValidation(True),
-        send_interim_text=lambda target, text: (
+        resolve_send_target=lambda identity: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, "Alice", False)),
+        validate_reply_target=lambda _event: SimpleNamespace(valid=True, reason=""),
+        send_interim_text=lambda target, text, **_kwargs: (
             sent.append((target, text))
             or {"success": True, "verified": True}
         )
@@ -332,14 +335,16 @@ def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fa
     item = channel._reply_queue.get()
     sent, history, audits, downstream = [], [], [], []
 
-    def send(target, text):
+    def send(target, text, **_kwargs):
         sent.append((target, text))
         if send_fails:
             raise RuntimeError("injected notice failure")
         return {"success": True, "verified": True}
 
     channel._driver = SimpleNamespace(
-        validate_reply_target=lambda event: ReplyTargetValidation(True),
+        resolve_send_target=lambda identity: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, "Alice", False)),
+        validate_reply_target=lambda _event: SimpleNamespace(valid=True, reason=""),
         send_interim_text=send,
     )
     channel._service = SimpleNamespace(status=lambda: {"paused": False})
@@ -369,9 +374,10 @@ def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fa
     callback(payload)
     callback(payload)
 
-    expected = [(event.conversation_id, "正在调用 web_search")]
+    expected = [(event.conversation_id, "正在调用 web_search")] if has_event else []
     assert sent == expected
-    assert len(history) == len(audits) == (0 if send_fails else 1)
+    assert len(history) == (1 if has_event and not send_fails else 0)
+    assert len(audits) == (0 if has_event and send_fails else 1)
     assert downstream == [payload, payload]
     assert "name 'conversation_id' is not defined" not in caplog.text
     if not send_fails:

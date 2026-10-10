@@ -59,6 +59,8 @@ def channel(tmp_path):
         send_text=send, send_image=send, send_interim_text=send,
         close=lambda: None,
         resolve_target=lambda name: TargetResolution(TargetStatus.RESOLVED, ConversationTarget(name, name)),
+        resolve_send_target=lambda name: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(name, "Alice", False)),
     )
     yield channel
     channel._stop_event.set()

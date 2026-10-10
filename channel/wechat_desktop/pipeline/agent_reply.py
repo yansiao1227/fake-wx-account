@@ -3,6 +3,7 @@
 from __future__ import annotations
 import re
 import threading
+from copy import deepcopy
 from pathlib import Path
 from bridge.context import Context, ContextType
 from channel.wechat_desktop.pipeline.prompts import (
@@ -107,11 +108,14 @@ class AgentReplyCoordinator:
             if not validation.valid:
                 return False
         invalid_context_ids = set()
+        valid_context_sources = []
         for source in event.task.context_source_events:
             if not channel._driver.validate_reply_target(source).valid:
                 invalid_context_ids.update(
                     identity for identity in (source.message_stable_id, source.source_message_id) if identity
                 )
+            else:
+                valid_context_sources.append(source)
         if invalid_context_ids:
             # FIFO 恢复的是入队时历史；实际投递前再剔除等待期间变化的前序来源。
             event.history = [
@@ -119,6 +123,18 @@ class AgentReplyCoordinator:
                 if not any(str(item.get(key) or "") in invalid_context_ids
                            for key in ("_message_stable_id", "source_message_id"))
             ]
+        # 只保留实际进入提示词的上文证据；已排除的来源不再阻断最终回复。
+        history_ids = {
+            str(item.get(key) or "") for item in event.history
+            for key in ("_message_stable_id", "source_message_id")
+            if item.get(key)
+        }
+        event.task.context_source_events = [] if event.reference else [
+            source for source in valid_context_sources
+            if any(identity and identity in history_ids
+                   for identity in (source.message_stable_id, source.source_message_id))
+        ]
+        used_context_sources = deepcopy(event.task.context_source_events)
         msg = WechatDesktopMessage(event)
         ctype = msg.ctype
         content = msg.content
@@ -237,6 +253,7 @@ class AgentReplyCoordinator:
             context["wechat_desktop_source_event_ids"] = list(
                 event.task.source_event_ids or [event.event_id]
             )
+            context["wechat_desktop_context_source_events"] = used_context_sources
             context["wechat_desktop_batch_id"] = str(
                 event.task.batch_id or event.event_id
             )
@@ -348,8 +365,15 @@ class AgentReplyCoordinator:
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
         if queue_token and not channel._reply_queue.is_active(queue_token):
             return False
-        send_target = (target_id or target_name)
-        is_group = bool(context.get("isgroup", False))
+        target = channel._resolve_reply_send_target(
+            target_id or target_name, context, target_name, "", "text"
+        )
+        if target is None:
+            return False
+        target_id, target_name, is_group = (
+            target.conversation_id, target.display_name, target.is_group
+        )
+        send_target = target_id
         if (
             bool(channel._service.status().get("paused"))
             or bool(channel.config.get("shadow_mode", True))
@@ -383,7 +407,8 @@ class AgentReplyCoordinator:
 
         result = channel._deliver(send_target, notice, policy_target=target_name,
                                is_group=is_group, interim=True, token=queue_token,
-                               source_event_ids=context.get("wechat_desktop_source_event_ids", []))
+                               source_event_ids=context.get("wechat_desktop_source_event_ids", []),
+                               authorized_target=target)
         if not result.get("success"):
             raise RuntimeError(str(result.get("message") or "send failed"))
 

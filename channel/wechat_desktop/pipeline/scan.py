@@ -237,6 +237,16 @@ class WechatDesktopScanMixin:
 
     def _dispatch_control_event(self, event: WechatDesktopEvent):
         """直接投递 /cancel、/steer，不进行私聊聚合和附件物化。"""
+        # 控制命令会取消或改写在途任务，同样必须在投递前复核原生来源。
+        try:
+            validation = self._driver.validate_reply_target(event)
+            reason = "" if validation.valid else (validation.reason or "source_validation_failed")
+        except Exception:
+            reason = "source_validation_failed"
+        if reason:
+            self._store.mark_event_processed(event.event_id, "skipped", reason)
+            self._finish_lifecycle([event.event_id], "skipped")
+            return
         context = self._compose_context(
             ContextType.TEXT,
             str(event.content or ""),

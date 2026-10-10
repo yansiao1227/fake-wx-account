@@ -19,6 +19,7 @@ from channel.wechat_desktop.pipeline.channel import WechatDesktopChannel
 from channel.wechat_desktop.pipeline.prompts import ATTACHMENT_REFERENCE_REQUIRED_REPLY
 from .helpers import FakeClient, FakeTimer, _bare_wechat_channel
 from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
+from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus
 from .test_uia_materializer import materialize_native_target
 
 
@@ -446,11 +447,13 @@ def test_attachment_reference_prompt_is_sent_without_agent():
     channel._policy = SimpleNamespace(allows_send=lambda *_args, **_kwargs: True, reserve_send=lambda _units=1: True)
     channel._reply_queue = reply_queue
     channel._driver = SimpleNamespace(
+        resolve_send_target=lambda identity: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, event.conversation_name, False)),
         validate_reply_target=lambda _event: SimpleNamespace(
             valid=True,
             reason="",
         ),
-        send_text=lambda target, text: (
+        send_text=lambda target, text, **_kwargs: (
             sent.append((target, text))
             or {"success": True, "verified": True}
         ),
@@ -652,8 +655,10 @@ def test_reply_timeout_sends_final_failure_notice():
         reserve_send=lambda _units=1: True,
     )
     channel._driver = SimpleNamespace(
-        validate_reply_target=lambda event: ReplyTargetValidation(True),
-        send_interim_text=lambda target, text: (
+        resolve_send_target=lambda identity: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, "Alice", False)),
+        validate_reply_target=lambda _event: SimpleNamespace(valid=True, reason=""),
+        send_interim_text=lambda target, text, **_kwargs: (
             sent.append((target, text))
             or {"success": True, "verified": True}
         ),
