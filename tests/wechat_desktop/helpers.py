@@ -212,7 +212,6 @@ def outgoing(content, runtime_id):
 def _bare_wechat_channel():
     implementation = WechatDesktopChannel.__closure__[0].cell_contents
     channel = object.__new__(implementation)
-    channel._daily_hot_scheduler = None
     return channel
 
 

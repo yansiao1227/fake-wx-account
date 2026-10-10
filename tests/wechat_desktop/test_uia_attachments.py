@@ -103,6 +103,7 @@ def test_native_dialog_cancel_refuses_main_window_and_uses_exact_cancel_control(
 
 
 def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp_path):
+    import win32api
     import win32gui
     from PIL import Image, ImageGrab
 
@@ -169,9 +170,9 @@ def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp
         lambda main_hwnd: calls.append(("restore_main", main_hwnd)) or True,
     )
     monkeypatch.setattr(
-        client,
-        "_press_escape_key",
-        lambda: (_ for _ in ()).throw(
+        win32api,
+        "keybd_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("viewer flow must never send global Escape")
         ),
     )
@@ -991,14 +992,18 @@ def test_locate_conversation_accepts_group_title_with_member_count(monkeypatch):
     assert row.click_count == 1
 
 
-def test_get_title_strips_member_count_suffix(monkeypatch):
+def test_get_title_strips_member_count_suffix_for_independent_group_count(monkeypatch):
     header = GeometryControl(
         (400, 100, 700, 130),
         "小小地下联络站(9)",
         "Text",
         automation_id="current_chat_name_label",
     )
-    root = GeometryControl((0, 0, 1000, 800), children=[header])
+    count_label = GeometryControl(
+        (700, 100, 760, 130), "9", "Text",
+        automation_id="current_chat_count_label",
+    )
+    root = GeometryControl((0, 0, 1000, 800), children=[header, count_label])
     client = WechatUiaClient({})
 
     @contextmanager

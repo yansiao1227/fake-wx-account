@@ -630,6 +630,7 @@ def test_reply_validation_does_not_deadlock_with_active_scan():
         "Alice",
         "text",
         "hello",
+        source_type="private",
     )
     result = {}
     scan_thread = threading.Thread(

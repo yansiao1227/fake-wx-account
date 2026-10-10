@@ -128,6 +128,8 @@ def test_referenced_image_clicks_quote_region_without_locating_original(monkeypa
 
 
 def test_missing_locate_original_menu_never_sends_global_escape(monkeypatch):
+    import win32api
+
     client = WechatUiaClient({})
     quoted = UiaChatMessage(
         "Alice",
@@ -151,9 +153,9 @@ def test_missing_locate_original_menu_never_sends_global_escape(monkeypatch):
     monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
     monkeypatch.setattr(client, "_find_desktop_control", lambda *_args: None)
     monkeypatch.setattr(
-        client,
-        "_press_escape_key",
-        lambda: (_ for _ in ()).throw(
+        win32api,
+        "keybd_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("missing reference menu must not send global Escape")
         ),
     )

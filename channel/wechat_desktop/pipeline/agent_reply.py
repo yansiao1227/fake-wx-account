@@ -65,6 +65,7 @@ class AgentReplyCoordinator:
             "isgroup": event.is_group,
             "wechat_desktop_queue_token": item.token,
             "wechat_desktop_source_type": event.source_type,
+            "wechat_desktop_source_event_ids": list(item.source_event_ids),
         }
         try:
             return channel._send_agent_tool_notice(context, notice_data)
@@ -85,6 +86,7 @@ class AgentReplyCoordinator:
             "isgroup": item.event.is_group,
             "wechat_desktop_queue_token": item.token,
             "wechat_desktop_source_type": item.event.source_type,
+            "wechat_desktop_source_event_ids": list(item.source_event_ids),
         }
         try:
             return channel._send_agent_tool_notice(
@@ -266,6 +268,9 @@ class AgentReplyCoordinator:
                                 exc,
                             )
                 context["on_event"] = channel._make_agent_event_callback(context)
+                if event.task.source_invalid:
+                    channel._finish_reply_cycle(context)
+                    return False
                 channel.produce(context)
             except Exception:
                 context["wechat_desktop_reply_cycle"] = False
@@ -381,6 +386,11 @@ class AgentReplyCoordinator:
             if str(item).strip()
         ]
         notice = _format_agent_notice(templates, kind, name)
+
+        if not channel._validate_source_before_reply(
+            event, context, target_name, notice, "text", action_type="agent_tool_notice"
+        ):
+            return False
 
         channel._driver.register_interim_text(conversation_id, notice)
         try:

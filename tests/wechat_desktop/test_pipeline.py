@@ -12,6 +12,7 @@ from channel.wechat_desktop.models import (
     UiaChatMessage,
     UiaReferencedMessage,
     WechatDesktopEvent,
+    ReplyTargetValidation,
 )
 from channel.wechat_desktop.uia.driver import WechatUiaDriver
 from channel.wechat_desktop.pipeline.channel import WechatDesktopChannel
@@ -662,6 +663,7 @@ def test_reply_timeout_sends_final_failure_notice():
         reserve_send=lambda _units=1: True,
     )
     channel._driver = SimpleNamespace(
+        validate_reply_target=lambda event: ReplyTargetValidation(True),
         send_interim_text=lambda target, text: (
             sent.append((target, text))
             or {"success": True, "verified": True}

@@ -89,7 +89,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pip show rapidocr
 - 新增或修改通用项时改 `config.json`，并同步 `config-template.json`。
 - 禁止把 wechat_desktop 等通道业务写进根 `config.py` 的 `available_setting`。
 - 禁止在根 `config.json` / `config-template.json` 写 `wechat_desktop` 段，也禁止把
-  白名单、`shadow_mode`、UIA 节拍、每日热点、通知模板等提升为最外层全局键。
+  白名单、`shadow_mode`、UIA 节拍、通知模板等提升为最外层全局键。
 - 根 `config.json` 里若仍残留 `wechat_desktop` 段，或把通道 `DEFAULT_CONFIG` 里的键
   （如 `shadow_mode`、`auto_reply_groups`）写到最外层，加载时删除并打警告，不得再当覆盖源。
 
@@ -98,14 +98,14 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pip show rapidocr
 位置：
 
 - **唯一配置源**：`channel/wechat_desktop/config.py` 的 `DEFAULT_CONFIG`
-- 白名单、`shadow_mode`、UIA 节拍、限流、进度/失败通知模板、每日热点、引用/附件策略等
+- 白名单、`shadow_mode`、UIA 节拍、限流、进度/失败通知模板、引用/附件策略等
   **全部**写这里
 
 规则：
 
 1. 新增或修改微信桌面行为时：只改 `channel/wechat_desktop/config.py`。
 2. 禁止把通道业务配置抄进外层 JSON「图齐全」。
-3. 禁止在 `pipeline/`、`uia/`、`storage/`、`daily_hot/` 等业务文件中再维护平行默认配置字典。
+3. 禁止在 `pipeline/`、`uia/`、`storage/` 等业务文件中再维护平行默认配置字典。
 4. 全局/Agent 通用项禁止放进 `channel/wechat_desktop/config.py`。
 5. 其他通道比照本约定，在对应通道目录下维护自己的 `config.py`。
 
@@ -129,5 +129,5 @@ C:\Users\26832\.cow\.env
 | `config-template.json` | 可保留空字符串字段说明，不填真值 |
 | 读取顺序 | 先确保加载 `~/.cow/.env`，再读 `os.environ`；`conf()` 中同名字段仅作可选回退 |
 
-禁止把真实密钥写入文档、日志、提交说明或测试夹具。每日热点、skill、web_search、
+禁止把真实密钥写入文档、日志、提交说明或测试夹具。skill、web_search、
 baidu_ai_search（智能搜索）、联网搜索等凡使用云厂商密钥的能力，均按上述顺序解析密钥。

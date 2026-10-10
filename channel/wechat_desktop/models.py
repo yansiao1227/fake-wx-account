@@ -100,6 +100,9 @@ class WechatHistoryMessage:
     stable_id: str = ""
     source: str = "wechat_history_dialog"
     degraded: bool = False
+    message_id: str = ""
+    source_message_id: str = ""
+    native_timestamp: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,8 @@ class WechatHistoryReadResult:
     history_window_opened: bool = True
     degraded: bool = False
     warnings: Tuple[str, ...] = ()
+    conversation_id: str = ""
+    account_id: str = ""
 
 
 class WechatHistoryReadError(RuntimeError):
@@ -132,16 +137,14 @@ class ReplyTaskMetadata:
 
     created_at: float = field(default_factory=time.monotonic)
     source_event_ids: list[str] = field(default_factory=list)
+    source_validation_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
+    source_invalid: bool = False
     batch_id: str = ""
     deferred_materialization_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
     cache_only: bool = False
     attachment_reference_required: bool = False
-    proactive_send: bool = False
-    precomposed_reply_text: str = ""
     preflight_attachment_notice_sent: bool = False
     failure_notice_sent: bool = False
-    broadcast_date: str = ""
-    broadcast_target: str = ""
     fingerprint_content: str | None = None
     baseline_only: bool = False
 
@@ -161,6 +164,7 @@ class WechatDesktopEvent:
     is_group: bool = False
     is_at: bool = False
     source_type: str = "unknown"
+    attachment_status: str = ""
     evidence_path: str = ""
     bounds: Optional[Tuple[int, int, int, int]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
@@ -172,10 +176,22 @@ class WechatDesktopEvent:
     session_unread_count: int = 0
     observed_at: float = field(default_factory=time.time)
     event_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    account_id: str = ""
+    source_stream_id: str = ""
+    source_message_id: str = ""
+    source_local_id: Optional[int] = None
+    native_timestamp: Optional[int] = None
+    receipt_phase: str = ""
 
     task: ReplyTaskMetadata = field(default_factory=ReplyTaskMetadata, repr=False, compare=False)
 
     def fingerprint(self) -> str:
+        if self.source_message_id:
+            # 原生来源身份包括分片/消息表/主键；昵称、正文和屏幕坐标均可变化。
+            return hashlib.sha256(json.dumps(
+                [self.account_id, self.source_message_id], ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
         fingerprint_content = self.task.fingerprint_content
         if fingerprint_content is None:
             fingerprint_content = self.content
@@ -209,7 +225,7 @@ class WechatDesktopMessage(ChatMessage):
         super().__init__(event.to_dict())
         self.event = event
         self.msg_id = event.event_id
-        self.create_time = event.observed_at
+        self.create_time = event.native_timestamp if event.native_timestamp is not None else event.observed_at
         if event.content_type == "image":
             self.ctype = ContextType.IMAGE
         elif event.content_type == "file" and os.path.isfile(str(event.content or "")):

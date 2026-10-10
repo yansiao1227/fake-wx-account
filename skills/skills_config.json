@@ -21,13 +21,6 @@
         "enabled": true,
         "category": "skill"
     },
-    "baidu-hot-cn": {
-        "name": "baidu-hot-cn",
-        "description": "获取真实的百度热搜榜单。用户询问百度热搜、当前热点，或民生、财经、体育、文娱、国际、挑战、电影、电视剧、小说榜时使用。",
-        "source": "clawhub",
-        "enabled": true,
-        "category": "skill"
-    },
     "ddgs": {
         "name": "ddgs",
         "description": "Search the web and find images, news, videos, or books with DDGS, or extract content from a URL. Use for DDGS-specific search categories and extraction; prefer the project's web_search tool for ordinary text search, and always cite source URLs when results inform an answer.",

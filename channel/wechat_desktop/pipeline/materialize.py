@@ -20,6 +20,17 @@ from common.log import logger
 class WechatDesktopMaterializeMixin:
     """物化线程：解析附件、折叠批次，并把稳定事件写入回复 FIFO。"""
 
+    @staticmethod
+    def _snapshot_reply_sources(events: list[WechatDesktopEvent]) -> list[WechatDesktopEvent]:
+        """固化批次原始来源，避免物化和历史聚合改写发送前需要复核的消息。"""
+        sources = {}
+        for event in events:
+            for source in event.task.source_validation_events or [event]:
+                if source.event_id not in sources:
+                    # to_dict 排除 task，快照不持有目标自身或延迟物化列表的循环引用。
+                    sources[source.event_id] = WechatDesktopEvent(**source.to_dict())
+        return list(sources.values())
+
     def _submit_materialization(self, events: list[WechatDesktopEvent]):
         """原子地提交一个消息批次到附件物化线程。"""
         if not events:
@@ -101,8 +112,9 @@ class WechatDesktopMaterializeMixin:
 
         最后一条消息是回复目标，前面的同批消息并入它的历史。只有显式引用的附件
         才会继续出现在普通文本上下文中，防止 Agent 把缓存中的旧图片误当成目标。
-        返回事件上的 ``_source_event_ids`` 和 ``_batch_id`` 用于生命周期追踪。
+        task.source_event_ids 与 batch_id 用于生命周期追踪，原始来源快照用于发送前逐条复核。
         """
+        source_validation_events = self._snapshot_reply_sources(events)
         resolved_events = []
         for event in events:
             if before_share_fetch is None:
@@ -169,6 +181,7 @@ class WechatDesktopMaterializeMixin:
             ]
         target.history = history
         target.task.source_event_ids = source_event_ids
+        target.task.source_validation_events = source_validation_events
         target.task.batch_id = batch_id
         target.task.cache_only = bool(resolved_events) and all((event.content_type == 'file' and (not event.reference) for event in resolved_events))
         target.task.attachment_reference_required = self._requires_attachment_reference(target)
@@ -199,9 +212,11 @@ class WechatDesktopMaterializeMixin:
         正在发送的上一条回复抢占窗口，因此这里只保存原始事件列表。
         """
         target = events[-1]
+        source_validation_events = self._snapshot_reply_sources(events)
         source_event_ids = [event.event_id for event in events]
         batch_id = uuid.uuid4().hex
         target.task.source_event_ids = source_event_ids
+        target.task.source_validation_events = source_validation_events
         target.task.batch_id = batch_id
         target.task.deferred_materialization_events = list(events)
         target.task.attachment_reference_required = False
@@ -266,7 +281,7 @@ class WechatDesktopMaterializeMixin:
         source_event_ids = list(
             event.task.source_event_ids or [event.event_id]
         )
-        if not event.task.proactive_send and any(
+        if any(
             self._store.event_state(event_id).get("state") in EVENT_TERMINALS
             for event_id in source_event_ids
         ):

@@ -38,7 +38,7 @@ from channel.wechat_desktop.models import (
     WechatHistoryMessage,
     WechatHistoryReadResult,
 )
-from channel.wechat_desktop.uia.operations import (
+from channel.wechat_desktop.conversation import (
     conversation_titles_match,
     strip_member_count_suffix,
 )
@@ -146,7 +146,6 @@ class WechatUiaClient:
         self._stop_event = threading.Event()
         self._last_send_at = 0.0
         self._last_conversation_send: dict[str, float] = {}
-        self._known_outgoing_texts: dict[str, list[str]] = {}
         self._known_outgoing_messages: dict[
             str, list[tuple[str, str, float]]
         ] = {}
@@ -199,17 +198,6 @@ class WechatUiaClient:
         remaining = due - now
         wait_send_delay(remaining, self._stop_event)
 
-    def remember_outgoing_text(self, conversation: str, text: str) -> None:
-        value = _text(text)
-        if not value:
-            return
-        key = _text(conversation)
-        items = self._known_outgoing_texts.setdefault(key, [])
-        if value in items:
-            items.remove(value)
-        items.append(value)
-        del items[:-20]
-
     def remember_outgoing_message(
         self, conversation: str, text: str = "", runtime_id: str = ""
     ) -> None:
@@ -218,8 +206,6 @@ class WechatUiaClient:
         if not value and not runtime:
             return
         key = _text(conversation)
-        if value:
-            self.remember_outgoing_text(key, value)
         records = self._known_outgoing_messages.setdefault(key, [])
         records.append((value, runtime, time.monotonic()))
         del records[:-50]
@@ -294,11 +280,20 @@ class WechatUiaClient:
                     False,
                     process_id,
                 )
-                executable = win32process.GetModuleFileNameEx(process, 0)
-                process.Close()
+                try:
+                    executable = win32process.GetModuleFileNameEx(process, 0)
+                finally:
+                    try:
+                        process.Close()
+                    except Exception:
+                        pass
             except Exception:
                 executable = ""
-            if not executable or Path(executable).name.casefold() == "weixin.exe":
+            # Qt 主窗口类被许多程序共享。无法读取进程路径时只能信任微信独有类，
+            # 否则受保护/提权的非微信 Qt 窗口会造成多个微信主窗口的误判。
+            if (executable and Path(executable).name.casefold() == "weixin.exe") or (
+                not executable and native_class == "mmui::MainWindow"
+            ):
                 windows.append((int(hwnd), int(process_id)))
             return True
 
@@ -883,7 +878,7 @@ class WechatUiaClient:
                 # Critical: a visible message list alone is NOT enough. If the
                 # click fails to switch the detail pane, the previous chat's
                 # message list remains visible and we must not claim success
-                # (that would paste daily-hot / replies into the wrong chat).
+                # (that would paste replies into the wrong chat).
                 for _ in range(2):
                     old_cursor = None
                     try:
@@ -908,6 +903,7 @@ class WechatUiaClient:
     def get_title(self) -> HeaderInfo:
         title = ""
         count = 1
+        count_label_seen = False
         count_from_label = False
         with self.operation_lock, self._uia_root() as root:
             for control in self._walk(root):
@@ -915,23 +911,26 @@ class WechatUiaClient:
                 if automation_id.endswith("current_chat_name_label"):
                     title = _text(control.Name)
                 elif automation_id.endswith("current_chat_count_label"):
+                    count_label_seen = True
                     match = re.search(r"(\d+)", _text(control.Name))
                     if match:
                         count = max(1, int(match.group(1)))
                         count_from_label = True
-        # Some builds put the member count only in a dedicated label; others
-        # also (or instead) append "(n)" to the name control. Prefer the bare
-        # group name so callers compare cleanly with session_item_* / config.
+        # 昵称也可以含有数字括号后缀，后缀不能作为群类型的证据。
+        # 只有独立人数控件已经确认群聊时，才去掉标题展示人数。
         base = strip_member_count_suffix(title)
-        if base and base != title:
-            if not count_from_label:
-                match = re.search(r"[（(](\d+)[）)]\s*$", title)
-                if match:
-                    count = max(1, int(match.group(1)))
+        title_has_count_suffix = bool(base and base != title)
+        if count_from_label and title_has_count_suffix:
             title = base
+        # 独立人数控件确认的一人群仍执行群策略；仅有后缀或人数控件
+        # 不可解析时无法确认类型，禁止主动发送时降级为私聊或群聊。
+        kind = "unknown"
+        if title:
+            kind = ("group" if count_from_label else "unknown"
+                    if count_label_seen or title_has_count_suffix else "private")
         return HeaderInfo(
             title,
-            "group" if count > 1 else ("private" if title else "unknown"),
+            kind,
             count,
         )
 
@@ -1524,16 +1523,6 @@ class WechatUiaClient:
         )
         return True
 
-    @staticmethod
-    def _press_escape_key() -> None:
-        import win32api
-        import win32con
-
-        win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
-        win32api.keybd_event(
-            win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0
-        )
-
     @classmethod
     def _find_image_viewer_close_control(cls, root):
         return WechatImageViewer(cls)._find_image_viewer_close_control(root)
@@ -1615,13 +1604,22 @@ class WechatUiaClient:
                 return False
             value_available, value = self._try_input_value(control)
             if (
-                value_available
-                and self._normalize_input_text(value)
+                not value_available
+                or self._normalize_input_text(value)
                 != self._normalize_input_text(expected_text)
             ):
                 return False
             try:
                 control.SetFocus()
+                if self._wait_for_keyboard_focus(control) is not True:
+                    return False
+                # 点击后的回退可能重复提交；焦点切换也可能改变草稿。
+                # 只有紧邻 Enter 仍可读且一致，才能继续回退。
+                current_available, current_text = self._try_input_value(control)
+                if (not current_available
+                        or self._normalize_input_text(current_text)
+                        != self._normalize_input_text(expected_text)):
+                    return False
             except Exception:
                 return False
             mark_send_submitted()

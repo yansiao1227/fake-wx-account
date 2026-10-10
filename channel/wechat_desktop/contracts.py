@@ -97,6 +97,8 @@ class SendResult(Mapping):
 class ConversationTarget:
     conversation_id: str
     display_name: str
+    # 仅由后端的数据库身份或已复核 UI 头部提供；未知类型不得用于发送授权。
+    is_group: bool | None = None
 
 
 class TargetStatus(str, Enum):

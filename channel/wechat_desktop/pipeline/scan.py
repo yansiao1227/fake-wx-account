@@ -38,20 +38,25 @@ class WechatDesktopScanMixin:
         self._lifecycle.advance_scan()
         observation, events = self._driver.observe_events()
         now = time.time()
+        backend_status = {
+            key: value for key, value in observation.items()
+            if key.startswith("db_read_") or key in {"account_binding", "message_source", "target_identity_verification"}
+        }
         if observation.get("error"):
             self.login_status = "unavailable"
             self._service.update_status(
                 login_status="unavailable",
-                mode="unavailable",
+                mode=observation.get("mode", "unavailable"),
                 last_observation_at=now,
                 last_error=observation["error"],
+                **backend_status,
             )
             return
 
         self.login_status = "logged_in"
         self._service.update_status(
             login_status=self.login_status,
-            mode="uia",
+            mode=observation.get("mode", "uia"),
             uia_available=observation.get("uia_available", False),
             shell_hook_active=observation.get("shell_hook_active", False),
             owner_name=observation.get("owner_name", ""),
@@ -60,7 +65,29 @@ class WechatDesktopScanMixin:
             last_error="; ".join(item["error"] for item in observation.get("scan_errors", [])),
             scan_errors=observation.get("scan_errors", []),
             **self._reply_queue.status(),
+            **backend_status,
         )
+
+        source_batch = observation.get("source_batch")
+        if source_batch is not None:
+            try:
+                receipts = self._store.receive_source_batch(source_batch)
+            except Exception as exc:
+                # 来源过滤和游标也是同一事务的一部分，失败后整批重交付。
+                self._service.update_status(last_error=f"source batch receipt failed: {exc}")
+                logger.exception("[WechatDesktop] source batch receipt failed")
+                return
+            events_by_id = {
+                record.event.event_id: record.event
+                for record in source_batch.records if record.event is not None
+            }
+            for receipt in receipts:
+                if receipt.accepted:
+                    self._admit_received_event(events_by_id[receipt.observed_event_id], False, {})
+            self._driver.acknowledge_events([source_batch.batch_id])
+            self._bootstrapped = True
+            self._cleanup_after_poll(now)
+            return
 
         first_poll = not self._bootstrapped
         baseline_history_exists = {}
@@ -85,17 +112,22 @@ class WechatDesktopScanMixin:
                 logger.exception("[WechatDesktop] event receipt failed")
                 continue
             if receipt.accepted:
-                self._start_lifecycle(event)
-                try:
-                    self._process_received_event(event, first_poll, baseline_history_exists)
-                except Exception as exc:
-                    self._store.mark_event_processed(event.event_id, "failed", "admission_failed")
-                    self._finish_lifecycle([event.event_id], "failed")
-                    logger.exception("[WechatDesktop] event admission failed")
-                    self._service.update_status(last_error=str(exc))
+                self._admit_received_event(event, first_poll, baseline_history_exists)
             self._driver.acknowledge_events([receipt.observed_event_id])
         self._bootstrapped = True
+        self._cleanup_after_poll(now)
 
+    def _admit_received_event(self, event, first_poll, baseline_history_exists):
+        self._start_lifecycle(event)
+        try:
+            self._process_received_event(event, first_poll, baseline_history_exists)
+        except Exception as exc:
+            self._store.mark_event_processed(event.event_id, "failed", "admission_failed")
+            self._finish_lifecycle([event.event_id], "failed")
+            logger.exception("[WechatDesktop] event admission failed")
+            self._service.update_status(last_error=str(exc))
+
+    def _cleanup_after_poll(self, now):
         if now - self._last_cleanup_at > 86400:
             self._store.cleanup(
                 int(self.config.get("retention_days", 7)),
@@ -109,7 +141,8 @@ class WechatDesktopScanMixin:
 
     def _process_received_event(self, event, first_poll, baseline_history_exists):
         """持久化接收后的单事件路由；所有拒绝也必须有可查询终态。"""
-        if event.kind == "message" and not (
+        # 数据库来源的历史已与接收游标一起提交；这里仅补写 UIA 快照历史。
+        if event.kind == "message" and not event.source_message_id and not (
             (first_poll or event.task.baseline_only)
             and baseline_history_exists.get(event.conversation_id, False)
         ):
@@ -124,6 +157,18 @@ class WechatDesktopScanMixin:
             self._store.mark_event_processed(event.event_id)
             self._finish_lifecycle([event.event_id], "skipped")
             return
+        if event.source_message_id:
+            reason = ""
+            if event.direction != "incoming":
+                reason = "source_not_incoming"
+            elif event.receipt_phase in {"baseline", "offline_backfill"}:
+                reason = event.receipt_phase
+            elif event.receipt_phase == "startup_unread" and not self.config.get("process_startup_unread_messages", True):
+                reason = "startup_unread_disabled"
+            if reason:
+                self._store.mark_event_processed(event.event_id, "skipped", reason)
+                self._finish_lifecycle([event.event_id], "skipped")
+                return
         process_startup_unread = bool(
             self.config.get("process_startup_unread_messages", True)
         )
@@ -131,7 +176,8 @@ class WechatDesktopScanMixin:
             process_startup_unread and event.session_unread_count > 0
         )
         if (
-            (first_poll or event.task.baseline_only)
+            not event.source_message_id
+            and (first_poll or event.task.baseline_only)
             and not bool(
                 self.config.get("bootstrap_existing_messages", False)
             )

@@ -1,8 +1,7 @@
-"""FIFO 任务准备、分流和收尾；广播与 Agent 细节委托给各自协调器。"""
+"""FIFO 任务准备、附件提示和收尾；Agent 细节委托给回复协调器。"""
 
 from __future__ import annotations
 from channel.wechat_desktop.pipeline.agent_reply import AgentReplyCoordinator
-from channel.wechat_desktop.pipeline.broadcast import BroadcastCoordinator
 from bridge.context import Context, ContextType
 from channel.wechat_desktop.pipeline.prompts import ATTACHMENT_REFERENCE_REQUIRED_REPLY
 from channel.wechat_desktop.pipeline.fifo_queue import ReplyQueueItem
@@ -15,21 +14,6 @@ from common.log import logger
 class WechatDesktopReplyMixin:
     """串行回复流程及通道兼容入口，不持有协调器的业务实现。"""
 
-    def _resolve_daily_hot_target(self, group_name: str) -> tuple[str, str]:
-        return BroadcastCoordinator(self).resolve_target(group_name)
-
-    def enqueue_daily_hot_broadcast(self, message: str, fire_date: str = "") -> int:
-        return BroadcastCoordinator(self).enqueue(message, fire_date)
-
-    def _send_precomposed_reply(self, item: ReplyQueueItem) -> str:
-        return BroadcastCoordinator(self).send(item)
-
-    def _claim_broadcast_send(self, event):
-        return BroadcastCoordinator(self).claim(event)
-
-    def _set_broadcast_status(self, event, status):
-        return BroadcastCoordinator(self).set_status(event, status)
-
     def _send_attachment_reference_prompt(self, item: ReplyQueueItem) -> str:
         """拒绝猜测未明确指向的附件，并直接发送“请引用后再问”的提示。"""
         event = item.event
@@ -41,17 +25,9 @@ class WechatDesktopReplyMixin:
             "text",
         ):
             return "skipped"
-        validation = self._driver.validate_reply_target(event)
-        if not validation.valid:
-            if validation.replacement_event is not None:
-                self._accept_replacement_event(validation.replacement_event)
-            self._store.audit(
-                "send_text",
-                target_name,
-                "stale_target",
-                self._content_hash(ATTACHMENT_REFERENCE_REQUIRED_REPLY),
-                detail=validation.reason,
-            )
+        if not self._validate_source_before_reply(
+            event, None, target_name, ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text"
+        ):
             return "skipped"
         send_target = (target_id or target_name)
         self._mark_lifecycle(item.source_event_ids, "send_started")
@@ -129,8 +105,6 @@ class WechatDesktopReplyMixin:
             self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, terminal)
         self._best_effort("finish_lifecycle", self._finish_lifecycle, item.source_event_ids, terminal)
         status = self._reply_queue.status()
-        if self._daily_hot_scheduler is not None:
-            status.update(self._daily_hot_scheduler.status())
         self._service.update_status(reply_in_flight=False, reply_conversation="", **status)
 
     def _process_reply_item(self, item: ReplyQueueItem) -> str:
@@ -147,7 +121,7 @@ class WechatDesktopReplyMixin:
             item.event.task.deferred_materialization_events
             or []
         )
-        if deferred_events:
+        if deferred_events and not item.event.task.source_invalid:
             try:
                 # 延迟物化会打开图片查看器或定位文件，必须纳入独占回复周期。
                 self._driver.begin_reply_cycle(
@@ -163,11 +137,12 @@ class WechatDesktopReplyMixin:
                     if not notice_sent:
                         notice_sent = self._send_share_content_fetch_notice(item)
 
-                materialized = self._materialize_batch(
-                    deferred_events, before_share_fetch=before_share_fetch
-                )
-                materialized.task.preflight_attachment_notice_sent = notice_sent
-                item.event = materialized
+                if not item.event.task.source_invalid:
+                    materialized = self._materialize_batch(
+                        deferred_events, before_share_fetch=before_share_fetch
+                    )
+                    materialized.task.preflight_attachment_notice_sent = notice_sent
+                    item.event = materialized
             except Exception:
                 deferred_failed = True
                 logger.exception(
@@ -178,25 +153,21 @@ class WechatDesktopReplyMixin:
         reference_required = bool(
             item.event.task.attachment_reference_required
         )
-        proactive_send = bool(
-            item.event.task.proactive_send
-            or item.event.task.precomposed_reply_text
-        )
-        if not reference_required and not proactive_send:
+        if not reference_required:
             self._mark_lifecycle(
                 item.source_event_ids,
                 "agent_started",
                 batch_id=item.batch_id,
             )
         try:
-            if deferred_failed:
+            if item.event.task.source_invalid:
+                terminal = "skipped"
+            elif deferred_failed:
                 terminal = "failed"
             elif item.expired:
                 terminal = item.terminal or "skipped"
             elif reference_required:
                 terminal = self._send_attachment_reference_prompt(item)
-            elif proactive_send:
-                terminal = self._send_precomposed_reply(item)
             elif not self._dispatch_message(item.event, item.token):
                 terminal = item.terminal or "skipped"
             else:
@@ -207,8 +178,10 @@ class WechatDesktopReplyMixin:
                 "[WechatDesktop] queued message failed: %s", exc, exc_info=True
             )
         finally:
+            if item.event.task.source_invalid:
+                terminal = "skipped"
             terminal = self._store.delivery_outcome(item.source_event_ids, terminal)
-            if terminal in {"failed", "timeout"} and not proactive_send:
+            if terminal in {"failed", "timeout"}:
                 try:
                     self._send_agent_failure_notice(
                         event=item.event,
@@ -224,10 +197,11 @@ class WechatDesktopReplyMixin:
                         "[WechatDesktop] final failure notice crashed: %s",
                         notice_exc,
                     )
+                if item.event.task.source_invalid:
+                    terminal = "skipped"
             if not reference_required:
                 self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
-                if not proactive_send:
-                    self._mark_lifecycle(item.source_event_ids, "agent_done")
+                self._mark_lifecycle(item.source_event_ids, "agent_done")
             self._best_effort(
                 "reply_audit", self._store.audit, "reply_queue",
                 item.event.conversation_name,
