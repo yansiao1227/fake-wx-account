@@ -207,20 +207,15 @@ class WechatDesktopChannel(
             stopping_workers=[],
             paused=bool(self._store.get_state("paused", False)),
             shadow_mode=bool(self.config.get("shadow_mode", True)),
-            auto_reply_private_all=bool(
-                self.config.get("auto_reply_private_all", False)
+            auto_reply_private_blacklist=list(
+                self.config["auto_reply_private_blacklist"]
             ),
-            auto_reply_groups_all=bool(
-                self.config.get("auto_reply_groups_all", False)
-            ),
-            auto_reply_blacklist=list(
-                self.config.get("auto_reply_blacklist", [])
+            auto_reply_group_blacklist=list(
+                self.config["auto_reply_group_blacklist"]
             ),
             diagnostic_logging=bool(
                 self.config.get("diagnostic_logging", False)
             ),
-            auto_reply_contacts=list(self.config.get("auto_reply_contacts", [])),
-            auto_reply_groups=list(self.config.get("auto_reply_groups", [])),
             group_reply_mode=str(self.config.get("group_reply_mode", "at_or_prefix")),
             last_error="",
         )
@@ -234,11 +229,11 @@ class WechatDesktopChannel(
         )
         self._trace(
             "00-startup",
-            "backend=db_uia poll_seconds=%s auto_reply_private=%s group_mode=%s blacklist=%s",
+            "backend=db_uia poll_seconds=%s group_mode=%s private_blacklist=%s group_blacklist=%s",
             self.config["db_poll_interval_seconds"],
-            bool(self.config.get("auto_reply_private_all")),
             self.config.get("group_reply_mode"),
-            list(self.config.get("auto_reply_blacklist", [])),
+            list(self.config["auto_reply_private_blacklist"]),
+            list(self.config["auto_reply_group_blacklist"]),
         )
 
     def stop(self):

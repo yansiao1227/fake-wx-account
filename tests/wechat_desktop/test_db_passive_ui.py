@@ -88,7 +88,7 @@ def test_authorization_rejections_keep_reason_and_never_initialize_ui(database_o
     assert not backend.uia_initialized
 
 
-@pytest.mark.parametrize("gate", ["shadow", "blacklist", "allowlist", "paused", "rate_limit", "old_receipt"])
+@pytest.mark.parametrize("gate", ["shadow", "blacklist", "paused", "rate_limit", "old_receipt"])
 @pytest.mark.parametrize("reply_type", [ReplyType.TEXT, ReplyType.IMAGE])
 def test_auto_reply_without_new_delivery_never_initializes_ui(database_only, monkeypatch, gate, reply_type):
     backend, reader, store, talker = database_only
@@ -99,7 +99,7 @@ def test_auto_reply_without_new_delivery_never_initializes_ui(database_only, mon
     backend.acknowledge_events([observation["source_batch"].batch_id])
     event = events[0]
     channel = make_channel(store, backend)
-    channel.config.update(auto_reply_private_all=True, auto_send_images=True)
+    channel.config["auto_send_images"] = True
     context = {"msg": SimpleNamespace(event=event, other_user_id=event.conversation_id,
                                       other_user_nickname=event.conversation_name),
                "receiver": event.conversation_id, "isgroup": False,
@@ -107,9 +107,7 @@ def test_auto_reply_without_new_delivery_never_initializes_ui(database_only, mon
     if gate == "shadow":
         channel.config["shadow_mode"] = True
     elif gate == "blacklist":
-        channel.config["auto_reply_blacklist"] = ["Synthetic"]
-    elif gate == "allowlist":
-        channel.config.update(auto_reply_private_all=False, auto_reply_contacts=[])
+        channel.config["auto_reply_private_blacklist"] = ["Synthetic"]
     elif gate == "paused":
         channel._service.set_paused(True)
     elif gate == "rate_limit":
@@ -128,17 +126,14 @@ def test_auto_reply_without_new_delivery_never_initializes_ui(database_only, mon
     assert not backend.uia_initialized
 
 
-@pytest.mark.parametrize("gate", ["shadow", "blacklist", "allowlist", "rate_limit"])
+@pytest.mark.parametrize("gate", ["shadow", "blacklist", "rate_limit"])
 def test_active_send_denied_before_ui_initialization(database_only, gate):
     backend, reader, store, talker = database_only
     channel = make_channel(store, backend)
-    channel.config["auto_reply_private_all"] = True
     if gate == "shadow":
         channel.config["shadow_mode"] = True
     elif gate == "blacklist":
-        channel.config["auto_reply_blacklist"] = ["Synthetic"]
-    elif gate == "allowlist":
-        channel.config.update(auto_reply_private_all=False, auto_reply_contacts=[])
+        channel.config["auto_reply_private_blacklist"] = ["Synthetic"]
     else:
         channel.config["max_send_per_minute"] = 1
         assert channel._policy.reserve_send(1)
