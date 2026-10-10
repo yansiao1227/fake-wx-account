@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.storage.store import WechatDesktopStore
 from common.utils import expand_path
 from config import conf
@@ -24,9 +25,8 @@ class WechatDesktopService:
             "last_observation_at": 0,
             "last_error": "",
             "shadow_mode": True,
-            "auto_reply_private_all": False,
-            "auto_reply_groups_all": False,
-            "auto_reply_blacklist": [],
+            "auto_reply_private_blacklist": list(DEFAULT_CONFIG["auto_reply_private_blacklist"]),
+            "auto_reply_group_blacklist": list(DEFAULT_CONFIG["auto_reply_group_blacklist"]),
             "diagnostic_logging": False,
             "reply_in_flight": False,
             "reply_conversation": "",
@@ -42,8 +42,6 @@ class WechatDesktopService:
             "queue_skipped": 0,
             "queue_failed": 0,
             "queue_timeout": 0,
-            "auto_reply_contacts": [],
-            "auto_reply_groups": [],
             "group_reply_mode": "at_only",
             "db_read_healthy": False,
             "db_read_stale": False,

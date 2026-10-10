@@ -28,7 +28,7 @@ def channel(tmp_path):
     cls = WechatDesktopChannel.__closure__[0].cell_contents
     channel = object.__new__(cls)
     channel.config = load_wechat_desktop_config({
-        "shadow_mode": False, "auto_reply_private_all": True,
+        "shadow_mode": False,
         "max_send_per_minute": 10, "max_send_per_hour": 50,
         "worker_join_timeout_seconds": 0.01,
     })
@@ -51,7 +51,7 @@ def channel(tmp_path):
     channel._trace = lambda *a, **kw: None
     channel.sent = []
 
-    def send(target, content):
+    def send(target, content, *, authorized_target=None):
         channel.sent.append((target, content))
         return {"success": True, "verified": True}
 
@@ -240,9 +240,9 @@ def test_restart_uses_new_stop_signal(channel):
 
 def test_config_lists_are_isolated_and_invalid_values_fail_early():
     first, second = load_wechat_desktop_config({}), load_wechat_desktop_config({})
-    first["auto_reply_groups"].append("mutated")
-    assert "mutated" not in second["auto_reply_groups"]
-    assert "mutated" not in DEFAULT_CONFIG["auto_reply_groups"]
+    first["auto_reply_group_blacklist"].append("mutated")
+    assert "mutated" not in second["auto_reply_group_blacklist"]
+    assert "mutated" not in DEFAULT_CONFIG["auto_reply_group_blacklist"]
     for override in ({"reply_queue_capacity": 0}, {"shadow_mode": "false"},
                      {"reply_queue_max_wait_seconds": float("inf")}):
         with pytest.raises(ValueError):

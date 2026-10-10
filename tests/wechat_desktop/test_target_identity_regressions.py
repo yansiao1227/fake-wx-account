@@ -238,10 +238,10 @@ def test_private_send_binding_rejects_suffix_header_collision():
 @pytest.mark.parametrize("observed,requested", [("Alice", "Alice(1)"),
                                               ("Alice(1)", "Alice"),
                                               ("Alice", "Alice（1）")])
-@pytest.mark.parametrize("configured_group", [False, True])
-def test_private_database_send_resolution_never_strips_requested_suffix(observed, requested, configured_group):
+@pytest.mark.parametrize("group_blocked", [False, True])
+def test_private_database_send_resolution_never_strips_requested_suffix(observed, requested, group_blocked):
     binder, gateway, bound = make_binder(observed)
-    gateway.config["auto_reply_groups"] = [observed] if configured_group else []
+    gateway.config["auto_reply_group_blacklist"] = [observed] if group_blocked else []
     resolution = binder.resolve_send_target(requested)
     assert resolution.status == TargetStatus.NOT_FOUND
     assert resolution.target is None

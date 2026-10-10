@@ -30,7 +30,7 @@ description: "在 Windows 和 cowagent-wechat Conda 环境中管理数据库接�
 
 4. 根 `config.json` 只配置模型、Agent、Web 与 `channel_type` 等通用项。启用微信和 Web 时写 `"channel_type": "web,wechat_desktop"`。微信业务项只改 `channel/wechat_desktop/config.py`，不要放回根 JSON；云厂商密钥优先放 `~/.cow/.env`。
 
-5. 首次验证先设置通道 `shadow_mode=True`，检查账号、历史和受控消息落账，再按需要启用发送。当前默认 `shadow_mode=False`；当前私聊和群聊全部放行开关均已开启，群聊仍按 `at_only` 触发。正式运行前检查黑名单、全部放行开关与白名单。
+5. 首次验证先设置通道 `shadow_mode=True`，检查账号、历史和受控消息落账，再按需要启用发送。当前默认 `shadow_mode=False`；私聊和群聊默认准入，群聊仍按 `at_only` 触发。正式运行前检查通道 `DEFAULT_CONFIG` 中独立的 `auto_reply_private_blacklist` 与 `auto_reply_group_blacklist`；黑名单按会话显示名完整匹配，群聊被屏蔽后即使 @ 也不回复。
 
 `shadow_mode` 只禁止向微信发送内容，正式通道仍可能执行 Agent 和必要附件物化。若需要不执行 Agent、不操作附件的数据库验证，使用下文的 `--shadow-seconds` 专用诊断。
 

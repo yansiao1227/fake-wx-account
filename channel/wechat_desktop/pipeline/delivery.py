@@ -7,7 +7,7 @@ from typing import Callable
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.text import split_message_text
 from channel.wechat_desktop.send_control import SendCancelled, send_scope
-from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus
+from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus, TargetStatus
 
 
 class DeliveryBlocked(SendCancelled):
@@ -32,10 +32,34 @@ class DeliveryService:
         def check_cancelled():
             if self.is_stopped() or self.is_paused() or (token and not self.is_active(token)):
                 raise DeliveryBlocked("send cancelled, paused or expired")
+            if not self.policy.allows_send(policy_target, is_group, content_type):
+                raise DeliveryBlocked("send blocked by policy")
 
+        if authorized_target is None:
+            # 先执行廉价门禁，拒绝的任务无需读取目标或初始化 UI。
+            check_cancelled()
+            resolve = getattr(self.backend, "resolve_send_target", None)
+            if callable(resolve):
+                try:
+                    resolution = resolve(target)
+                except Exception as exc:
+                    raise DeliveryBlocked("send target resolution failed") from exc
+                if (getattr(resolution, "status", None) != TargetStatus.RESOLVED
+                        or getattr(resolution, "target", None) is None):
+                    raise DeliveryBlocked("send target could not be verified")
+                authorized_target = resolution.target
+                target = getattr(authorized_target, "conversation_id", "")
+        if authorized_target is not None:
+            identity = getattr(authorized_target, "conversation_id", None)
+            display_name = getattr(authorized_target, "display_name", None)
+            if (not isinstance(identity, str) or not identity.strip()
+                    or not isinstance(display_name, str) or not display_name.strip()
+                    or not isinstance(getattr(authorized_target, "is_group", None), bool)):
+                raise DeliveryBlocked("send target identity or type could not be verified")
+            # 所有发送都按当前可信名称/类型检查，防止旧消息快照绕过黑名单。
+            policy_target = authorized_target.display_name
+            is_group = authorized_target.is_group
         check_cancelled()
-        if not self.policy.allows_send(policy_target, is_group, content_type):
-            raise DeliveryBlocked("send blocked by policy")
         limit = self.config.get("uia_text_chunk_chars", DEFAULT_CONFIG["uia_text_chunk_chars"])
         units = len(split_message_text(content, limit)) if content_type == "text" else 1
         with send_scope(check_cancelled):

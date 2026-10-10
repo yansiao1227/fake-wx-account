@@ -35,7 +35,7 @@ def native_reply(tmp_path):
     event.history = [{"content": previous.content, "source_message_id": previous.source_message_id}]
     event.task.context_source_events = [previous]
     channel = make_channel(store, backend)
-    channel.config.update(auto_reply_private_all=True, auto_send_images=True)
+    channel.config.update(auto_send_images=True)
     context = {"msg": WechatDesktopMessage(event), "receiver": event.conversation_id,
                "isgroup": False, "wechat_desktop_source_type": "private",
                "wechat_desktop_source_event_ids": [event.event_id]}
@@ -116,26 +116,30 @@ def test_valid_notice_preserves_authorized_current_target(native_reply, kind):
 
 @pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, ReplyType.IMAGE_URL,
                                   "tool", "attachment", "failure", "reference"])
-@pytest.mark.parametrize("policy", ["blacklist", "allowlist"])
-def test_queued_name_cannot_bypass_current_contact_policy(native_reply, kind, policy):
+@pytest.mark.parametrize("blocked_name", ["新名称", "Synthetic"])
+def test_current_contact_blacklist_uses_latest_name(native_reply, kind, blocked_name):
     channel, reader, talker, _, _, event, context, gateway = native_reply
     contacts = reader.caches["contact/contact.db"]
     with sqlite3.connect(contacts.path) as connection:
         connection.execute("UPDATE contact SET remark=? WHERE username=?", ("新名称", talker))
     contacts.changed = True
-    if policy == "blacklist":
-        channel.config["auto_reply_blacklist"] = ["新名称"]
-    else:
-        channel.config.update(auto_reply_private_all=False, auto_reply_contacts=["Synthetic"])
+    channel.config["auto_reply_private_blacklist"] = [blocked_name]
     submissions = []
-    channel._deliver = lambda *args, **kwargs: submissions.append(args) or SendResult(SendStatus.SENT)
+    channel._deliver = lambda *args, **kwargs: submissions.append((args, kwargs)) or SendResult(SendStatus.SENT)
 
     if isinstance(kind, ReplyType):
         channel._send_reply_impl(Reply(kind, "结果"), context)
     else:
         send_notice(channel, event, context, kind)
 
-    assert submissions == [] and gateway.client.ui_calls == []
+    if blocked_name == "新名称":
+        assert submissions == [] and gateway.client.ui_calls == []
+    else:
+        assert len(submissions) == 1
+        args, kwargs = submissions[0]
+        assert args[0] == event.conversation_id
+        assert kwargs["policy_target"] == "新名称"
+        assert kwargs["authorized_target"] == ConversationTarget(event.conversation_id, "新名称", False)
 
 
 @pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, "tool", "failure", "reference"])
@@ -143,7 +147,7 @@ def test_current_backend_group_type_controls_policy(native_reply, kind):
     channel, _, _, _, _, event, context, _ = native_reply
     channel._driver.resolve_send_target = lambda identity: TargetResolution(
         TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, "Synthetic", True))
-    channel.config.update(auto_reply_groups_all=False, auto_reply_groups=[])
+    channel.config["auto_reply_group_blacklist"] = ["Synthetic"]
     submissions = []
     channel._deliver = lambda *args, **kwargs: submissions.append(args) or SendResult(SendStatus.SENT)
 
