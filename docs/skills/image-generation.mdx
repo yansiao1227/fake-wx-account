@@ -22,7 +22,9 @@ By default, "auto routing + automatic fallback" is used:
 
 1. Pick the first configured provider in the order `OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI`
 2. On errors such as 401, model not enabled, or network issues, automatically switch to the next provider
-3. A specified model or provider uses only its matching configured provider; unpinned requests use the automatic fallback order above
+3. A specified model or provider uses only its matching provider and reports a configuration error if its key is missing; unpinned requests use the automatic fallback order above
+
+Pinning only a provider uses its default model and appears as a specified route on the model page. Custom model names require an explicit provider.
 
 To pin a specific model:
 
@@ -54,6 +56,8 @@ The base ends at `/v1`; the script appends `/images/generations` and requests on
 Non-secret defaults also fit under `config.json` → `skills.image-generation.{provider,model,api_base}`. Keep the optional `api_key` template field empty when using the environment file. Matching `SKILL_IMAGE_GENERATION_*` environment variables take precedence. Standalone invocation loads `~/.cow/.env`; this Windows project requires `D:\Miniconda\envs\cowagent-wechat\python.exe`.
 
 Signed result URLs are downloaded immediately without the generation Bearer token. Output contains local absolute paths for the existing Agent artifact and WeChat image-sending pipeline. Empty data, failed downloads, and non-image responses fail; errors redact keys and signed URLs. Image editing depends on the custom service supporting `/images/edits`; an edit failure must not silently become a new generation.
+
+Result URLs must use HTTP/HTTPS and resolve only to public Internet addresses, including every redirect target. API results cannot read local files; user-supplied editing inputs may still use local paths. Generated files accept verified PNG, JPEG, or WebP with matching extensions. OpenAI-compatible responses are fully validated before saving, and files created by a failed batch are removed.
 
 ### Existing provider credentials
 

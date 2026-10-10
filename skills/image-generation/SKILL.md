@@ -130,9 +130,11 @@ When both dedicated fields are absent, the existing provider keys remain support
 
 `OPENAI_API_KEY` / `GEMINI_API_KEY` / `ARK_API_KEY` / `DASHSCOPE_API_KEY` / `MINIMAX_API_KEY` / `LINKAI_API_KEY`
 
-Each also has an optional `*_API_BASE` for custom endpoints. Automatic routing can try configured providers in order; a pinned provider/model uses its matching provider. Missing dedicated credentials must be corrected before invoking the skill again.
+Each also has an optional `*_API_BASE` for custom endpoints. Automatic routing can try configured providers in order; a pinned provider/model uses only its matching provider, and missing credentials are a configuration error. Pinning only a provider uses that provider's default model. Unknown models require an explicit provider. Missing credentials must be corrected before invoking the skill again.
 
 Image URLs returned by the API are downloaded immediately without forwarding the generation Bearer token. The output contains local absolute paths in `images[].url`, which the existing Agent artifact and WeChat sending pipeline consume. Empty results, failed downloads, and non-image responses are failures. Do not paste signed download URLs into progress messages.
+
+Result URLs must use HTTP/HTTPS and resolve only to public Internet addresses; local paths, private addresses, and unsafe redirects are rejected. Local paths remain supported for user-supplied editing inputs. Generated outputs accept verified PNG, JPEG, or WebP with matching extensions. OpenAI-compatible responses are fully validated before saving, and files created by a failed batch are removed.
 
 The custom service above has only been specified for text-to-image generation. Image editing uses `/images/edits` and depends on the service supporting that endpoint; report an edit failure rather than silently generating a new image.
 

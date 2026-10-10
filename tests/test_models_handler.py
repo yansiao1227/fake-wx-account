@@ -149,6 +149,54 @@ class TestModelsHandler(unittest.TestCase):
         self.assertEqual(cap["current_model"], "gpt-image-2")
         self.assertEqual(cap["current_provider"], "openai")
         self.assertEqual(cap["strategy"], "specified")
+        self.assertEqual(cap["fallback_provider"], "")
+        self.assertEqual(cap["fallback_model"], "")
+
+    def test_image_provider_only_uses_pinned_provider_default_without_global_fallback(self):
+        from channel.web.web_channel import ModelsHandler
+
+        defaults = {
+            "openai": "gpt-image-2",
+            "gemini": "gemini-3.1-flash-image-preview",
+            "doubao": "seedream-5.0-lite",
+            "dashscope": "qwen-image-2.0",
+            "minimax": "image-01",
+            "linkai": "gpt-image-2",
+        }
+        for source in ("env", "config"):
+            for provider, default_model in defaults.items():
+                with self.subTest(source=source, provider=provider):
+                    # A usable global OpenAI key must not turn an explicit
+                    # selection into auto routing, even if that vendor has no key.
+                    environment = {"OPENAI_API_KEY": "synthetic-openai-key"}
+                    local_config = {}
+                    if source == "env":
+                        environment["SKILL_IMAGE_GENERATION_PROVIDER"] = provider
+                    else:
+                        local_config = {"skills": {"image-generation": {"provider": provider}}}
+                    with patch.dict(os.environ, environment, clear=True):
+                        cap = ModelsHandler._image_capability(local_config)
+
+                    self.assertEqual(cap["strategy"], "specified")
+                    self.assertEqual(cap["current_provider"], provider)
+                    self.assertEqual(cap["current_model"], default_model)
+                    self.assertEqual(cap["fallback_provider"], "")
+                    self.assertEqual(cap["fallback_model"], "")
+                    self.assertTrue(cap["runtime_active"])
+                    self.assertEqual(cap["note"], "")
+
+    def test_image_model_only_does_not_report_global_auto_fallback(self):
+        from channel.web.web_channel import ModelsHandler
+
+        local_config = {"skills": {"image-generation": {"model": "qwen-image-2.0"}}}
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "synthetic-openai-key"}, clear=True):
+            cap = ModelsHandler._image_capability(local_config)
+
+        self.assertEqual(cap["strategy"], "specified")
+        self.assertEqual(cap["current_provider"], "dashscope")
+        self.assertEqual(cap["current_model"], "qwen-image-2.0")
+        self.assertEqual(cap["fallback_provider"], "")
+        self.assertEqual(cap["fallback_model"], "")
 
     def test_empty_image_env_model_and_provider_override_json_selection(self):
         from channel.web.web_channel import ModelsHandler

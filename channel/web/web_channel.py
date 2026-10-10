@@ -3022,17 +3022,23 @@ class ModelsHandler:
                 if inferred_provider:
                     break
 
-        # In auto mode the hint should reflect what generate.py will actually
-        # dispatch to — surface that prediction via fallback_* so the UI
-        # never claims a chat-only bot (e.g. minimax/MiniMax-M2.7) "would
-        # generate the image", which is impossible.
-        predicted = cls._predict_image_auto(local_config)
+        specified = bool(explicit_provider or explicit_model)
+        # Pinning only the provider uses its runtime default model, rather
+        # than the first catalog entry (which may be a different variant).
+        current_model = explicit_model
+        if explicit_provider and not current_model:
+            current_model = dict(cls._IMAGE_AUTO_ORDER).get(inferred_provider, "")
+
+        # Only genuine auto routing has a global fallback. Explicit provider
+        # or model selection stays pinned even when its credentials are missing.
+        predicted = ({"provider": "", "model": ""} if specified else
+                     cls._predict_image_auto(local_config))
 
         return {
             "editable": True,
-            "strategy": "specified" if explicit_model else "auto",
+            "strategy": "specified" if specified else "auto",
             "current_provider": inferred_provider,
-            "current_model": explicit_model,
+            "current_model": current_model,
             "fallback_provider": predicted["provider"],
             "fallback_model": predicted["model"],
             "providers": list(cls._IMAGE_PROVIDER_MODELS.keys()),

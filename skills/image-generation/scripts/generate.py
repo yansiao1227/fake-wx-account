@@ -5,10 +5,10 @@ Unified image generation script.
 Usage:
     python generate.py '<json_args>'
 
-Supported model families (each provider is tried in priority order:
-OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI; missing API keys
-are skipped, and the provider that natively owns the requested model is
-promoted to the front of the queue):
+Without an explicit provider/model, configured providers are tried in order:
+OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI. A specified provider
+or model uses only its matching provider and requires that provider's API key.
+Supported model families:
 
     - gpt-image-2 / gpt-image-1                    → OpenAI
     - nano-banana / gemini-*-image-*               → Gemini
@@ -28,10 +28,13 @@ import io
 import time
 import uuid
 import re
+import http.client
+import ipaddress
+import socket
 from abc import ABC, abstractmethod
 from pathlib import Path
 from urllib.request import urlopen, Request
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from urllib.error import URLError
 
 try:
@@ -110,18 +113,104 @@ def resolve_size(size: str | None, aspect_ratio: str | None) -> str | None:
 # Image helpers
 # ---------------------------------------------------------------------------
 
+def _public_image_addresses(host: str, port: int) -> list:
+    """Resolve once and reject any destination outside the public Internet."""
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not addresses:
+        raise RuntimeError("Image URL has no resolved address")
+    for family, _kind, _proto, _canonname, endpoint in addresses:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            raise RuntimeError("Image URL has an unsupported address")
+        address = ipaddress.ip_address(endpoint[0])
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        if (not address.is_global or address.is_multicast or address.is_reserved or
+                address.is_loopback or address.is_link_local):
+            raise RuntimeError("Image URL must resolve only to public Internet addresses")
+    return addresses
+
+
+def _connect_image_addresses(addresses: list, timeout: float):
+    """Connect to a validated numeric address without resolving the host again."""
+    last_error = None
+    for family, kind, proto, _canonname, endpoint in addresses:
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(endpoint)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            sock.close()
+    raise last_error or RuntimeError("Image URL has no usable public address")
+
+
+class _PublicImageHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, port, *, addresses, timeout):
+        super().__init__(host, port, timeout=timeout)
+        self._image_addresses = addresses
+
+    def connect(self):
+        self.sock = _connect_image_addresses(self._image_addresses, self.timeout)
+
+
+class _PublicImageHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port, *, addresses, timeout):
+        super().__init__(host, port, timeout=timeout)
+        self._image_addresses = addresses
+
+    def connect(self):
+        sock = _connect_image_addresses(self._image_addresses, self.timeout)
+        try:
+            # Keep the original hostname for certificate verification and SNI.
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        except Exception:
+            sock.close()
+            raise
+
+
+def _download_image(source: str) -> bytes:
+    """Download an API result from public HTTP(S), checking every redirect."""
+    for redirect in range(6):
+        if not isinstance(source, str) or any(char.isspace() or ord(char) < 32 for char in source):
+            raise RuntimeError("Image URL must be an HTTP or HTTPS URL")
+        try:
+            parsed = urlparse(source)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname or
+                    parsed.username is not None or parsed.password is not None or "%" in parsed.hostname):
+                raise ValueError("Invalid image URL")
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError:
+            raise RuntimeError("Image URL must be an HTTP or HTTPS URL without credentials") from None
+        addresses = _public_image_addresses(parsed.hostname, port)
+        connection_type = _PublicImageHTTPSConnection if parsed.scheme == "https" else _PublicImageHTTPConnection
+        connection = connection_type(parsed.hostname, port, addresses=addresses, timeout=60)
+        try:
+            target = parsed.path or "/"
+            if parsed.query:
+                target += "?" + parsed.query
+            connection.request("GET", target, headers={"Accept": "image/*"})
+            response = connection.getresponse()
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.getheader("Location")
+                if not location or redirect == 5:
+                    raise RuntimeError("Image download has an invalid or excessive redirect")
+                source = urljoin(source, location)
+                continue
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"Image download failed with HTTP {response.status}")
+            return response.read()
+        finally:
+            connection.close()
+    raise RuntimeError("Image download has too many redirects")
+
+
 def _load_image(source: str) -> bytes:
-    """Load image from a local file path or URL."""
+    """Load a user-supplied editing input from a local file or public URL."""
     if os.path.isfile(source):
         with open(source, "rb") as f:
             return f.read()
-    if _HAS_REQUESTS:
-        resp = requests.get(source, timeout=60)
-        resp.raise_for_status()
-        return resp.content
-    req = Request(source)
-    with urlopen(req, timeout=60) as resp:
-        return resp.read()
+    return _download_image(source)
 
 
 def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int = 4096) -> bytes:
@@ -172,21 +261,43 @@ def _compress_image(data: bytes, max_bytes: int = 4 * 1024 * 1024, max_edge: int
     return buf.getvalue()
 
 
-def _save_image(data: bytes, output_dir: str) -> str:
-    """Save image bytes to output_dir and return the path."""
+def _validate_image_bytes(data: bytes) -> str:
+    """Verify supported image content and return its matching extension."""
     if not data:
         raise RuntimeError("Image download returned empty content")
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        ext = "png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        ext = "jpg"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        ext = "webp"
+    else:
+        raise RuntimeError("Image download returned invalid or unsupported image content; expected PNG, JPEG or WebP")
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.verify()
+    except Exception:
+        raise RuntimeError("Image download returned corrupt image content") from None
+    return ext
+
+
+def _save_image(data: bytes, output_dir: str) -> str:
+    """Save verified image bytes with an extension matching their format."""
+    ext = _validate_image_bytes(data)
     output_dir = os.path.abspath(os.path.expanduser(output_dir))
     os.makedirs(output_dir, exist_ok=True)
-    ext = "png"
-    if data[:3] == b"\xff\xd8\xff":
-        ext = "jpg"
-    elif data[:4] == b"RIFF":
-        ext = "webp"
-    filename = f"{uuid.uuid4().hex[:12]}.{ext}"
+    filename = f"{uuid.uuid4().hex}.{ext}"
     path = os.path.join(output_dir, filename)
-    with open(path, "wb") as f:
-        f.write(data)
+    created = False
+    try:
+        with open(path, "xb") as f:
+            created = True
+            f.write(data)
+    except Exception:
+        if created:
+            os.remove(path)
+        raise
     return path
 
 
@@ -372,28 +483,27 @@ class OpenAIProvider(ImageProvider):
             raise RuntimeError("Image API returned no image data")
         paths = []
         try:
+            images = []
             for item in items:
                 if not isinstance(item, dict):
                     raise RuntimeError("Image API returned invalid image data")
                 if item.get("b64_json"):
                     raw = base64.b64decode(item["b64_json"], validate=True)
                 elif item.get("url"):
-                    raw = _load_image(item["url"])
+                    raw = _download_image(item["url"])
                 else:
                     raise RuntimeError("Image API returned no downloadable image")
-                # Expired CDN URLs sometimes return HTML with HTTP 200.
-                if not (raw.startswith(b"\x89PNG\r\n\x1a\n") or raw.startswith(b"\xff\xd8\xff") or
-                        raw.startswith((b"GIF87a", b"GIF89a", b"BM", b"II*\0", b"MM\0*")) or
-                        raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"):
-                    raise RuntimeError("Image download returned invalid image content")
-                from PIL import Image
-                try:
-                    with Image.open(io.BytesIO(raw)) as image:
-                        image.verify()
-                except Exception:
-                    raise RuntimeError("Image download returned corrupt image content") from None
+                _validate_image_bytes(raw)
+                images.append(raw)
+            # No files are created until every response item passes validation.
+            for raw in images:
                 paths.append(_save_image(raw, output_dir))
         except Exception as exc:
+            for path in paths:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
             raise RuntimeError(_safe_error(exc, self.api_key)) from None
         return paths
 
@@ -475,7 +585,7 @@ class LinkAIProvider(ImageProvider):
         paths = []
         for item in result.get("data", []):
             if "url" in item:
-                raw = _load_image(item["url"])
+                raw = _download_image(item["url"])
                 paths.append(_save_image(raw, output_dir))
             elif "b64_json" in item:
                 raw = base64.b64decode(item["b64_json"])
@@ -805,7 +915,7 @@ class SeedreamProvider(ImageProvider):
             u = item.get("url")
             b64 = item.get("b64_json")
             if u:
-                paths.append(_save_image(_load_image(u), output_dir))
+                paths.append(_save_image(_download_image(u), output_dir))
             elif b64:
                 paths.append(_save_image(base64.b64decode(b64), output_dir))
         if not paths:
@@ -939,7 +1049,7 @@ class QwenProvider(ImageProvider):
             for part in ((ch.get("message") or {}).get("content") or []):
                 u = part.get("image")
                 if u:
-                    paths.append(_save_image(_load_image(u), output_dir))
+                    paths.append(_save_image(_download_image(u), output_dir))
         if not paths:
             raise RuntimeError(f"Qwen returned no image: {result}")
         return paths
@@ -1060,7 +1170,7 @@ class MinimaxProvider(ImageProvider):
         for b64 in b64_list:
             paths.append(_save_image(base64.b64decode(b64), output_dir))
         for u in urls_list:
-            paths.append(_save_image(_load_image(u), output_dir))
+            paths.append(_save_image(_download_image(u), output_dir))
         if not paths:
             raise RuntimeError(f"MiniMax returned no image: {result}")
         return paths
@@ -1070,9 +1180,7 @@ class MinimaxProvider(ImageProvider):
 # Provider factory
 # ---------------------------------------------------------------------------
 
-# Model-prefix → preferred provider label.
-# When the requested model matches a prefix, that provider is promoted to the
-# front of the queue. All other configured providers still run as fallbacks.
+# Model-prefix → native provider label for a pinned model.
 _MODEL_PREFERRED_PROVIDER: list[tuple[tuple[str, ...], str]] = [
     (("gpt-image",), "OpenAI"),
     (("nano-banana", "gemini-"), "Gemini"),
@@ -1108,17 +1216,13 @@ def _preferred_provider(model: str) -> str | None:
 def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, ImageProvider]]:
     """Build an ordered list of (label, provider) to try.
 
-    Behaviour:
-      1. All providers with a configured API key are added in the global
-         priority order: OpenAI → Gemini → Seedream → Qwen → MiniMax → LinkAI.
-      2. If `model` natively belongs to one of the providers AND that provider
-         is configured, it is promoted to the front so it gets the first
-         attempt with the right model id.
-      3. If the preferred provider is NOT configured (no API key), the model
-         id would 100% fail on every other backend, so we drop the explicit
-         model and fall back to automatic routing — every provider then uses
-         its own DEFAULT_MODEL.
+    An explicit provider or model pins one backend. Missing credentials and
+    unknown selections are configuration errors, never a reason to change
+    vendors. Only an empty provider and model enable automatic routing in
+    global priority order, with each backend's default model.
     """
+    model = (model or "").strip()
+    provider_id = (provider_id or "").strip().lower()
     # Seedream / Ark credentials: ARK_API_KEY + standard /api/v3.
     ark_key = os.environ.get("ARK_API_KEY", "").strip()
     ark_base = _normalize_ark_base(os.environ.get("ARK_API_BASE", "").strip())
@@ -1131,16 +1235,16 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         openai_key = image_key
         openai_base = image_base or "https://api.openai.com/v1"
     else:
-        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
         openai_base = os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1"
 
     keys = {
         "OpenAI": openai_key,
-        "Gemini": os.environ.get("GEMINI_API_KEY", ""),
+        "Gemini": os.environ.get("GEMINI_API_KEY", "").strip(),
         "Seedream": ark_key,
-        "Qwen": os.environ.get("DASHSCOPE_API_KEY", ""),
-        "MiniMax": os.environ.get("MINIMAX_API_KEY", ""),
-        "LinkAI": os.environ.get("LINKAI_API_KEY", ""),
+        "Qwen": os.environ.get("DASHSCOPE_API_KEY", "").strip(),
+        "MiniMax": os.environ.get("MINIMAX_API_KEY", "").strip(),
+        "LinkAI": os.environ.get("LINKAI_API_KEY", "").strip(),
     }
     bases = {
         "OpenAI": openai_base,
@@ -1154,15 +1258,35 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
     # Provider preference resolution priority:
     #   1. Explicit `provider_id` (UI-persisted, supports custom model names).
     #   2. Model-name prefix inference.
-    pref = _PROVIDER_ID_TO_LABEL.get(provider_id) if provider_id else None
-    if not pref:
+    pref = None
+    if provider_id:
+        pref = _PROVIDER_ID_TO_LABEL.get(provider_id)
+        if not pref:
+            raise ValueError(
+                f"Unknown image provider '{provider_id}'. "
+                f"Supported providers: {', '.join(_PROVIDER_ID_TO_LABEL)}"
+            )
+    elif model:
         pref = _preferred_provider(model)
+        if not pref:
+            raise ValueError(
+                f"Cannot determine an image provider for model '{model}'. "
+                "Specify provider explicitly for a custom model."
+            )
 
-    # If a specific model is requested and its native provider has no key,
-    # other backends won't recognise the id → reset to auto routing.
     if pref and not keys.get(pref):
-        model = ""
-        pref = None
+        credential_names = {
+            "OpenAI": "SKILL_IMAGE_GENERATION_API_KEY or OPENAI_API_KEY",
+            "Gemini": "GEMINI_API_KEY",
+            "Seedream": "ARK_API_KEY",
+            "Qwen": "DASHSCOPE_API_KEY",
+            "MiniMax": "MINIMAX_API_KEY",
+            "LinkAI": "LINKAI_API_KEY",
+        }
+        raise ValueError(
+            f"No API key configured for selected image provider {pref}. "
+            f"Set {credential_names[pref]} via env_config, then try again."
+        )
 
     factories = {
         "OpenAI": OpenAIProvider,
@@ -1172,22 +1296,15 @@ def _build_providers(model: str, provider_id: str = "") -> list[tuple[str, Image
         "MiniMax": MinimaxProvider,
         "LinkAI": LinkAIProvider,
     }
-    available: dict[str, ImageProvider] = {}
-    for label, key in keys.items():
-        if key:
-            available[label] = factories[label](api_key=key, api_base=bases[label], model=model)
-
-    # When a specific model is pinned, only try its native provider — other
-    # backends won't recognise the model id so retrying them is pointless.
-    if pref and pref in available:
-        return [(pref, available[pref])]
+    if pref:
+        provider = factories[pref](api_key=keys[pref], api_base=bases[pref], model=model)
+        return [(pref, provider)]
 
     # Auto routing: try every configured provider in priority order.
-    ordered: list[str] = []
-    for label in _DEFAULT_PROVIDER_ORDER:
-        if label in available:
-            ordered.append(label)
-    return [(label, available[label]) for label in ordered]
+    return [
+        (label, factories[label](api_key=keys[label], api_base=bases[label], model=""))
+        for label in _DEFAULT_PROVIDER_ORDER if keys[label]
+    ]
 
 
 # ---------------------------------------------------------------------------

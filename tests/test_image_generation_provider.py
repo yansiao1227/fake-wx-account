@@ -37,6 +37,7 @@ def generate(monkeypatch):
     monkeypatch.setattr(module, "_load_skill_environment", lambda: None)
     monkeypatch.setattr(module.requests, "post", lambda *_args, **_kwargs: pytest.fail("unmocked HTTP POST"))
     monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: pytest.fail("unmocked HTTP GET"))
+    monkeypatch.setattr(module, "_download_image", lambda *_args: pytest.fail("unmocked image download"))
     return module
 
 
@@ -103,10 +104,9 @@ def test_generation_requests_exactly_one_image_and_saves_base64_absolute_path(ge
 def test_signed_image_url_is_downloaded_immediately_without_generation_authorization(generate, monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(generate.requests, "post", lambda *_args, **_kwargs: response({"data": [{"url": SIGNED_URL}]}))
-    monkeypatch.setattr(generate.requests, "get", lambda url, **kwargs: (
-        calls.append((url, kwargs)) or SimpleNamespace(content=PNG, raise_for_status=lambda: None)))
+    monkeypatch.setattr(generate, "_download_image", lambda url: calls.append(url) or PNG)
     paths = provider(generate).generate("synthetic prompt", output_dir=str(tmp_path))
-    assert calls == [(SIGNED_URL, {"timeout": 60})]
+    assert calls == [SIGNED_URL]
     assert Path(paths[0]).is_absolute() and Path(paths[0]).read_bytes() == PNG
     assert SIGNED_URL not in paths[0]
 
@@ -123,8 +123,7 @@ def test_empty_or_invalid_image_response_cannot_report_success(generate, monkeyp
 @pytest.mark.parametrize("download", [b"", b"<html>expired synthetic link</html>", PNG[:20]])
 def test_empty_or_html_download_is_not_saved_as_image(generate, monkeypatch, tmp_path, download):
     monkeypatch.setattr(generate.requests, "post", lambda *_args, **_kwargs: response({"data": [{"url": SIGNED_URL}]}))
-    monkeypatch.setattr(generate.requests, "get", lambda *_args, **_kwargs: SimpleNamespace(
-        content=download, raise_for_status=lambda: None))
+    monkeypatch.setattr(generate, "_download_image", lambda *_args: download)
     with pytest.raises(RuntimeError):
         provider(generate).generate("synthetic prompt", output_dir=str(tmp_path))
     assert list(tmp_path.iterdir()) == []
@@ -146,7 +145,7 @@ def test_download_transport_error_redacts_url_and_key(generate, monkeypatch, tmp
     def failed_download(*_args, **_kwargs):
         raise RuntimeError(f"synthetic timeout {SIGNED_URL} {IMAGE_KEY}")
 
-    monkeypatch.setattr(generate.requests, "get", failed_download)
+    monkeypatch.setattr(generate, "_download_image", failed_download)
     with pytest.raises(RuntimeError) as error:
         provider(generate).generate("synthetic prompt", output_dir=str(tmp_path))
     assert IMAGE_KEY not in str(error.value) and "synthetic-signature" not in str(error.value)
