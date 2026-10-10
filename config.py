@@ -14,7 +14,7 @@ from common import i18n
 # 根目录 config.py 只加载 config.json 并提供 conf()。
 # available_setting 只登记跨通道通用字段（模型、Agent、channel_type、Web、tools 等），
 # 取值是占位说明，程序不把这里当业务默认值源。
-# 禁止在这里新增 wechat_desktop 白名单、shadow_mode、UIA 节拍等通道业务项；
+# 禁止在这里新增 wechat_desktop 黑名单、shadow_mode、UIA 节拍等通道业务项；
 # 那些字段只写 channel/wechat_desktop/config.py。
 available_setting = {
     # global UI language for CLI, startup logs, error messages, agent prompts
@@ -50,8 +50,6 @@ available_setting = {
     "group_chat_reply_suffix": "",  # auto-reply suffix in group chat; \n inserts a line break
     "group_chat_keyword": [],  # messages containing this keyword trigger a reply in group chat
     "group_at_off": False,  # whether to disable @bot triggering in group chat
-    "group_name_white_list": ["group1", "group2"],  # group names where auto-reply is enabled
-    "group_name_keyword_white_list": [],  # group-name keywords where auto-reply is enabled
     "group_chat_in_one_session": ["group1"],  # group names that share conversation context
     "group_shared_session": False,  # whether group chat shares conversation context (all members share). When False each user has an independent session in the group
     "nick_name_black_list": [],  # user nickname blacklist
@@ -335,15 +333,16 @@ def drag_sensitive(config):
 
 
 def _drop_wechat_desktop_keys_from_global(loaded) -> list[str]:
-    """从外层配置中删除 wechat_desktop 业务键，避免与通道内 config.py 重复。"""
-    from channel.wechat_desktop.config import DEFAULT_CONFIG
+    """删除外层通道业务键和已废弃的自动回复白名单，避免重复或遗留配置。"""
+    from channel.wechat_desktop.config import DEFAULT_CONFIG, RETIRED_AUTO_REPLY_KEYS
 
     dropped = []
     if "wechat_desktop" in loaded:
         del loaded["wechat_desktop"]
         dropped.append("wechat_desktop")
     for key in list(loaded.keys()):
-        if key in DEFAULT_CONFIG:
+        if (key in DEFAULT_CONFIG or key in RETIRED_AUTO_REPLY_KEYS
+                or key in {"group_name_white_list", "group_name_keyword_white_list"}):
             del loaded[key]
             dropped.append(key)
     return dropped
@@ -417,8 +416,8 @@ def load_config():
     dropped_channel_keys = _drop_wechat_desktop_keys_from_global(config)
     if dropped_channel_keys:
         logger.warning(
-            "[INIT] 已从 config.json 删除 wechat_desktop 业务配置: %s；"
-            "请写到 channel/wechat_desktop/config.py",
+            "[INIT] 已从 config.json 删除通道业务或废弃配置: %s；"
+            "现行微信桌面业务配置请写到 channel/wechat_desktop/config.py",
             ", ".join(dropped_channel_keys),
         )
 

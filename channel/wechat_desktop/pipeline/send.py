@@ -107,8 +107,7 @@ class WechatDesktopSendMixin:
             if (
                 bool(self._service.status().get("paused"))
                 or bool(self.config.get("shadow_mode", True))
-                or self._policy.is_blocked(target_name)
-                or not self._policy.is_allowlisted(target_name, is_group)
+                or self._policy.is_blocked(target_name, is_group)
             ):
                 return False
             notice = _format_failure_notice(
@@ -273,10 +272,13 @@ class WechatDesktopSendMixin:
             )
             return
         msg = context.get("msg")
-        target_name = getattr(msg, "other_user_nickname", "") or context.get("receiver", "")
-        target_id = getattr(msg, "other_user_id", "") or context.get("receiver", "")
+        event = getattr(msg, "event", None)
+        target_name = (getattr(event, "conversation_name", "")
+                       or getattr(msg, "other_user_nickname", "") or context.get("receiver", ""))
+        target_id = (getattr(event, "conversation_id", "")
+                     or getattr(msg, "other_user_id", "") or context.get("receiver", ""))
         send_target = (target_id or target_name)
-        is_group = bool(context.get("isgroup", False))
+        is_group = bool(getattr(event, "is_group", context.get("isgroup", False)))
         source_type = str(
             context.get("wechat_desktop_source_type", "unknown")
         ).strip().lower()
@@ -350,7 +352,6 @@ class WechatDesktopSendMixin:
             )
             if can_auto:
                 try:
-                    event = getattr(msg, "event", None)
                     if not self._validate_source_before_reply(event, context, target_name, reply_text, "text"):
                         return
                     self._mark_lifecycle(source_event_ids, "send_started")
@@ -443,7 +444,6 @@ class WechatDesktopSendMixin:
             )
             if can_auto:
                 try:
-                    event = getattr(msg, "event", None)
                     if not self._validate_source_before_reply(event, context, target_name, reply.content, "image"):
                         return
                     self._mark_lifecycle(source_event_ids, "send_started")
@@ -568,7 +568,7 @@ class WechatDesktopSendMixin:
         """供 Agent 读取历史、查询联系人或主动发送文字的受限入口。
 
         读取为只读操作，不触发会话切换或持久化；发送路径继续遵守暂停、
-        黑名单、白名单和限流规则，并要求后端验证发送结果。
+        对应会话类型的黑名单和限流规则，并要求后端验证发送结果。
         """
         if action not in {"read_history", "search_contacts", "send_text"}:
             return {
@@ -692,7 +692,7 @@ class WechatDesktopSendMixin:
         conversation_id = target.conversation_id
         conversation = target.display_name
         is_group = target.is_group
-        if self._policy.is_blocked(conversation):
+        if self._policy.is_blocked(conversation, is_group):
             return {
                 "status": "blocked",
                 "message": "conversation is in the WeChat reply blacklist",

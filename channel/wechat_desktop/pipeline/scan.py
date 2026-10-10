@@ -140,14 +140,11 @@ class WechatDesktopScanMixin:
             self._store.mark_event_processed(event.event_id, "skipped", reason)
             self._finish_lifecycle([event.event_id], "skipped")
             return
-        if (
-            self._policy.is_blocked(event.conversation_name)
-            or self._policy.is_blocked(event.sender_name)
-        ):
+        if self._policy.is_blocked(event.conversation_name, event.is_group):
             logger.info(
-                "[WechatDesktop] ignored blacklisted sender/conversation: %s / %s",
-                event.sender_name,
+                "[WechatDesktop] ignored blacklisted conversation: %s (is_group=%s)",
                 event.conversation_name,
+                event.is_group,
             )
             self._trace(
                 "08-skip",
@@ -156,7 +153,7 @@ class WechatDesktopScanMixin:
                 event.conversation_name,
                 event.sender_name,
             )
-            self._store.mark_event_processed(event.event_id)
+            self._store.mark_event_processed(event.event_id, "skipped", "blacklist")
             self._finish_lifecycle([event.event_id], "skipped")
             return
         if event.source_type not in {"private", "group"}:

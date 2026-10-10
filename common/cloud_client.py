@@ -847,7 +847,6 @@ def _build_config():
         "group_chat_prefix": local_conf.get("group_chat_prefix"),
         "group_chat_reply_prefix": local_conf.get("group_chat_reply_prefix"),
         "group_chat_reply_suffix": local_conf.get("group_chat_reply_suffix"),
-        "group_name_white_list": local_conf.get("group_name_white_list"),
         "nick_name_black_list": local_conf.get("nick_name_black_list"),
         "speech_recognition": "Y" if local_conf.get("speech_recognition") else "N",
         "text_to_image": local_conf.get("text_to_image"),

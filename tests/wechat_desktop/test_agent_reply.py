@@ -277,8 +277,7 @@ def test_agent_error_sends_one_final_failure_notice():
     channel._reply_queue = reply_queue
     channel._service = SimpleNamespace(status=lambda: {"paused": False})
     channel._policy = SimpleNamespace(
-        is_blocked=lambda _target: False,
-        is_allowlisted=lambda _target, _is_group: True,
+        is_blocked=lambda _target, _is_group: False,
         allows_send=lambda *_args, **_kwargs: True,
         reserve_send=lambda _units=1: True,
     )
@@ -382,8 +381,7 @@ def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fa
     )
     channel._service = SimpleNamespace(status=lambda: {"paused": False})
     channel._policy = SimpleNamespace(
-        is_blocked=lambda target: False,
-        is_allowlisted=lambda *args: True,
+        is_blocked=lambda _target, _is_group: False,
         allows_send=lambda *args, **kwargs: True,
         reserve_send=lambda units: True,
     )

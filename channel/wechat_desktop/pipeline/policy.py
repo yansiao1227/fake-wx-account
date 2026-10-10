@@ -7,34 +7,22 @@ from channel.wechat_desktop.triggers import group_message_triggered
 
 
 class WechatDesktopPolicy:
-    """集中处理白名单、黑名单、群触发方式和发送频率限制。"""
+    """集中处理私聊/群聊黑名单、群触发方式和发送频率限制。"""
 
     def __init__(self, config: dict, store):
         self.config = config
         self.store = store
 
     @staticmethod
-    def _matches(value: str, allowed: Iterable[str]) -> bool:
+    def _matches(value: str, entries: Iterable[str]) -> bool:
         normalized = str(value or "").strip().casefold()
-        return any(normalized == str(item).strip().casefold() for item in allowed or [])
+        return any(normalized == str(item).strip().casefold() for item in entries or [])
 
-    def is_allowlisted(self, target: str, is_group: bool) -> bool:
-        """检查联系人或群聊是否允许自动回复。"""
+    def is_blocked(self, target: str, is_group: bool) -> bool:
+        """只检查对应会话类型的黑名单，群成员不按私聊黑名单过滤。"""
 
-        allow_all_key = (
-            "auto_reply_groups_all" if is_group else "auto_reply_private_all"
-        )
-        if bool(self.config.get(allow_all_key, False)):
-            return True
-        key = "auto_reply_groups" if is_group else "auto_reply_contacts"
+        key = "auto_reply_group_blacklist" if is_group else "auto_reply_private_blacklist"
         return self._matches(target, self.config.get(key, []))
-
-    def is_blocked(self, target: str) -> bool:
-        """黑名单优先级高于全部放行和白名单。"""
-
-        return self._matches(
-            target, self.config.get("auto_reply_blacklist", [])
-        )
 
     def group_triggered(self, event: WechatDesktopEvent) -> bool:
         """根据群回复模式判断消息是否触发 Agent。"""
@@ -45,9 +33,7 @@ class WechatDesktopPolicy:
 
     def allows_send(self, target: str, is_group: bool, content_type: str) -> bool:
         """无副作用的策略检查；发送额度由发送服务在操作前预留。"""
-        if bool(self.config.get("shadow_mode", True)) or self.is_blocked(target):
-            return False
-        if not self.is_allowlisted(target, is_group):
+        if bool(self.config.get("shadow_mode", True)) or self.is_blocked(target, is_group):
             return False
         return content_type == "text" or (
             content_type == "image" and bool(self.config.get("auto_send_images", False))

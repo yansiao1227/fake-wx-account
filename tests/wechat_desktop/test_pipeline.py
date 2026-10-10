@@ -645,8 +645,7 @@ def test_reply_timeout_sends_final_failure_notice():
         update_status=lambda **_kwargs: None,
     )
     channel._policy = SimpleNamespace(
-        is_blocked=lambda _target: False,
-        is_allowlisted=lambda _target, _is_group: True,
+        is_blocked=lambda _target, _is_group: False,
         allows_send=lambda *_args, **_kwargs: True,
         reserve_send=lambda _units=1: True,
     )
