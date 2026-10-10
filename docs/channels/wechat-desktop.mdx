@@ -1,23 +1,40 @@
 ---
 title: Desktop WeChat Automation
-description: Control one WeChat 4.1.9.30 window with Windows UI Automation
+description: Receive messages from local WeChat databases and use Windows UI Automation for actions
 ---
 
-The `wechat_desktop` channel controls a locally logged-in WeChat 4.1.9.30 client through Windows UI Automation. It does not use screenshots, OCR, a vision model, or a separate automation server.
+The `wechat_desktop` channel uses the `db_uia` backend on Windows. Local encrypted WeChat databases are the sole source of incoming messages, contacts, and chat history. Windows UI Automation (UIA) handles conversation targeting, sending, and necessary attachment actions. There is no UIA message-reception backend or Shell Hook listener.
 
-## Install
+The implementation targets WeChat **4.1.9.30** and the workstation's **Python 3.13.11 x64** Conda environment. Database access is read-only; it does not modify WeChat's process memory or original databases. Only data already synchronized to this computer is available.
 
-Use Windows 10/11 and Python 3.13+:
+## Architecture
+
+| Component | Responsibility |
+| --- | --- |
+| `backend.py` / `hybrid.py` | Public backend contract and composition of database access with UIA actions |
+| `db/source.py` | Account lifecycle, fixed startup baseline, per-source pagination, and batch acknowledgements |
+| `db/reader.py`, `db/cache.py` | Database discovery, authenticated decryption, WAL refresh, schema and message parsing |
+| `binding.py` | Bind stable database conversation IDs to a unique account, window, and UIA row |
+| `uia/gateway.py`, `uia/materializer.py` | Shared UI-operation leases, sending, and verified attachment materialization |
+| `pipeline/`, `storage/` | Admission policy, aggregation, reply queue, Agent execution, delivery records, and atomic source receipts |
+
+The database package does not depend on UIA. Database observation, contact search, and history queries with an explicit conversation ID do not initialize the UIA gateway, activate WeChat, or run OCR. Reading the current chat's history uses a passive UIA title and account check to identify the database conversation. Actual sending and necessary attachment materialization may activate WeChat.
+
+Ordinary sends use separate UIA bubble snapshots without OCR. OCR is loaded only when needed by explicit UIA history diagnostics or the share-card copy-link menu fallback; it is not preloaded at startup.
+
+## Install and start
+
+Use Windows 10/11 and the `cowagent-wechat` Conda environment. On this workstation, verify the interpreter before running any Python command:
 
 ```powershell
-python -m pip install -r requirements-windows.txt
+Set-Location D:\workshop\repositories\fake-wx-account
+D:\Miniconda\envs\cowagent-wechat\python.exe -c "import sys; print(sys.executable)"
+D:\Miniconda\envs\cowagent-wechat\python.exe -m pip install -r requirements-windows.txt
 ```
 
-Start and sign in to exactly one desktop WeChat instance, then configure:
+The verification output must be `D:\Miniconda\envs\cowagent-wechat\python.exe`. Dependencies include `pycryptodome` and `zstandard==0.25.0`; the full upstream automation package is not installed.
 
-Channel business settings live only in `channel/wechat_desktop/config.py`. Root
-`config.json` holds generic items such as model and `channel_type`; do **not**
-add a `wechat_desktop` block. To enable the channel:
+Sign in to one WeChat instance. Channel business settings live only in `channel/wechat_desktop/config.py`. Root `config.json` holds generic model, Agent, and process settings; enable the channel with:
 
 ```json
 {
@@ -25,34 +42,111 @@ add a `wechat_desktop` block. To enable the channel:
 }
 ```
 
-Set `self_display_name`, `shadow_mode`, allowlists, and UIA timing in
-`channel/wechat_desktop/config.py`. `self_display_name` is used when WeChat does
-not expose the current account through UIA. Automatic sending stops if it
-conflicts with an account name exposed by the client.
+Do not add a `wechat_desktop` block or channel settings to the root JSON. Store provider credentials in `~/.cow/.env`, not in this channel's configuration or documentation.
 
-## Message processing
+Before a first controlled verification, stop the project and set these entries in the channel's `DEFAULT_CONFIG`:
 
-Windows Shell Hook taskbar-flash events wake the observer. A session-row check runs every 15 seconds to catch foreground messages and suppressed notifications. The channel reads at most five already visible message bubbles and never scrolls for older history.
-
-Each changed conversation is read as one snapshot of at most five visible UIA bubbles. Private chats select only the latest incoming bubble after the last outgoing bubble. Group chats select only the latest incoming bubble that explicitly mentions the owner. Every other bubble is context, not a separate reply task. Direction comes exclusively from bubble/avatar geometry; private chats do not depend on display names.
-
-Incoming targets enter one global in-memory FIFO. Only one target can run through the Agent and reply path at a time. A newer target from the same queued conversation replaces the older target; if the target changes during generation, token checks and a final UIA revalidation discard the stale result. Replies are sent directly through UIA without approval. The queue is intentionally discarded when CowAgent stops.
-
-Shell Hook reconciliation, focus, conversation selection, paste, and send operations use bounded interruptible pacing. Sends are spaced by 2–5 seconds globally and at least 5 seconds per conversation by default. Uncertain sends are never retried automatically.
-
-For groups, the session row must report `[有人@我]`, and each individual bubble must itself contain `@<self_display_name>`. Later non-mentioned bubbles are not queued merely because an earlier message mentioned the account.
-
-Conversation titles are display labels, not identifiers. Duplicate names are separated with each UIA row's RuntimeId and visible-row index. In group previews, a `sender:` prefix identifies the latest message as coming from another member; a preview without that prefix is not treated as a new incoming message from that row alone.
-
-If WeChat is in the background it is restored before inspection. An empty UIA tree triggers at most three taskbar recovery attempts. All UIA reads and sends share one operation lock.
-
-## Smoke test
-
-The diagnostic report includes raw conversation names and message text, but does not take screenshots:
-
-```powershell
-python scripts/test_wechat_uia.py
-python scripts/test_wechat_uia.py --conversation "File Transfer"
+```python
+"desktop_backend": "db_uia",
+"shadow_mode": True,
+"db_data_dir": "",
+"db_account": "",
+"db_poll_interval_seconds": 1.0,
+"db_cache_dir": "",
 ```
 
-Review diagnostic reports before sharing them. Sending occurs only when both `--send-to` and `--text` are supplied.
+`db_uia` is the only supported backend. An empty data path triggers discovery; an empty account setting is accepted only when the logged-in account can be uniquely authenticated. For ambiguous accounts or a nonstandard location, explicitly set the data directory and account directory name or path. Do not infer the account from file modification times.
+
+Review `auto_reply_private_all`, `auto_reply_groups_all`, the contact/group allowlists, the blacklist, and `group_reply_mode` before enabling replies. The current configuration allows all private chats and groups, subject to the blacklist; groups still require a native mention under `at_only`. `shadow_mode` currently defaults to `False`, so set it explicitly for verification. `self_display_name` is not used to infer database message direction.
+
+`shadow_mode` prevents outgoing content only. The normal channel may still execute the Agent and necessary attachment materialization. Use the dedicated `--shadow-seconds` diagnostic below to verify database reception without those actions.
+
+Start in the foreground:
+
+```powershell
+.\cow.ps1 start
+```
+
+`cow.ps1` supports only `start`, `stop`, `restart`, and `status`. It resolves the `cowagent-wechat` environment through Conda, prints logs in the current terminal, and disables automatic browser opening. With the repository's Web configuration, the console is available at `http://127.0.0.1:9899`. Use `Ctrl+C` to stop normally; configuration changes require a process restart.
+
+Current text and one-level references containing HTTP/HTTPS links are passed to the Agent's `analyze-url` skill or general tools before answering. Dynamic share pages can use `browser`; static pages can use `web_fetch`, while file URLs are parsed by file type. Trusted existing page content is reused, and unrelated history links are not opened automatically. A native share URL does not require UIA bubble matching; verified WeChat UIA materialization remains available when the URL is missing. Page access failures must be reported without guessing from the title.
+
+## Automatic reply flow
+
+Quoted messages first use the native `svrid` to find a unique original across database shards within the same account and conversation. This restores full text, file names, and share links without changing receive cursors. Only one reference level is expanded. The original's identity, generation, and content signature are checked during materialization, before Agent execution, and before sending. Deleted, changed, or ambiguous originals are rejected. UIA remains available for verified attachment access or missing original previews; the old filename cache and UIA-only receive resolver have been removed.
+
+1. The source polls the databases, by default every second. Every native message has an identity containing the account, shard, table, and primary key. Identical text and repeated primary keys in different shards remain distinct messages.
+2. The reader returns a source batch and records why outgoing, system, or unresolved-direction rows are filtered. Storage commits source deduplication, events, filter records, conversation history, and per-source cursors in one transaction. A failed commit leaves the cursor unchanged and redelivers the batch. A successful commit permits ACK; a lost ACK does not enqueue duplicate replies.
+3. Routing admits incoming live messages and eligible startup unread messages, then applies blacklist and group-trigger rules. Native database `@` metadata determines whether a group message mentions the account; session previews and `[有人@我]` UI labels are not reception requirements.
+4. Private messages may be aggregated in a sliding window before execution. Groups are not aggregated. Tasks then enter a bounded global FIFO; new messages do not replace a queued task or cancel one being generated. Only explicit `/steer` and `/cancel` commands use the control path.
+5. Live events carry native preceding history, or one explicit reference fragment. Text does not require reopening a chat to collect context. Attachment work is performed only when needed; referenced attachment actions are deferred until the task reaches the reply queue's head.
+6. The Agent uses the admitted message and context to generate a reply and call tools. All outgoing content, including tool-progress and failure notices, passes through the same shadow-mode, pause, allowlist/blacklist, rate-limit, and cancellation checks.
+7. Sending binds the database conversation to the actual WeChat account, window, RuntimeId, selected state, and title. Each UI sending segment revalidates the authorized target and lifecycle before submission. Duplicate names, changed bindings, or an account mismatch block sending. UIA does not expose native conversation identity, so successful bindings explicitly report `display_name` verification.
+
+First startup fixes the existing-history baseline once. Only a proven unread boundary enables the startup-unread policy. Restart catch-up normally records history and receipts without replying to offline messages; interrupted reply tasks and uncertain sends are not automatically replayed. ACK means receipt was persisted, not that a reply was sent.
+
+Once the send button has been attempted, stale input values or unknown bubbles do not justify another Enter press. Unconfirmed results remain `uncertain` or otherwise unverified and are not retried automatically. Native validation covers the complete body and quote/share structures; materialized paths do not replace native content evidence.
+
+## When databases are decrypted
+
+| Operation | Database work | UI work |
+| --- | --- | --- |
+| Construct the backend | Create source/binding objects; the reader remains lazy | None |
+| First observation or database query | Authenticate the account, acquire/validate keys, then build verified decrypted snapshots | None for observation or explicit-ID queries |
+| Poll unchanged files | Inspect database/WAL state; do not decrypt pages or rebuild snapshots | None |
+| Append within one WAL generation | Verify new frames, page HMACs, checksums, and committed boundaries; publish only committed data | None |
+| Checkpoint, WAL reset/truncation, or database replacement | Rebuild the snapshot | None |
+| Contact/history/target validation | Refresh when necessary and query the verified snapshot; do not advance reception cursors | Passive identity checks only when a UI target is needed |
+
+Initial refresh decrypts the main database and incorporates verified committed WAL frames. Snapshot refresh holds the shared locks required by SQLite's WAL protocol to avoid races with commits and checkpoints. Full rebuilds can hold those locks longer as database size grows; lock contention is retried. A refresh failure keeps the last verified snapshot, marks it stale, pauses new event delivery, and preserves cursors. There is no automatic switch to UIA reception.
+
+The default cache is `<agent_workspace>/wechat_desktop_db/<account_id>/`. Windows DPAPI protects persisted database keys, and directory ACLs restrict access to the current user and LocalSystem. Decrypted snapshots contain plaintext chat data; each reader owns separate snapshot files and deletes them when closed. A restarted or recreated reader performs a new full initial refresh. Key caching does not eliminate account authentication or all process scanning.
+
+Discovery covers `contact.db`, numeric `message_*.db` shards, and auxiliary `session.db` for startup-unread boundaries. `sns.db`, Moments, and encrypted media-file decoding are outside the current implementation.
+
+## Contacts, history, and attachments
+
+Contact search through the `wechat_desktop` tool returns stable conversation IDs:
+
+```json
+{"action": "search_contacts", "query": "contact or group name", "limit": 20}
+```
+
+Pass the returned ID to `wechat_history`:
+
+```json
+{"conversation_id": "the exact returned ID", "limit": 20}
+```
+
+History defaults to 20 messages and permits at most 50. Results include native message identity, time, direction, sender, and source. Omitting `conversation_id` passively maps the current UI title to one unique database conversation. Neither query triggers a reply or changes the live cursor.
+
+Standalone images and share cards are observed without opening them. Standalone files may be cached; explicit references can request an image, file, or share-card body. The project does not treat a previously cached attachment as the implicit subject of a later text message.
+
+Attachment materialization first needs UIA `ScrollPattern` evidence that the chat is at the bottom. It then requires a unique suffix alignment between at most 50 database rows and 20 visible UI messages, at least two distinct normalized `(type, content)` anchors, and a unique target appearance and RuntimeId. Immediately before materialization it rechecks the account, window, native row, and both sequences. Failed verification returns `attachment_identity_unavailable` and refuses the attachment click. Native ScrollPattern coverage on the target client still needs real-machine validation; unavailable evidence must not be bypassed.
+
+Database attachment retrieval does not search cross-account caches by filename, size, or modification time. It uses the verified bubble's copied path or download/Save As flow and rechecks account, window, current conversation, and RuntimeId during waits. Cached materialized paths are tied to native message identity and do not replace verification.
+
+## Verification and provenance
+
+For isolated database verification without Agent execution or sending:
+
+```powershell
+D:\Miniconda\envs\cowagent-wechat\python.exe scripts\wechat_db_doctor.py --schema
+D:\Miniconda\envs\cowagent-wechat\python.exe scripts\wechat_db_doctor.py --shadow-seconds 60
+```
+
+Optional arguments include `--data-dir`, `--account`, `--cache-dir`, and `--conversation-id`. Shadow diagnostics use a separate ledger under the account cache, report health and performance, and check that history queries leave the cursor unchanged. The ledger contains chat data even though diagnostic output omits message content and keys.
+
+`--benchmark-uia` explicitly compares current UI history access; it is a diagnostic capability, not a reception fallback. UI diagnostics may use OCR or operate windows. `scripts/test_wechat_uia.py` and `scripts/dump_wechat_conversation_tree.py` remain for manual UI diagnosis; their reports can contain raw chat text. `--send-smoke`, or `--send-to` together with `--text`, performs real sends.
+
+Run regression tests with the required interpreter:
+
+```powershell
+D:\Miniconda\envs\cowagent-wechat\python.exe -m pytest tests/wechat_desktop -q
+```
+
+Boundary regressions include `test_database_only_backend.py`, `test_db_passive_ui.py`, `test_db_reply_context.py`, `test_db_uia_attachment_bridge.py`, `test_uia_materializer.py`, and `test_uia_passive_reads.py`.
+
+Synthetic database and control tests do not establish real-account compatibility, attachment ScrollPattern availability, controlled incoming-message delivery, or live WAL performance. Validate those separately in shadow mode before enabling automatic replies.
+
+Database format parsing references [wechatauto-replica at commit `fbfb02677f8f5c8d52be166dc2a662a836f1354d`](https://github.com/fanyuantaier/wechatauto-replica/tree/fbfb02677f8f5c8d52be166dc2a662a836f1354d). Attribution and the upstream Apache 2.0 license are retained in `channel/wechat_desktop/db/NOTICE` and `UPSTREAM_LICENSE.txt`. The private cache, authentication checks, source ledger, and UIA composition are implemented within this project.

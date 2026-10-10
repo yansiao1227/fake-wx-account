@@ -1,5 +1,6 @@
 """会话类型与人数后缀的安全回归；全部使用替身，不操作真实微信。"""
 
+import sqlite3
 import threading
 from contextlib import nullcontext
 from dataclasses import replace
@@ -11,28 +12,34 @@ from channel.wechat_desktop.binding import DatabaseUiaTargetBinder
 from channel.wechat_desktop.contracts import ConversationTarget, SendStatus, TargetStatus
 from channel.wechat_desktop.conversation import conversation_titles_match
 from channel.wechat_desktop.db.errors import DatabaseReadError
+from channel.wechat_desktop.hybrid import WechatDatabaseBackend
 from channel.wechat_desktop.models import HeaderInfo, OwnerInfo
 from channel.wechat_desktop.send_control import current_send_target, mark_send_submitted, send_target_scope
+from channel.wechat_desktop.storage.store import WechatDesktopStore
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
 from channel.wechat_desktop.uia.gateway import WechatUiaGateway
-from .helpers import FakeClient, FakeHook, incoming, row
+from .helpers import FakeClient, row
+from .test_db_reader import add_message, make_reader
 
 
-def make_binder(name="Alice", *, group=False, ui_title=None):
+def make_binder(name="Alice", *, group=False, ui_title=None, extra_contacts=()):
     contact = {"conversation_id": "db-session:alice", "display_name": name,
                "username": "alice", "is_group": group}
+    contacts = [contact, *extra_contacts]
     reader = SimpleNamespace(
         binding=SimpleNamespace(pid=42, wxid="owner"), account_id="account",
         refresh=lambda: None,
         get_contact_by_username=lambda username: {},
-        get_contact_by_conversation_id=lambda identity: contact if identity == contact["conversation_id"] else None,
-        match_contacts=lambda title: [contact] if title == contact["username"] or
-        conversation_titles_match(title, contact["display_name"]) else [],
+        get_contact_by_conversation_id=lambda identity: next(
+            (item for item in contacts if identity == item["conversation_id"]), None),
+        match_contacts=lambda title: [item for item in contacts if title == item["username"] or
+                                      conversation_titles_match(title, item["display_name"])],
     )
     source = SimpleNamespace(session_epoch="epoch", reader_session=lambda: nullcontext(reader))
     bound = []
     client = FakeClient()
+    client.get_owner_info_passive = lambda: OwnerInfo("小牛", "owner")
+    client.get_owner_window_handle = lambda: 123
     title = ui_title if ui_title is not None else name
     client.rows = [row(title, runtime_id="alice-row")]
     client.headers["alice-row"] = HeaderInfo(title, "group" if group else "private")
@@ -102,152 +109,200 @@ def test_database_current_chat_requires_known_type():
         binder.current_conversation()
 
 
-def make_driver(*, name="Alice", kind="private", known_group=False):
-    client = FakeClient()
-    client.rows = [row(name, runtime_id="alice-row", mention=known_group)]
-    client.headers["alice-row"] = HeaderInfo(name, kind)
-    client.histories["alice-row"] = [incoming("请回答", "first")]
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True, "group_reply_mode": "all",
-         "auto_reply_groups": [name] if known_group else []},
-        client=client, shell_hook=FakeHook(),
-    )
-    return driver, client
+@pytest.fixture
+def database_receiver(tmp_path, monkeypatch):
+    instances = []
+
+    def make(*, name="Alice", group=False, ui_kind="private", ui_title=None):
+        directory = tmp_path / str(len(instances))
+        directory.mkdir()
+        reader, talker = make_reader(directory, group=group)
+        contact_cache = reader.caches["contact/contact.db"]
+        with sqlite3.connect(contact_cache.path) as connection:
+            connection.execute("UPDATE contact SET nick_name=?,remark=? WHERE username=?",
+                               (name, name, talker))
+        contact_cache.changed = True
+        reader.refresh()
+        store = WechatDesktopStore(str(directory / "ledger.sqlite3"))
+        client = FakeClient()
+        client.rows = [row(name, runtime_id="alice-row")]
+        client.headers["alice-row"] = HeaderInfo(ui_title or name, ui_kind)
+        instance = WechatDatabaseBackend({}, db_reader=reader, store=store, client=client)
+        monkeypatch.setattr(instance, "_actions", lambda: pytest.fail("数据库接收和来源验证不得初始化 UIA"))
+        instances.append((instance, store))
+        assert instance.observe_events()[1] == []
+        return instance, reader, store, client, talker
+
+    yield make
+    for instance, store in instances:
+        instance.close()
+        store._get_connection().close()
 
 
-@pytest.mark.parametrize("known_group", [False, True])
-def test_unknown_scan_header_never_emits_replyable_events_and_retries(known_group):
-    driver, client = make_driver(kind="unknown", known_group=known_group)
-    _, events = driver.observe_events()
-    assert events == []
-    assert client.history_calls == []
-    assert driver._retry_conversations
-    client.headers["alice-row"] = HeaderInfo("Alice", "private")
-    client.rows = [replace(client.rows[0], not_read_number=0, mentions_self=False)]
-    _, recovered = driver.observe_events()
-    assert len(recovered) == 1
-    assert recovered[0].source_type == "private"
+def receive_message(receiver, local_id=1, content="请回答"):
+    instance, reader, store, _, talker = receiver
+    add_message(reader.caches["message/message_0.db"], talker, local_id, content=content)
+    observation, events = instance.observe_events()
+    assert len(events) == 1
+    assert store.receive_source_batch(observation["source_batch"])[0].accepted
+    instance.acknowledge_events([observation["source_batch"].batch_id])
+    return events[0]
 
 
-def test_unknown_reply_monitor_header_never_emits_new_events():
-    driver, client = make_driver()
-    _, initial = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in initial])
-    driver.begin_reply_cycle("Alice", initial[0].conversation_id)
+@pytest.mark.parametrize("group", [False, True])
+def test_database_receipt_uses_native_type_without_known_ui_header(database_receiver, group):
+    receiver = database_receiver(group=group, ui_kind="unknown")
+    event = receive_message(receiver)
+    instance, reader, _, client, talker = receiver
+    assert event.source_type == ("group" if group else "private")
+    assert event.is_group is group
+    assert event.conversation_id == reader.conversation_id(talker)
+    assert instance.validate_reply_target(event).valid
+    assert not instance.uia_initialized
+    assert client.history_calls == [] and client.focus_calls == 0 and client.owner_calls == 0
+
+
+def test_unknown_ui_header_during_reply_does_not_suppress_native_new_message(database_receiver):
+    receiver = database_receiver()
+    first = receive_message(receiver)
+    instance, _, _, client, _ = receiver
     client.headers["alice-row"] = HeaderInfo("Alice", "unknown")
-    client.histories["alice-row"].append(incoming("后续消息", "second"))
-    history_calls = len(client.history_calls)
-    _, events = driver.observe_events()
-    assert events == []
-    assert len(client.history_calls) == history_calls
+    second = receive_message(receiver, 2, "后续消息")
+    assert second.source_message_id != first.source_message_id
+    assert second.source_type == "private"
+    assert instance.validate_reply_target(first).valid and instance.validate_reply_target(second).valid
+    assert not instance.uia_initialized and client.history_calls == []
 
 
 @pytest.mark.parametrize("group", [False, True])
 @pytest.mark.parametrize("changed_type", ["unknown", "opposite"])
-def test_reply_source_revalidation_rejects_unconfirmed_or_changed_type(group, changed_type):
-    driver, client = make_driver(kind="group" if group else "private")
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    assert len(events) == 1
+def test_native_reply_source_revalidation_rejects_unconfirmed_or_changed_type(
+        database_receiver, group, changed_type):
+    receiver = database_receiver(group=group)
+    event = receive_message(receiver)
+    instance = receiver[0]
+    assert instance.validate_reply_target(event).valid
     kind = "unknown" if changed_type == "unknown" else "private" if group else "group"
-    client.headers["alice-row"] = HeaderInfo("Alice", kind)
-    assert not driver.validate_reply_target(events[0]).valid
+    assert not instance.validate_reply_target(replace(event, source_type=kind)).valid
+    assert not instance.uia_initialized and receiver[3].history_calls == []
 
 
-def test_private_reply_source_revalidation_rejects_suffix_title_collision():
-    driver, client = make_driver()
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    client.headers["alice-row"] = HeaderInfo("Alice(1)", "private")
-    assert not driver.validate_reply_target(events[0]).valid
+@pytest.mark.parametrize("group", [False, True])
+def test_native_reply_source_revalidation_rejects_changed_group_flag(database_receiver, group):
+    receiver = database_receiver(group=group)
+    event = receive_message(receiver)
+    assert not receiver[0].validate_reply_target(replace(event, is_group=not group)).valid
+    assert not receiver[0].uia_initialized
 
 
-def test_reply_source_revalidation_rejects_event_with_unknown_type():
-    driver, _ = make_driver()
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    assert not driver.validate_reply_target(replace(events[0], source_type="unknown")).valid
+def test_private_native_reply_source_rejects_different_suffix_named_conversation(database_receiver):
+    receiver = database_receiver()
+    event = receive_message(receiver)
+    instance, reader, _, client, _ = receiver
+    cache = reader.caches["contact/contact.db"]
+    with sqlite3.connect(cache.path) as connection:
+        connection.execute("INSERT INTO contact VALUES ('alice-count-user','Alice(1)','Alice(1)','')")
+    cache.changed = True
+    collision = replace(event, conversation_id=reader.conversation_id("alice-count-user"),
+                        conversation_name="Alice(1)")
+    assert not instance.validate_reply_target(collision).valid
+    assert instance.validate_reply_target(event).valid
+    assert not instance.uia_initialized and client.history_calls == []
 
 
-def test_private_scan_rejects_suffix_title_collision():
-    driver, client = make_driver()
-    client.headers["alice-row"] = HeaderInfo("Alice(1)", "private")
-    assert driver.observe_events()[1] == []
-    assert client.history_calls == []
+def test_native_reply_source_revalidation_rejects_event_without_source_identity(database_receiver):
+    receiver = database_receiver()
+    event = receive_message(receiver)
+    assert not receiver[0].validate_reply_target(replace(event, source_message_id="")).valid
+    assert not receiver[0].validate_reply_target(replace(event, source_stream_id="")).valid
+    assert not receiver[0].uia_initialized
 
 
-def test_private_send_resolution_rejects_suffix_title_collision():
-    driver, client = make_driver()
-    driver.observe_events()
-    client.headers["alice-row"] = HeaderInfo("Alice(1)", "private")
-    assert driver.resolve_send_target("uia-session:alice-row").status == TargetStatus.STALE
+def test_private_database_receipt_keeps_native_identity_despite_ui_suffix_collision(database_receiver):
+    receiver = database_receiver(ui_title="Alice(1)")
+    event = receive_message(receiver)
+    instance, reader, _, client, talker = receiver
+    assert event.conversation_id == reader.conversation_id(talker)
+    assert event.conversation_name == "Alice" and not event.is_group
+    assert instance.validate_reply_target(event).valid
+    assert not instance.uia_initialized and client.history_calls == []
+
+
+def test_private_send_binding_rejects_suffix_header_collision():
+    binder, gateway, bound = make_binder()
+    gateway.client.headers["alice-row"] = HeaderInfo("Alice(1)", "private")
+    assert binder.resolve_target("db-session:alice").status == TargetStatus.STALE
+    assert bound == []
 
 
 @pytest.mark.parametrize("observed,requested", [("Alice", "Alice(1)"),
                                               ("Alice(1)", "Alice"),
                                               ("Alice", "Alice（1）")])
-@pytest.mark.parametrize("known_group", [False, True])
-def test_private_active_send_resolution_never_strips_requested_name_suffix(observed, requested, known_group):
-    driver, _ = make_driver(name=observed, known_group=known_group)
-    driver.observe_events()
-    resolution = driver.resolve_send_target(requested)
-    assert resolution.status != TargetStatus.RESOLVED
+@pytest.mark.parametrize("configured_group", [False, True])
+def test_private_database_send_resolution_never_strips_requested_suffix(observed, requested, configured_group):
+    binder, gateway, bound = make_binder(observed)
+    gateway.config["auto_reply_groups"] = [observed] if configured_group else []
+    resolution = binder.resolve_send_target(requested)
+    assert resolution.status == TargetStatus.NOT_FOUND
     assert resolution.target is None
+    assert bound == [] and gateway.client.focus_calls == 0
 
 
-@pytest.mark.parametrize("requested,identity", [("Alice", "uia-session:alice-row"),
-                                               ("Alice(1)", "uia-session:alice-count-row")])
-def test_active_send_resolution_prefers_exact_display_name_over_suffix_alias(requested, identity):
-    driver, client = make_driver()
-    client.rows = [row("Alice", unread=0, runtime_id="alice-row"),
-                   row("Alice(1)", unread=0, runtime_id="alice-count-row")]
+@pytest.mark.parametrize("requested,identity", [("Alice", "db-session:alice"),
+                                               ("Alice(1)", "db-session:alice-count")])
+def test_database_send_resolution_prefers_exact_private_display_name_over_suffix_alias(requested, identity):
+    counted = {"conversation_id": "db-session:alice-count", "display_name": "Alice(1)",
+               "username": "alice-count", "is_group": False}
+    binder, gateway, bound = make_binder(extra_contacts=[counted])
+    client = gateway.client
+    client.rows.append(row("Alice(1)", unread=0, runtime_id="alice-count-row"))
     client.headers["alice-count-row"] = HeaderInfo("Alice(1)", "private")
-    driver.observe_events()
-    candidate = driver.resolve_target(requested)
-    assert candidate.status == TargetStatus.RESOLVED
-    assert candidate.target.conversation_id == identity
-    resolution = driver.resolve_send_target(requested)
+    resolution = binder.resolve_send_target(requested)
     assert resolution.status == TargetStatus.RESOLVED
     assert resolution.target == ConversationTarget(identity, requested, False)
+    assert bound == [] and client.focus_calls == 0
+    candidate = binder.resolve_target(requested)
+    assert candidate.status == TargetStatus.RESOLVED
+    assert candidate.target == resolution.target
+    assert bound[0][0] == identity
+    assert bound[0][1].runtime_id == ("alice-row" if requested == "Alice" else "alice-count-row")
 
 
-def test_private_active_send_resolution_preserves_internal_identity():
-    driver, _ = make_driver(name="Alice(1)")
-    driver.observe_events()
-    resolution = driver.resolve_send_target("uia-session:alice-row")
+def test_private_database_send_resolution_preserves_internal_identity():
+    binder, gateway, bound = make_binder("Alice(1)")
+    resolution = binder.resolve_send_target("db-session:alice")
     assert resolution.status == TargetStatus.RESOLVED
-    assert resolution.target == ConversationTarget("uia-session:alice-row", "Alice(1)", False)
+    assert resolution.target == ConversationTarget("db-session:alice", "Alice(1)", False)
+    assert bound == [] and gateway.client.focus_calls == 0
 
 
 @pytest.mark.parametrize("observed,requested", [("Alice", "Alice（9）"), ("Alice(9)", "Alice")])
-def test_active_send_resolution_allows_suffix_alias_after_current_group_verification(observed, requested):
-    driver, client = make_driver(name=observed, kind="group")
-    client.rows = [replace(client.rows[0], not_read_number=0)]
-    driver.observe_events()
-    assert driver._known_group_keys == set()
-    resolution = driver.resolve_send_target(requested)
+def test_database_send_resolution_allows_suffix_alias_only_for_native_group(observed, requested):
+    binder, gateway, bound = make_binder(observed, group=True)
+    resolution = binder.resolve_send_target(requested)
     assert resolution.status == TargetStatus.RESOLVED
-    assert resolution.target == ConversationTarget("uia-session:alice-row", observed, True)
+    assert resolution.target == ConversationTarget("db-session:alice", observed, True)
+    assert bound == [] and gateway.client.focus_calls == 0
+    assert binder.resolve_target(requested).target == resolution.target
+    assert len(bound) == 1
 
 
 @pytest.mark.parametrize("current_kind", ["private", "unknown"])
-def test_active_send_group_suffix_alias_requires_current_group_evidence(current_kind):
-    driver, client = make_driver(kind="group")
-    driver.observe_events()
-    assert driver._known_group_keys == {"uia-session:alice-row"}
-    client.headers["alice-row"] = HeaderInfo("Alice", current_kind)
-    resolution = driver.resolve_send_target("Alice(9)")
-    assert resolution.status != TargetStatus.RESOLVED
-    assert resolution.target is None
+def test_database_group_suffix_alias_requires_current_ui_group_evidence_before_binding(current_kind):
+    binder, gateway, bound = make_binder(group=True)
+    assert binder.resolve_send_target("Alice(9)").status == TargetStatus.RESOLVED
+    gateway.client.headers["alice-row"] = HeaderInfo("Alice", current_kind)
+    resolution = binder.resolve_target("Alice(9)")
+    assert resolution.status == TargetStatus.STALE
+    assert resolution.target is None and bound == []
 
 
-def test_group_scan_and_source_revalidation_allow_member_count_suffix():
-    driver, client = make_driver(kind="group")
-    client.headers["alice-row"] = HeaderInfo("Alice（9）", "group", 9)
-    _, events = driver.observe_events()
-    assert len(events) == 1
-    assert events[0].is_group
-    assert driver.validate_reply_target(events[0]).valid
+def test_group_database_receipt_and_source_validation_ignore_ui_member_count_suffix(database_receiver):
+    receiver = database_receiver(group=True, ui_kind="group", ui_title="Alice（9）")
+    event = receive_message(receiver)
+    assert event.is_group and event.source_type == "group"
+    assert receiver[0].validate_reply_target(event).valid
+    assert not receiver[0].uia_initialized and receiver[3].history_calls == []
 
 
 @pytest.fixture
@@ -257,7 +312,8 @@ def typed_sender(monkeypatch):
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
     monkeypatch.setattr(client, "get_title", lambda: HeaderInfo("Alice", "group"))
-    monkeypatch.setattr(client, "get_chat_history", lambda **kwargs: [])
+    monkeypatch.setattr(client, "get_chat_history", lambda **kwargs: pytest.fail("发送验证不得调用旧接收历史接口"))
+    monkeypatch.setattr(client, "get_send_bubble_snapshot", lambda **kwargs: [])
     monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
     monkeypatch.setattr(client, "_wait_for_send_slot", lambda who: None)
     monkeypatch.setattr(client, "_verify_send", lambda *args, **kwargs: {"success": True, "verified": True})

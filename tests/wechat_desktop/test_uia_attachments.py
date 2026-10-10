@@ -14,21 +14,15 @@ from channel.wechat_desktop.models import (
 )
 from channel.wechat_desktop.uia.operations import resolve_local_media_path
 from channel.wechat_desktop.uia.client import WechatUiaClient
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway
+from channel.wechat_desktop.uia.materializer import WechatUiaMaterializer
 from channel.wechat_desktop.pipeline.prompts import (
     _render_event_context_lines,
     _reply_requirements,
     _strip_group_bot_mentions,
 )
-from .helpers import (
-    ClickableGeometryControl,
-    FakeClient,
-    FakeHook,
-    GeometryControl,
-    _selection_tree,
-    incoming,
-    row,
-)
+from .helpers import ClickableGeometryControl, FakeClient, GeometryControl, _selection_tree, row
+from .test_uia_materializer import materialize_native_target
 
 
 def test_dependency_failure_only_reactivates_when_wechat_left_foreground(
@@ -430,87 +424,31 @@ def test_regular_context_renderer_marks_history_as_filterable_candidates():
     assert lines == ["历史消息: 昨天讨论部署", "历史消息: 午饭吃什么"]
 
 
-def test_reply_target_image_requests_viewer_quality_capture():
+def test_reply_target_image_requests_viewer_quality_capture(tmp_path):
     client = FakeClient()
     calls = []
 
-    def fetch_image(message, prefer_viewer=True):
-        calls.append(prefer_viewer)
-        return "C:/tmp/viewer.png"
+    image = tmp_path / "viewer.png"
+    image.write_bytes(b"synthetic image")
+    def fetch_image(message, prefer_viewer=True, *, strict=False, validate_target=None):
+        calls.append((prefer_viewer, strict))
+        return str(image)
 
     client.fetch_message_image = fetch_image
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    driver = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     message = UiaChatMessage(
         "Alice",
         "图片",
         message_type="image",
+        runtime_id="synthetic-image-runtime",
         bounds=(100, 100, 300, 260),
     )
 
-    resolved, resolve_count = driver._resolve_reply_target_message("a", message)
+    resolved, resolve_count = materialize_native_target(driver, message)
 
-    assert calls == [True]
-    assert resolved.file_path == "C:/tmp/viewer.png"
+    assert calls == [(True, True)]
+    assert resolved.content == str(image)
     assert resolve_count == 1
-
-
-def test_reply_target_skips_verified_outgoing_without_using_direction():
-    for observed_direction in ("incoming", "outgoing", "unknown"):
-        client = WechatUiaClient({"outgoing_echo_suppression_seconds": 300})
-        client.remember_outgoing_message(
-            "Alice", "机器人刚发的回复", "bot-runtime"
-        )
-        driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-        messages = [
-            UiaChatMessage(
-                "",
-                "对方的新消息",
-                direction="unknown",
-                runtime_id="user-runtime",
-            ),
-            UiaChatMessage(
-                "",
-                "机器人刚发的回复",
-                direction=observed_direction,
-                runtime_id="bot-runtime",
-            ),
-        ]
-
-        index, target = driver._select_reply_target(
-            messages, False, "", "session", "Alice"
-        )
-
-        assert index == 0
-        assert target.content == "对方的新消息"
-
-
-def test_private_scan_excludes_verified_outgoing_before_history_and_queue():
-    client = WechatUiaClient({"outgoing_echo_suppression_seconds": 300})
-    client.remember_outgoing_message(
-        "Alice", "这题得请 pdf-reader skill 出场了", "notice-runtime"
-    )
-    client.remember_outgoing_message(
-        "Alice", "机器人最终回复", "reply-runtime"
-    )
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
-    incoming = UiaChatMessage(
-        "Alice", "用户新消息", runtime_id="incoming-runtime"
-    )
-    notice = UiaChatMessage(
-        "", "这题得请 pdf-reader skill 出场了", runtime_id="notice-runtime"
-    )
-    reply = UiaChatMessage(
-        "", "机器人最终回复", runtime_id="reply-runtime"
-    )
-
-    filtered = driver._exclude_private_outgoing_messages(
-        [incoming, notice, reply], "Alice", False
-    )
-
-    assert filtered == [incoming]
-    assert driver._exclude_private_outgoing_messages(
-        [incoming, notice, reply], "Alice", True
-    ) == [incoming, notice, reply]
 
 
 def test_event_fingerprint_does_not_depend_on_observed_direction():
@@ -860,22 +798,6 @@ def test_rapidocr_preload_skipped_when_disabled():
     resolver = RapidOcrGroupSenderResolver({"uia_group_sender_ocr_enabled": False})
     assert resolver.preload() is False
     assert resolver._engine is None
-
-
-def test_group_sender_name_survives_flattened_followup_snapshot():
-    driver = WechatUiaDriver({}, client=FakeClient(), shell_hook=FakeHook())
-    first = driver._stabilize_messages(
-        "group",
-        [UiaChatMessage("成员甲", "同一条消息", runtime_id="runtime-1")],
-    )
-    second = driver._stabilize_messages(
-        "group",
-        [UiaChatMessage("unknown", "同一条消息", runtime_id="runtime-1")],
-    )
-
-    assert first[0].sender_name == "成员甲"
-    assert second[0].sender_name == "成员甲"
-    assert second[0].stable_id == first[0].stable_id
 
 
 def test_locate_conversation_does_not_click_populated_active_chat(monkeypatch):

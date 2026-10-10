@@ -19,7 +19,7 @@ from config import conf
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # 后端与 UI 操作节奏。db_uia 从加密库读取，发送仍使用 Windows UIA。
-    "desktop_backend": "uia",
+    "desktop_backend": "db_uia",
     # 数据库读取配置唯一来源。空路径自动定位，空账号仅在可唯一确定时绑定。
     "db_data_dir": "",
     "db_account": "",
@@ -27,13 +27,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 空值使用 Agent 工作区的 wechat_desktop_db，按账号隔离。
     "db_cache_dir": "",
     "db_batch_size": 200,
+    # 自动回复上下文每批每个会话分片额外读取的最多行数；先走现有索引再内存排序。
+    "db_reply_context_max_rows_per_stream": 1000,
     "db_snapshot_retry_attempts": 3,
     "db_key_scan_timeout_seconds": 30.0,
     "uia_recovery_attempts": 3,
     "uia_recovery_settle_ms": 500,
     "uia_selection_settle_ms": 150,
-    "uia_hook_settle_ms_min": 300,
-    "uia_hook_settle_ms_max": 800,
     "uia_focus_settle_ms_min": 350,
     "uia_focus_settle_ms_max": 700,
     "uia_selection_settle_ms_min": 250,
@@ -72,32 +72,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 每条气泡粘贴上限。更长的回复会按句号/换行切开后连续发送。
     "uia_text_chunk_chars": 2000,
     "uia_conversation_cooldown_seconds": 5,
-    # 已发送消息回声抑制：UIA runtime ID 长期保留，纯文本匹配仅作短时兜底。
-    "outgoing_echo_suppression_seconds": 1800,
-    "outgoing_echo_text_suppression_seconds": 120,
     "uia_owner_lookup_timeout_seconds": 2.0,
     "uia_owner_failure_cache_seconds": 60.0,
 
-    # 消息观察与会话历史解析。
+    # 分享卡片菜单的 OCR 后备；普通消息接收和发送不使用 OCR。
     "uia_group_sender_ocr_enabled": True,
     "uia_group_sender_ocr_body_min_score": 0.6,
     "uia_group_sender_ocr_name_min_score": 0.75,
     "uia_group_sender_ocr_text_similarity": 0.78,
     "uia_group_sender_ocr_name_gap_px": 48,
-    "shell_hook_reconcile_seconds": 15,
-    "shell_hook_reconcile_enabled": False,
-    "shell_hook_debounce_ms": 250,
-    "reply_monitor_interval_seconds": 1.0,
-    # 会话读取失败后主动重试；点击可能已清除未读标记，不能只等下一次闪烁。
-    "uia_scan_retry_seconds": 1.0,
-    "event_receipt_capacity": 100,
     # 待处理容量（不含正在执行的任务）；超过容量拒绝新任务并记录原因。
     "reply_queue_capacity": 100,
     "materialize_queue_capacity": 100,
     "reply_queue_max_wait_seconds": 300,
     "worker_join_timeout_seconds": 2.0,
 
-    # 聊天记录只读查询。UIA 读取当前会话，db_uia 也支持稳定会话 ID。
+    # 聊天记录只读查询走数据库；UIA 仅确认当前会话身份。
     "wechat_history_read_enabled": True,
     "wechat_history_max_messages": 50,
     "wechat_history_open_timeout_seconds": 4.0,
@@ -156,11 +146,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "轮到 `{tool_name}` tool 上场了，我去后台忙活一下 🛠️",
         "先让 `{tool_name}` tool 跑一趟，别走开，马上带结果回来 🚀",
     ],
-    "share_content_fetch_notice_templates": [
-        "内置浏览器没读到正文，我改用 `web_fetch` 去拆这张卡片 🕵️",
-        "链接拿到了，`web_fetch` 正在把页面内容搬回来 🌐",
-        "卡片已经翻面，我去网上把正文捞回来，稍等片刻 🚚",
-    ],
     "agent_failure_notice_enabled": True,
     "agent_failure_notice_templates": [
         "刚才脑内小齿轮打了个滑，我这次没能答上来 😵‍💫 请再戳我一下，我重新来过。",
@@ -200,10 +185,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "uia_share_browser_clipboard_settle_ms_min": 200,
     "uia_share_browser_clipboard_settle_ms_max": 450,
     "uia_share_browser_close_timeout_seconds": 2,
-    # 回复期间微信 UI 重建/滚动后，同一消息可能短暂消失再出现；按其 UIA runtime
-    # 身份抑制重复入队。新气泡会获得新的 runtime id，不影响用户重复追问。
-    "uia_recent_target_suppression_seconds": 300,
-    # 直接读取内置浏览器失败后，回退到 web_fetch 拉取网页正文。
     "uia_image_viewer_enabled": True,
     "uia_image_viewer_before_close_ms_min": 300,
     "uia_image_viewer_before_close_ms_max": 500,
@@ -263,11 +244,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         elif isinstance(default, list):
             if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
                 raise ValueError(f"{key} must be a list of strings")
-    for key in ("reply_queue_capacity", "materialize_queue_capacity", "event_receipt_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds", "db_poll_interval_seconds", "db_batch_size", "db_snapshot_retry_attempts", "db_key_scan_timeout_seconds"):
+    for key in ("reply_queue_capacity", "materialize_queue_capacity", "reply_queue_max_wait_seconds", "worker_join_timeout_seconds", "reply_cycle_timeout_seconds", "db_poll_interval_seconds", "db_batch_size", "db_reply_context_max_rows_per_stream", "db_snapshot_retry_attempts", "db_key_scan_timeout_seconds"):
         if config[key] <= 0:
             raise ValueError(f"{key} must be positive")
-    if config["desktop_backend"] not in {"uia", "db_uia"}:
-        raise ValueError("desktop_backend must be uia or db_uia")
+    if config["desktop_backend"] != "db_uia":
+        raise ValueError("desktop_backend must be db_uia; UIA 消息接收后端已移除")
     for key in ("db_data_dir", "db_account", "db_cache_dir"):
         if not isinstance(config[key], str):
             raise ValueError(f"{key} must be a string")

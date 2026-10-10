@@ -91,6 +91,16 @@ class WechatDatabaseSource:
             checkpoint = self.get_checkpoint_store().get_source_checkpoint(reader.account_id, event.source_stream_id)
             return reader.validate_native_event(event, checkpoint)
 
+    def enrich_reference(self, event, *, session_epoch=None):
+        """只读补全一层引用；保持账号生命周期，不推进来源游标。"""
+        with self.reader_session() as reader:
+            if session_epoch is not None and session_epoch != self._session_epoch:
+                raise DatabaseReadError("account_binding_changed", "引用查询期间数据库账号绑定已变化")
+            result = reader.enrich_reference(event)
+            if session_epoch is not None and session_epoch != self._session_epoch:
+                raise DatabaseReadError("account_binding_changed", "引用查询期间数据库账号绑定已变化")
+            return result
+
     def _reset_for_relogin(self):
         old_reader = self._reader
         self._reader = None

@@ -8,17 +8,19 @@ from types import SimpleNamespace
 from .helpers import PipelineStoreStub
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.models import (
-    HeaderInfo,
     UiaChatMessage,
     UiaReferencedMessage,
     WechatDesktopEvent,
     ReplyTargetValidation,
 )
-from channel.wechat_desktop.uia.driver import WechatUiaDriver
+from channel.wechat_desktop.uia.gateway import WechatUiaGateway
+from channel.wechat_desktop.uia.materializer import WechatUiaMaterializer
 from channel.wechat_desktop.pipeline.channel import WechatDesktopChannel
 from channel.wechat_desktop.pipeline.prompts import ATTACHMENT_REFERENCE_REQUIRED_REPLY
-from .helpers import FakeClient, FakeHook, FakeTimer, _bare_wechat_channel, row
+from .helpers import FakeClient, FakeTimer, _bare_wechat_channel
 from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
+from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus
+from .test_uia_materializer import materialize_native_target
 
 
 def test_private_aggregation_uses_sliding_window():
@@ -445,12 +447,13 @@ def test_attachment_reference_prompt_is_sent_without_agent():
     channel._policy = SimpleNamespace(allows_send=lambda *_args, **_kwargs: True, reserve_send=lambda _units=1: True)
     channel._reply_queue = reply_queue
     channel._driver = SimpleNamespace(
+        resolve_send_target=lambda identity: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, event.conversation_name, False)),
         validate_reply_target=lambda _event: SimpleNamespace(
             valid=True,
             reason="",
-            replacement_event=None,
         ),
-        send_text=lambda target, text: (
+        send_text=lambda target, text, **_kwargs: (
             sent.append((target, text))
             or {"success": True, "verified": True}
         ),
@@ -505,11 +508,7 @@ def test_reply_consumer_bypasses_agent_for_reference_prompt():
         mark_event_processed=lambda event_id, *args: processed.append(event_id),
         audit=lambda *_args, **_kwargs: None,
     )
-    channel._driver = SimpleNamespace(
-        end_reply_cycle=lambda: (_ for _ in ()).throw(
-            AssertionError("no Agent reply cycle should be active")
-        )
-    )
+    channel._driver = SimpleNamespace()
     channel._mark_lifecycle = (
         lambda _event_ids, stage, **_kwargs: stages.append(stage)
     )
@@ -555,7 +554,7 @@ def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
         mark_event_processed=lambda _event_id: None,
         audit=lambda *_args, **_kwargs: None,
     )
-    channel._driver = SimpleNamespace(end_reply_cycle=lambda: None)
+    channel._driver = SimpleNamespace()
     channel._mark_lifecycle = lambda *_args, **_kwargs: None
     channel._finish_lifecycle = lambda *_args, **_kwargs: None
 
@@ -572,7 +571,7 @@ def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
     ]
 
 
-def test_share_browser_notice_is_not_sent_before_materialization():
+def test_share_materialization_leaves_network_read_and_notice_to_agent():
     channel = _bare_wechat_channel()
     channel._stop_event = threading.Event()
     channel._reply_queue = WechatReplyQueue()
@@ -601,22 +600,14 @@ def test_share_browser_notice_is_not_sent_before_materialization():
         mark_event_processed=lambda _event_id: None,
         audit=lambda *_args, **_kwargs: None,
     )
-    channel._driver = SimpleNamespace(
-        begin_reply_cycle=lambda *_args: None,
-        end_reply_cycle=lambda: None,
-    )
+    channel._driver = SimpleNamespace()
     channel._mark_lifecycle = lambda *_args, **_kwargs: None
     channel._finish_lifecycle = lambda *_args, **_kwargs: None
     channel._send_deferred_attachment_notice = (
         lambda _item: notices.append("微信内置浏览器") or False
     )
-    channel._send_share_content_fetch_notice = (
-        lambda _item: notices.append("网络回退") or True
-    )
-
-    def materialize(events, *, before_share_fetch=None):
-        before_share_fetch()
-        before_share_fetch()
+    def materialize(events):
+        events[-1].reference.update(url="https://example.invalid/article", fetch_status="link_available")
         return events[-1]
 
     channel._materialize_batch = materialize
@@ -624,8 +615,9 @@ def test_share_browser_notice_is_not_sent_before_materialization():
 
     channel._consume_reply_queue()
 
-    assert notices == ["微信内置浏览器", "网络回退"]
-    assert event.task.preflight_attachment_notice_sent is True
+    assert notices == ["微信内置浏览器"]
+    assert event.task.preflight_attachment_notice_sent is False
+    assert event.reference["fetch_status"] == "link_available"
 
 
 def test_reply_timeout_sends_final_failure_notice():
@@ -663,12 +655,13 @@ def test_reply_timeout_sends_final_failure_notice():
         reserve_send=lambda _units=1: True,
     )
     channel._driver = SimpleNamespace(
-        validate_reply_target=lambda event: ReplyTargetValidation(True),
-        send_interim_text=lambda target, text: (
+        resolve_send_target=lambda identity: TargetResolution(
+            TargetStatus.RESOLVED, ConversationTarget(event.conversation_id, "Alice", False)),
+        validate_reply_target=lambda _event: SimpleNamespace(valid=True, reason=""),
+        send_interim_text=lambda target, text, **_kwargs: (
             sent.append((target, text))
             or {"success": True, "verified": True}
         ),
-        end_reply_cycle=lambda: None,
     )
     channel._store = PipelineStoreStub(
         mark_event_processed=lambda event_id, *args: processed.append(event_id),
@@ -691,8 +684,6 @@ def test_attachment_path_cache_avoids_second_image_capture(tmp_path):
     local_image = tmp_path / "cached.png"
     local_image.write_bytes(b"png")
     client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
     client.histories["Alice"] = [
         UiaChatMessage(
             "Alice",
@@ -703,14 +694,13 @@ def test_attachment_path_cache_avoids_second_image_capture(tmp_path):
         )
     ]
     client.image_paths["[图片]"] = str(local_image)
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True}, client=client, shell_hook=FakeHook()
-    )
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
+    materializer = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
+    target = client.histories["Alice"][0]
+    event = WechatDesktopEvent("message", "alice", "Alice", "alice", "Alice", "image", "[图片]",
+                              account_id="synthetic-account", source_message_id="message_0/Msg_synthetic/1")
 
-    _, first_count = driver.materialize_event(events[0])
-    _, second_count = driver.materialize_event(events[0])
+    _, first_count = materializer.materialize_event(event, target_message=target)
+    _, second_count = materializer.materialize_event(event, target_message=target)
 
     assert first_count == 1
     assert second_count == 0
@@ -723,8 +713,6 @@ def test_materialization_resolves_only_selected_visible_attachment(tmp_path):
     old_file.write_bytes(b"pdf")
     target_image.write_bytes(b"png")
     client = FakeClient()
-    client.rows = [row("Alice", unread=1)]
-    client.headers["Alice"] = HeaderInfo("Alice", "private", 1)
     client.histories["Alice"] = [
         UiaChatMessage(
             "Alice",
@@ -742,15 +730,12 @@ def test_materialization_resolves_only_selected_visible_attachment(tmp_path):
     ]
     client.file_paths["old.pdf"] = str(old_file)
     client.image_paths["target-image"] = str(target_image)
-    driver = WechatUiaDriver(
-        {"bootstrap_existing_messages": True},
-        client=client,
-        shell_hook=FakeHook(),
+    materializer = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
+    event = WechatDesktopEvent("message", "alice", "Alice", "alice", "Alice", "image", "target-image",
+                              account_id="synthetic-account", source_message_id="message_0/Msg_synthetic/1")
+    materialized, resolve_count = materializer.materialize_event(
+        event, target_message=client.histories["Alice"][1]
     )
-
-    _, events = driver.observe_events()
-    driver.acknowledge_events([event.event_id for event in events])
-    materialized, resolve_count = driver.materialize_event(events[0])
 
     assert resolve_count == 1
     assert materialized.content == str(target_image)
@@ -758,12 +743,13 @@ def test_materialization_resolves_only_selected_visible_attachment(tmp_path):
     assert client.file_fetches == []
 
 
-def test_cached_file_is_reused_by_quoted_filename(tmp_path):
+def test_cached_file_is_not_reused_by_quoted_filename(tmp_path):
     local_file = tmp_path / "report.pdf"
     local_file.write_bytes(b"%PDF")
     client = FakeClient()
     client.file_paths["文件\nreport.pdf\n8 KB"] = str(local_file)
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    client.resolve_message_reference = lambda value, **kwargs: value
+    materializer = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     standalone = UiaChatMessage(
         "Alice",
         "文件\nreport.pdf\n8 KB",
@@ -772,9 +758,7 @@ def test_cached_file_is_reused_by_quoted_filename(tmp_path):
         stable_id="stable-file-1",
     )
 
-    cached, first_count = driver._resolve_reply_target_message(
-        "conversation", standalone
-    )
+    cached, first_count = materialize_native_target(materializer, standalone, local_id=2)
     quoted = UiaChatMessage(
         "Alice",
         "帮我读一下",
@@ -787,15 +771,13 @@ def test_cached_file_is_reused_by_quoted_filename(tmp_path):
             message_type="file",
         ),
     )
-    resolved, second_count = driver._resolve_reply_target_message(
-        "conversation", quoted
-    )
+    resolved, second_count = materialize_native_target(materializer, quoted)
 
-    assert cached.file_path == str(local_file)
+    assert cached.content == str(local_file)
     assert first_count == 1
-    assert resolved.reference.file_path == str(local_file)
-    assert resolved.reference.resolved is True
-    assert second_count == 0
+    assert resolved.reference["file_path"] == ""
+    assert resolved.reference["resolved"] is False
+    assert second_count == 1
     assert client.file_fetches == ["文件\nreport.pdf\n8 KB"]
 
 
@@ -803,7 +785,7 @@ def test_text_reference_locates_original_before_resolving():
     client = FakeClient()
     calls = []
 
-    def resolve_reference(message):
+    def resolve_reference(message, **kwargs):
         calls.append(message.reference.content)
         return replace(
             message,
@@ -821,7 +803,7 @@ def test_text_reference_locates_original_before_resolving():
     client.fetch_referenced_message_image = lambda _message: (
         _ for _ in ()
     ).throw(AssertionError("text reference must not open image viewer"))
-    driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
+    materializer = WechatUiaMaterializer({}, gateway=WechatUiaGateway({}, client=client))
     quoted = UiaChatMessage(
         "Alice",
         "你怎么看",
@@ -834,12 +816,10 @@ def test_text_reference_locates_original_before_resolving():
         ),
     )
 
-    resolved, resolve_count = driver._resolve_reply_target_message(
-        "conversation", quoted
-    )
+    resolved, resolve_count = materialize_native_target(materializer, quoted)
 
     assert calls == ["这是被引用的文本预览"]
     assert resolve_count == 1
-    assert resolved.reference.content == "这是定位后的完整原文"
-    assert resolved.reference.resolved is True
-    assert resolved.reference.strategy == "wechat_locate_original"
+    assert resolved.reference["content"] == "这是定位后的完整原文"
+    assert resolved.reference["resolved"] is True
+    assert resolved.reference["strategy"] == "wechat_locate_original"

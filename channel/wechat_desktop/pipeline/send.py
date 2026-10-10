@@ -99,10 +99,15 @@ class WechatDesktopSendMixin:
                 and context.get("wechat_desktop_failure_notice_sent", False)
             ) or bool(event and event.task.failure_notice_sent):
                 return True
-            is_group = bool(
-                getattr(event, "is_group", False)
-                if event is not None
-                else context.get("isgroup", False)
+            validation_context = context if context is not None else {}
+            target = self._resolve_reply_send_target(
+                target_id or target_name, validation_context, target_name,
+                "", "text",
+            )
+            if target is None:
+                return False
+            target_id, target_name, is_group = (
+                target.conversation_id, target.display_name, target.is_group
             )
             if (
                 bool(self._service.status().get("paused"))
@@ -120,7 +125,7 @@ class WechatDesktopSendMixin:
                 or (event.task.source_event_ids or [event.event_id] if event is not None else [])
             )
             if not self._validate_source_before_reply(
-                event, context, target_name, notice, "text", action_type="agent_failure_notice"
+                event, validation_context, target_name, notice, "text", action_type="agent_failure_notice"
             ):
                 return False
             self._mark_lifecycle(source_event_ids, "send_started")
@@ -128,7 +133,8 @@ class WechatDesktopSendMixin:
                 result = self._deliver(send_target, notice, policy_target=target_name,
                                        is_group=is_group, interim=True,
                                        source_event_ids=source_event_ids,
-                                       token=queue_token if require_active else "")
+                                       token=queue_token if require_active else "",
+                                       authorized_target=target)
                 if not result.get("success"):
                     raise RuntimeError(str(result.get("message") or "send failed"))
             except Exception as exc:
@@ -199,21 +205,9 @@ class WechatDesktopSendMixin:
             )
             return True
 
-    def _finish_reply_cycle(self, context):
-        """幂等释放后端回复周期，防止回调和异常路径重复解锁。"""
-        if not context or not bool(
-            context.get("wechat_desktop_reply_cycle", False)
-        ):
-            return
-        context["wechat_desktop_reply_cycle"] = False
-        token = str(context.get("wechat_desktop_queue_token") or "")
-        if not token or self._reply_queue.is_active(token):
-            self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
-
     def _success_callback(self, session_id, **kwargs):
-        """Agent 成功结束时释放后端并唤醒等待中的 FIFO 消费者。"""
+        """Agent 成功结束时唤醒等待中的 FIFO 消费者。"""
         context = kwargs.get("context")
-        self._finish_reply_cycle(context)
         if context:
             self._mark_lifecycle(
                 context.get("wechat_desktop_source_event_ids", []),
@@ -226,9 +220,8 @@ class WechatDesktopSendMixin:
         return super()._success_callback(session_id, **kwargs)
 
     def _fail_callback(self, session_id, exception, **kwargs):
-        """Agent 失败时释放后端，并把当前队列项标记为失败。"""
+        """Agent 失败时把当前队列项标记为失败并唤醒消费者。"""
         context = kwargs.get("context")
-        self._finish_reply_cycle(context)
         if context:
             try:
                 self._send_agent_failure_notice(
@@ -254,46 +247,76 @@ class WechatDesktopSendMixin:
             **kwargs,
         )
 
+    def _resolve_reply_send_target(self, identity, context, target_name, content, content_type):
+        """每次发送都用后端当前名称和类型授权，缓存昵称不能绕过策略。"""
+        try:
+            resolution = self._driver.resolve_send_target(identity)
+            target = resolution.target
+            if (resolution.status == TargetStatus.RESOLVED and target is not None
+                    and target.conversation_id and target.display_name
+                    and isinstance(target.is_group, bool)):
+                return target
+            reason = resolution.reason or "conversation identity or type could not be verified"
+        except Exception as exc:
+            reason = str(exc)
+        context["wechat_desktop_queue_terminal"] = "skipped"
+        self._trace("11-send-target-unverified", "target=%s reason=%s", target_name, reason)
+        self._store.audit(f"send_{content_type}", target_name, "target_unverified",
+                          self._content_hash(content), detail=reason)
+        return None
+
     def _validate_source_before_reply(
         self, event, context, target_name, content, content_type, *, action_type=None
     ):
-        """回复与通知共用批次来源复核；任何来源失效都不发送、不预留额度。"""
-        if event is None:
-            return True
-        if event.task.source_invalid:
+        """原始批次和 Agent 已用上文共同复核，失效后停止所有回复与提示。"""
+        if event is not None and event.task.source_invalid:
             if context is not None:
                 context["wechat_desktop_queue_terminal"] = "skipped"
             return False
-        for source in event.task.source_validation_events or [event]:
+        sources = list(event.task.source_validation_events or [event]) if event is not None else []
+        # Context 保存实际交给 Agent 的集合，不能用后来改写的候选历史覆盖它。
+        context_sources = context.get("wechat_desktop_context_source_events") if context is not None else None
+        if context_sources is None and event is not None:
+            context_sources = event.task.context_source_events
+        if event is not None:
+            sources.extend(context_sources or [])
+        reason = "source_event_missing" if event is None else ""
+        checked_sources = set()
+        for source in sources:
+            identity = ((source.account_id, source.source_message_id, source.message_stable_id,
+                         source.content_signature) if source.source_message_id else (source.event_id,))
+            if identity in checked_sources:
+                continue
+            checked_sources.add(identity)
             try:
                 validation = self._driver.validate_reply_target(source)
             except Exception as exc:
-                validation = ReplyTargetValidation(False, getattr(exc, "code", "source_validation_failed"))
+                validation = ReplyTargetValidation(False, getattr(exc, "code", None) or "source_validation_failed")
             if not validation.valid:
+                reason = validation.reason or "source_event_invalid"
                 break
         else:
-            return True
-        event.task.source_invalid = True
+            if not reason:
+                return True
+        if event is not None:
+            event.task.source_invalid = True
         if context is not None:
             context["wechat_desktop_queue_terminal"] = "skipped"
-        self._trace("11-send-target-invalid", "target=%s reason=%s", target_name, validation.reason)
+        self._trace("11-send-target-invalid", "target=%s reason=%s", target_name, reason)
         self._store.audit(action_type or f"send_{content_type}", target_name, "stale_target",
-                          self._content_hash(content), detail=validation.reason)
-        if validation.replacement_event is not None:
-            try:
-                self._accept_replacement_event(validation.replacement_event)
-            except Exception as exc:
-                logger.warning("[WechatDesktop] replacement admission failed target=%s: %s", target_name, exc)
+                          self._content_hash(content), detail=reason)
         token = str(context.get("wechat_desktop_queue_token") or "") if context is not None else ""
         if token and self._reply_queue.is_active(token):
-            # 工具流通知可能早于 Agent 完成，来源失效后立即结束等待，迟到结果由令牌门禁拦截。
+            # 工具流提示先发现来源变化时，立即唤醒消费者并取消还在执行的 Agent。
             self._reply_queue.signal(token, "skipped")
-            try:
-                from agent.protocol import get_cancel_registry
+            request_id = event.event_id if event is not None else str(context.get("wechat_desktop_batch_id") or "")
+            if request_id:
+                try:
+                    from agent.protocol import get_cancel_registry
 
-                get_cancel_registry().cancel_request(event.event_id)
-            except Exception as exc:
-                logger.warning("[WechatDesktop] stale-source cancellation failed: %s", exc)
+                    get_cancel_registry().cancel_request(request_id)
+                except Exception as exc:
+                    logger.warning("[WechatDesktop] stale-source cancellation failed: %s", exc)
         return False
 
     def _send_reply_impl(self, reply: Reply, context: Context):
@@ -373,6 +396,17 @@ class WechatDesktopSendMixin:
                 )
             return
 
+        target = self._resolve_reply_send_target(
+            send_target, context, target_name, reply.content,
+            "image" if reply.type in (ReplyType.IMAGE, ReplyType.IMAGE_URL) else "text",
+        )
+        if target is None:
+            return
+        target_id, target_name, is_group = (
+            target.conversation_id, target.display_name, target.is_group
+        )
+        send_target = target_id
+
         if reply.type == ReplyType.TEXT:
             reply_text = (
                 _normalize_auto_reply_text(reply.content)
@@ -403,7 +437,8 @@ class WechatDesktopSendMixin:
                         return
                     self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._deliver(send_target, reply_text, policy_target=target_name,
-                                           is_group=is_group, token=queue_token, source_event_ids=source_event_ids)
+                                           is_group=is_group, token=queue_token, source_event_ids=source_event_ids,
+                                           authorized_target=target)
                     if result.get("status") in {"partial", "uncertain"}:
                         context["wechat_desktop_queue_terminal"] = result["status"]
                         self._store.audit(
@@ -496,7 +531,8 @@ class WechatDesktopSendMixin:
                         return
                     self._mark_lifecycle(source_event_ids, "send_started")
                     result = self._deliver(send_target, str(reply.content), policy_target=target_name,
-                                           is_group=is_group, content_type="image", token=queue_token, source_event_ids=source_event_ids)
+                                           is_group=is_group, content_type="image", token=queue_token, source_event_ids=source_event_ids,
+                                           authorized_target=target)
                     if result.get("status") in {"partial", "uncertain"}:
                         context["wechat_desktop_queue_terminal"] = result["status"]
                         self._store.audit(
@@ -577,7 +613,6 @@ class WechatDesktopSendMixin:
         网络状态未知时继续消费会造成大量过期回复，所以这里主动清空三个阶段中
         尚未开始的任务；正在处理的当前任务由外层消费者完成收尾。
         """
-        self._finish_reply_cycle(context)
         discarded_event_ids = self._reply_queue.clear_pending()
         discarded_event_ids.extend(self._clear_pending_private_batches())
         discarded_event_ids.extend(self._clear_pending_materializations())

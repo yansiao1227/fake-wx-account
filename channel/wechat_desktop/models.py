@@ -141,12 +141,13 @@ class ReplyTaskMetadata:
     source_invalid: bool = False
     batch_id: str = ""
     deferred_materialization_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
+    context_source_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
     cache_only: bool = False
+    file_cache_results: dict[str, bool] = field(default_factory=dict)
     attachment_reference_required: bool = False
     preflight_attachment_notice_sent: bool = False
     failure_notice_sent: bool = False
     fingerprint_content: str | None = None
-    baseline_only: bool = False
 
 
 @dataclass
@@ -169,6 +170,7 @@ class WechatDesktopEvent:
     bounds: Optional[Tuple[int, int, int, int]] = None
     history: List[Dict[str, Any]] = field(default_factory=list)
     reference: Dict[str, Any] = field(default_factory=dict)
+    share_card: Dict[str, Any] = field(default_factory=dict)
     target_key: str = ""
     message_runtime_id: str = ""
     message_stable_id: str = ""
@@ -250,8 +252,7 @@ class WechatDesktopMessage(ChatMessage):
 
 @dataclass(frozen=True)
 class ReplyTargetValidation:
-    """发送前复核结果，可携带替代的新目标事件。"""
+    """发送前复核数据库原生来源；新消息由接收事务独立交付。"""
 
     valid: bool
     reason: str = ""
-    replacement_event: Optional[WechatDesktopEvent] = None

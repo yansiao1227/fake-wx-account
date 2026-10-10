@@ -7,8 +7,6 @@ from channel.wechat_desktop.uia.image_viewer import WechatImageViewer
 from channel.wechat_desktop.uia.attachments import WechatAttachmentReader
 from channel.wechat_desktop.text import split_message_text
 from channel.wechat_desktop.send_control import (
-    check_send_allowed,
-    mark_send_submitted,
     wait_send_delay,
 )
 import hashlib
@@ -45,7 +43,6 @@ from channel.wechat_desktop.conversation import (
 from channel.wechat_desktop.uia.controls import (
     SESSION_PREFIX,
     MESSAGE_LIST_ID,
-    INPUT_ID,
     HISTORY_LIST_ID,
     HISTORY_WINDOW_CLASS,
     MENTION_MARKERS,
@@ -134,28 +131,21 @@ class WechatUiaClient:
         self.operation_lock = threading.RLock()
         # Serializes concurrent senders (reply FIFO vs. agent-initiated sends)
         # so humanized pacing waits happen outside any UIA lock: a waiting
-        # sender must never block conversation scanning or attachment reads.
+        # sender must never block independent attachment reads.
         self._send_lock = threading.RLock()
-        # Optional per-section UIA priority context installed by the driver.
+        # Optional per-section UIA priority context installed by the gateway.
         # Each bounded send section (one chunk's focus/locate/paste/verify)
-        # runs inside ``uia_section()`` so scans yield during UI work but can
-        # run freely while a sender sleeps between chunks.
+        # runs inside ``uia_section()``; attachment operations may acquire the
+        # UI lease while a sender sleeps between chunks.
         self.uia_section = nullcontext
         self._owner_cache: Optional[OwnerInfo] = None
+        self._owner_cache_window: Optional[tuple[int, int]] = None
         self._owner_lookup_retry_after = 0.0
         self._stop_event = threading.Event()
         self._last_send_at = 0.0
         self._last_conversation_send: dict[str, float] = {}
-        self._known_outgoing_messages: dict[
-            str, list[tuple[str, str, float]]
-        ] = {}
-        # RapidOCR is preloaded at channel startup; first group scan should not
-        # pay model-load latency. Enrich still falls back to on-demand load.
+        # OCR 仅供显式完整 UI 快照的后备识别，普通发送快照及数据库接收均不加载模型。
         self._group_sender_ocr = RapidOcrGroupSenderResolver(self.config)
-
-    def preload_group_sender_ocr(self) -> bool:
-        """Load RapidOCR models early (channel startup). Returns readiness."""
-        return bool(self._group_sender_ocr.preload())
 
     def cancel_waits(self):
         self._stop_event.set()
@@ -197,57 +187,6 @@ class WechatUiaClient:
         )
         remaining = due - now
         wait_send_delay(remaining, self._stop_event)
-
-    def remember_outgoing_message(
-        self, conversation: str, text: str = "", runtime_id: str = ""
-    ) -> None:
-        value = _text(text)
-        runtime = _text(runtime_id)
-        if not value and not runtime:
-            return
-        key = _text(conversation)
-        records = self._known_outgoing_messages.setdefault(key, [])
-        records.append((value, runtime, time.monotonic()))
-        del records[:-50]
-
-    def is_known_outgoing_message(
-        self, conversation: str, message: UiaChatMessage
-    ) -> bool:
-        key = _text(conversation)
-        records = self._known_outgoing_messages.get(key, [])
-        runtime_window = max(
-            5.0,
-            min(
-                float(self.config.get("outgoing_echo_suppression_seconds", 300)),
-                3600.0,
-            ),
-        )
-        text_window = max(
-            0.0,
-            min(
-                float(
-                    self.config.get(
-                        "outgoing_echo_text_suppression_seconds", 120
-                    )
-                ),
-                runtime_window,
-            ),
-        )
-        now = time.monotonic()
-        cutoff = now - runtime_window
-        records[:] = [record for record in records if record[2] >= cutoff]
-        runtime = _text(message.runtime_id)
-        content = _text(message.content)
-        return any(
-            (runtime and record_runtime and runtime == record_runtime)
-            or (
-                content
-                and record_text
-                and content == record_text
-                and now - created_at <= text_window
-            )
-            for record_text, record_runtime, created_at in records
-        )
 
     @staticmethod
     def _require_windows():
@@ -493,7 +432,54 @@ class WechatUiaClient:
             f"WeChat UI Automation tree remained empty after {attempts} recovery attempts"
         )
 
+    def _read_visible_owner_sidebar(self, root) -> str:
+        """只解析主窗口已经暴露的账号控件，不打开个人资料。"""
+        root_bounds = _bounds(root)
+        left_limit = (
+            root_bounds[0] + max(100, (root_bounds[2] - root_bounds[0]) // 5)
+            if root_bounds else 0
+        )
+        for control in self._walk(root):
+            aid = _text(control.AutomationId).casefold()
+            cls = _text(control.ClassName).casefold()
+            name = _text(control.Name)
+            bounds = _bounds(control)
+            profile_hint = any(
+                key in aid
+                for key in ("self_avatar", "owner_avatar", "profile", "account", "userinfo")
+            ) or ("avatar" in cls and any(key in aid for key in ("self", "owner")))
+            if (
+                profile_hint and bounds and left_limit and bounds[0] <= left_limit
+                and name and name not in {"头像", "微信"}
+            ):
+                return name
+        return ""
+
+    def get_owner_info_passive(self) -> OwnerInfo:
+        """只读窗口内账号信息；空树或缺少身份时绝不点击、恢复或聚焦。"""
+        return self._get_owner_info(allow_profile_popup=False)
+
     def get_owner_info(self) -> OwnerInfo:
+        """显式账号诊断入口，可交互打开个人资料；发送绑定使用被动接口。"""
+        return self._get_owner_info(allow_profile_popup=True)
+
+    def _get_owner_info(self, *, allow_profile_popup: bool) -> OwnerInfo:
+        with self.operation_lock:
+            return self._get_owner_info_locked(allow_profile_popup=allow_profile_popup)
+
+    def _get_owner_info_locked(self, *, allow_profile_popup: bool) -> OwnerInfo:
+        # HWND/PID 变化时不能继承其他窗口的账号或失败重试缓存。
+        try:
+            window = self._window()
+        except Exception:
+            self._owner_cache = None
+            self._owner_cache_window = None
+            self._owner_lookup_retry_after = 0.0
+            return OwnerInfo("", source="unknown")
+        if window != self._owner_cache_window:
+            self._owner_cache = None
+            self._owner_lookup_retry_after = 0.0
+            self._owner_cache_window = window
         configured = _text(self.config.get("self_display_name"))
         if self._owner_cache and self._owner_cache.nick_name and (
             not configured or self._owner_cache.nick_name == configured
@@ -521,44 +507,10 @@ class WechatUiaClient:
             )
         try:
             with self.operation_lock, self._uia_root() as root:
-                root_bounds = _bounds(root)
-                left_limit = (
-                    root_bounds[0]
-                    + max(100, (root_bounds[2] - root_bounds[0]) // 5)
-                    if root_bounds
-                    else 0
-                )
-                for control in self._walk(root):
-                    aid = _text(control.AutomationId).casefold()
-                    cls = _text(control.ClassName).casefold()
-                    name = _text(control.Name)
-                    bounds = _bounds(control)
-                    profile_hint = any(
-                        key in aid
-                        for key in (
-                            "self_avatar",
-                            "owner_avatar",
-                            "profile",
-                            "account",
-                            "userinfo",
-                        )
-                    ) or (
-                        "avatar" in cls
-                        and any(key in aid for key in ("self", "owner"))
-                    )
-                    in_sidebar = bool(
-                        bounds and left_limit and bounds[0] <= left_limit
-                    )
-                    if (
-                        profile_hint
-                        and in_sidebar
-                        and name
-                        and name not in {"头像", "微信"}
-                    ):
-                        discovered = name
-                        discovery_method = "sidebar"
-                        break
-                if not discovered:
+                discovered = self._read_visible_owner_sidebar(root)
+                if discovered:
+                    discovery_method = "sidebar"
+                if not discovered and allow_profile_popup:
                     if bool(self.config.get("diagnostic_logging", False)):
                         file_logger.info("[WechatDesktop][trace:05-owner] "
                             "sidebar_missing; opening_profile_popup"
@@ -571,6 +523,18 @@ class WechatUiaClient:
                 "[WechatDesktop][trace:05-owner] lookup_failed error=%s",
                 exc,
             )
+        # 读取过程中窗口被替换时，结果不能归属于旧账号。
+        try:
+            if self._window() != window:
+                self._owner_cache = None
+                self._owner_cache_window = None
+                self._owner_lookup_retry_after = 0.0
+                return OwnerInfo("", source="unknown")
+        except Exception:
+            self._owner_cache = None
+            self._owner_cache_window = None
+            self._owner_lookup_retry_after = 0.0
+            return OwnerInfo("", source="unknown")
         if discovered and configured and discovered != configured:
             raise RuntimeError(
                 "self_display_name does not match the account exposed by WeChat UIA"
@@ -616,7 +580,7 @@ class WechatUiaClient:
 
         Desktop ``GetChildren()`` asks every top-level window's UIA provider for
         data.  A single unrelated, unresponsive provider can therefore block the
-        WeChat scan thread for close to a minute.  Native window enumeration is
+        WeChat UI operation for close to a minute.  Native window enumeration is
         cheap; only same-process candidates are converted to UIA controls.
         """
 
@@ -1344,6 +1308,102 @@ class WechatUiaClient:
             and not conversation_titles_match(header.title, conversation)
         ):
             return []
+        messages = self._read_visible_chat_messages(header, use_ocr=True)
+        return messages if bounded_limit == 0 else messages[-bounded_limit:]
+
+    def get_send_bubble_snapshot(
+        self, conversation: Optional[str] = None, limit: int = 5,
+    ) -> list[UiaChatMessage]:
+        """发送回声快照，只读 UIA 树；不定位会话、不截图、不调用 OCR。"""
+        header = self.get_title()
+        if conversation and not conversation_titles_match(header.title, conversation):
+            return []
+        messages = self._read_visible_chat_messages(header, use_ocr=False)
+        bounded_limit = max(1, min(int(limit), 20))
+        return messages[-bounded_limit:]
+
+    def get_chat_scroll_position_passive(self) -> Optional[bool]:
+        """仅读取 ScrollPattern；无法证明在底部时返回 None，不滚动或激活窗口。"""
+        with self.operation_lock, self._uia_root() as root:
+            for control in self._walk(root):
+                if _text(control.AutomationId) != MESSAGE_LIST_ID:
+                    continue
+                try:
+                    pattern = control.GetScrollPattern()
+                    if pattern is None:
+                        return None
+                    if not bool(pattern.VerticallyScrollable):
+                        return True
+                    percent = float(pattern.VerticalScrollPercent)
+                    return percent >= 99.99 if 0.0 <= percent <= 100.0 else None
+                except Exception:
+                    return None
+        return None
+
+    @classmethod
+    def _send_direction_from_children(cls, item, pane_bounds) -> str:
+        """只信任气泡本体/头像子控件；消息行的矩形可能覆盖整行。"""
+        if not pane_bounds:
+            return "unknown"
+        pane_left, pane_top, pane_right, pane_bottom = pane_bounds
+        pane_width = pane_right - pane_left
+        if pane_width <= 0 or pane_bottom <= pane_top:
+            return "unknown"
+        center = (pane_left + pane_right) / 2
+        margin = max(5, pane_width * 0.04)
+        evidence = set()
+        try:
+            pending = list(item.GetChildren())
+        except Exception:
+            return "unknown"
+        visited = 0
+        while pending and visited < 128:
+            child = pending.pop(0)
+            visited += 1
+            class_name = _text(getattr(child, "ClassName", "")).casefold()
+            aid = _text(getattr(child, "AutomationId", "")).casefold()
+            # 引用内容的头像/气泡属于原消息，整条子树都不能证明当前方向。
+            if ("itemview" in class_name or "refer" in class_name
+                    or "refer" in aid or "quote" in aid):
+                continue
+            try:
+                pending.extend(child.GetChildren())
+            except Exception:
+                pass
+            avatar = any(key in class_name for key in (
+                "chatavatar", "messageavatar", "senderavatar",
+            )) or any(
+                key in aid for key in ("chat_avatar", "message_avatar", "sender_avatar")
+            )
+            body = any(key in class_name for key in (
+                "chattextbubble", "chatbubbleview", "chatmessagebubble", "chattextbody",
+            )) or any(key in aid for key in (
+                "message_bubble", "chat_bubble", "bubble_body", "message_body",
+            ))
+            if not (avatar or body):
+                continue
+            bounds = _bounds(child)
+            if not bounds:
+                continue
+            left, top, right, bottom = bounds
+            if (
+                right <= left or bottom <= top
+                or left < pane_left or right > pane_right
+                or top < pane_top or bottom > pane_bottom
+                or right - left >= pane_width * (0.25 if avatar else 0.9)
+            ):
+                continue
+            if right < center - margin:
+                evidence.add("incoming")
+            elif left > center + margin:
+                evidence.add("outgoing")
+        # 遍历上限截断时，未读取子树可能包含相反证据。
+        return evidence.pop() if not pending and len(evidence) == 1 else "unknown"
+
+    def _read_visible_chat_messages(
+        self, header: HeaderInfo, *, use_ocr: bool,
+    ) -> list[UiaChatMessage]:
+        """共享字段解析；显式完整 UI 快照才补充截图和 OCR 方向/群发送者。"""
         messages: list[UiaChatMessage] = []
         with self.operation_lock, self._uia_root() as root:
             message_list = None
@@ -1364,7 +1424,10 @@ class WechatUiaClient:
                 # ChatImageItemView, ChatFileItemView, and similar subclasses.
                 if class_name.casefold() == "mmui::chatitemview":
                     continue
-                direction = "unknown"
+                direction = (
+                    "unknown" if use_ocr
+                    else self._send_direction_from_children(item, list_bounds)
+                )
                 item_bounds = _bounds(item)
                 parsed_reference = self._parse_reference_label(content)
                 reference = None
@@ -1394,7 +1457,7 @@ class WechatUiaClient:
                         reference=reference,
                     )
                 )
-            if header.header_type in {"group", "private"}:
+            if use_ocr and header.header_type in {"group", "private"}:
                 messages = self._group_sender_ocr.enrich(
                     messages,
                     list_bounds,
@@ -1402,7 +1465,7 @@ class WechatUiaClient:
                 )
             if header.header_type == "private":
                 messages = self._normalize_private_senders(header, messages)
-        return messages if bounded_limit == 0 else messages[-bounded_limit:]
+        return messages
 
     @staticmethod
     def _same_bounds(left, right, tolerance: int = 3) -> bool:
@@ -1584,55 +1647,11 @@ class WechatUiaClient:
     def _return_to_reference(self) -> bool:
         return self._reference_resolver._return_to_reference()
 
-    def _send_existing_input_with_enter(self, expected_text: str) -> bool:
-        """Retry a failed Send-button click without pasting a duplicate."""
-        import win32api
-        import win32con
-
-        check_send_allowed()
-        self.focus_window()
-        with self._uia_root() as root:
-            control = next(
-                (
-                    item
-                    for item in self._walk(root)
-                    if _text(item.AutomationId) == INPUT_ID
-                ),
-                None,
-            )
-            if control is None:
-                return False
-            value_available, value = self._try_input_value(control)
-            if (
-                not value_available
-                or self._normalize_input_text(value)
-                != self._normalize_input_text(expected_text)
-            ):
-                return False
-            try:
-                control.SetFocus()
-                if self._wait_for_keyboard_focus(control) is not True:
-                    return False
-                # 点击后的回退可能重复提交；焦点切换也可能改变草稿。
-                # 只有紧邻 Enter 仍可读且一致，才能继续回退。
-                current_available, current_text = self._try_input_value(control)
-                if (not current_available
-                        or self._normalize_input_text(current_text)
-                        != self._normalize_input_text(expected_text)):
-                    return False
-            except Exception:
-                return False
-            mark_send_submitted()
-            win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
-            win32api.keybd_event(
-                win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0
-            )
-            return True
-
     def resolve_message_reference(
-        self, message: UiaChatMessage
+        self, message: UiaChatMessage, *, allow_filename_cache: bool = True, validate_target=None,
     ) -> UiaChatMessage:
-        return self._reference_resolver.resolve_message_reference(message)
+        return self._reference_resolver.resolve_message_reference(
+            message, allow_filename_cache=allow_filename_cache, validate_target=validate_target)
 
     @staticmethod
     def _share_card_activation_point(
@@ -1810,29 +1829,31 @@ class WechatUiaClient:
                 win32clipboard.CloseClipboard()
         return value
 
-    def _click_copy_link_menu(self, browser_hwnd: int) -> bool:
-        return self._share_browser._click_copy_link_menu(browser_hwnd)
+    def _click_copy_link_menu(self, browser_hwnd: int, *, validate_context=None) -> bool:
+        return self._share_browser._click_copy_link_menu(browser_hwnd, validate_context=validate_context)
 
-    def _close_share_browser(self, browser_hwnd: int, main_hwnd: int) -> bool:
-        return self._share_browser._close_share_browser(browser_hwnd, main_hwnd)
+    def _close_share_browser(self, browser_hwnd: int, main_hwnd: int, *, restore_main=True, expected_identity=None) -> bool:
+        return self._share_browser._close_share_browser(
+            browser_hwnd, main_hwnd, restore_main=restore_main, expected_identity=expected_identity)
 
     def fetch_referenced_share_url(self, message: UiaChatMessage) -> str:
         return self._share_browser.fetch_referenced_share_url(message)
 
-    def fetch_referenced_share_page(self, message: UiaChatMessage) -> tuple[str, str]:
-        return self._share_browser.fetch_referenced_share_page(message)
+    def fetch_referenced_share_page(self, message: UiaChatMessage, *, strict=False, validate_target=None) -> tuple[str, str]:
+        return self._share_browser.fetch_referenced_share_page(message, strict=strict, validate_target=validate_target)
 
-    def _fetch_referenced_share(self, message: UiaChatMessage, *, direct_read: bool) -> tuple[str, str]:
-        return self._share_browser._fetch_referenced_share(message, direct_read=direct_read)
+    def _fetch_referenced_share(self, message: UiaChatMessage, *, direct_read: bool, strict=False, validate_target=None) -> tuple[str, str]:
+        return self._share_browser._fetch_referenced_share(
+            message, direct_read=direct_read, strict=strict, validate_target=validate_target)
 
-    def _read_share_browser_content(self, browser_hwnd: int) -> str:
-        return self._share_browser._read_share_browser_content(browser_hwnd)
+    def _read_share_browser_content(self, browser_hwnd: int, *, validate_context=None) -> str:
+        return self._share_browser._read_share_browser_content(browser_hwnd, validate_context=validate_context)
 
     def _read_share_browser_uia_content_once(self, browser_hwnd: int) -> str:
         return self._share_browser._read_share_browser_uia_content_once(browser_hwnd)
 
-    def _wait_for_share_browser_content(self, browser_hwnd: int) -> str:
-        return self._share_browser._wait_for_share_browser_content(browser_hwnd)
+    def _wait_for_share_browser_content(self, browser_hwnd: int, *, validate_context=None) -> str:
+        return self._share_browser._wait_for_share_browser_content(browser_hwnd, validate_context=validate_context)
 
     def _normalize_share_browser_content(self, value: str) -> str:
         return self._share_browser._normalize_share_browser_content(value)
@@ -1843,8 +1864,13 @@ class WechatUiaClient:
     def fetch_share_page_from_point(self, point: tuple[int, int]) -> tuple[str, str]:
         return self._share_browser.fetch_share_page_from_point(point)
 
-    def _fetch_share_from_point(self, point: tuple[int, int], *, direct_read: bool) -> tuple[str, str]:
-        return self._share_browser._fetch_share_from_point(point, direct_read=direct_read)
+    def fetch_share_message_page(self, message: UiaChatMessage, *, strict=False, validate_target=None) -> tuple[str, str]:
+        return self._share_browser.fetch_share_message_page(message, strict=strict, validate_target=validate_target)
+
+    def _fetch_share_from_point(self, point: tuple[int, int], *, direct_read: bool,
+                               validate_before_click=None, validate_context=None) -> tuple[str, str]:
+        return self._share_browser._fetch_share_from_point(
+            point, direct_read=direct_read, validate_before_click=validate_before_click, validate_context=validate_context)
 
     def _copy_control_file_paths(self, control) -> list[str]:
         return self._attachment_reader._copy_control_file_paths(control)
@@ -1880,16 +1906,20 @@ class WechatUiaClient:
         return self._attachment_reader._try_cancel_verified_native_dialog(dialog_hwnd, main_hwnd)
 
     def fetch_message_file(
-        self, message: UiaChatMessage, tmp_root: Optional[Path] = None
+        self, message: UiaChatMessage, tmp_root: Optional[Path] = None,
+        *, allow_filename_cache: bool = True, validate_target=None,
     ) -> str:
-        return self._attachment_reader.fetch_message_file(message, tmp_root)
+        return self._attachment_reader.fetch_message_file(
+            message, tmp_root, allow_filename_cache=allow_filename_cache, validate_target=validate_target)
 
     def _capture_image_viewer_from_point(
         self,
         point: tuple[int, int],
         target: Path,
+        *, validate_before_click=None, validate_context=None,
     ) -> str:
-        return self._attachment_reader._capture_image_viewer_from_point(point, target)
+        return self._attachment_reader._capture_image_viewer_from_point(
+            point, target, validate_before_click=validate_before_click, validate_context=validate_context)
 
     _reference_image_activation_point = staticmethod(WechatAttachmentReader._reference_image_activation_point)
 
@@ -1897,16 +1927,20 @@ class WechatUiaClient:
         self,
         message: UiaChatMessage,
         tmp_root: Optional[Path] = None,
+        *, strict: bool = False, validate_target=None,
     ) -> str:
-        return self._attachment_reader.fetch_referenced_message_image(message, tmp_root)
+        return self._attachment_reader.fetch_referenced_message_image(
+            message, tmp_root, strict=strict, validate_target=validate_target)
 
     def fetch_message_image(
         self,
         message: UiaChatMessage,
         tmp_root: Optional[Path] = None,
         prefer_viewer: bool = True,
+        *, strict: bool = False, validate_target=None,
     ) -> str:
-        return self._attachment_reader.fetch_message_image(message, tmp_root, prefer_viewer)
+        return self._attachment_reader.fetch_message_image(
+            message, tmp_root, prefer_viewer, strict=strict, validate_target=validate_target)
 
     def _clipboard(self, unicode_text: Optional[str]=None, files: Optional[Iterable[str]]=None):
         return self._send_controller._clipboard(unicode_text, files)

@@ -28,14 +28,13 @@ def _invalidate(cache, talker, change, local_id=1):
 
 
 def _capture_submission(channel):
-    sent, registered, stages = [], [], []
+    sent, stages = [], []
     channel._deliver = lambda *args, **kwargs: sent.append((args, kwargs)) or SendResult(SendStatus.SENT)
-    channel._driver.register_interim_text = lambda *args: registered.append(args)
     channel._mark_lifecycle = lambda ids, stage, **kwargs: stages.append(stage)
     channel.config.update(agent_failure_notice_templates=["合成失败提示"],
                           agent_tool_notice_templates=["正在调用 {tool_name}"],
                           agent_tool_notice_enabled=True)
-    return sent, registered, stages
+    return sent, stages
 
 
 def _invoke(channel, context, output):
@@ -50,12 +49,12 @@ def _invoke(channel, context, output):
 @pytest.mark.parametrize("change", ["delete", "replace", "generation"])
 def test_notices_revalidate_native_source_before_any_submission(tmp_path, store, output, change):
     _, talker, cache, channel, context = _reply_setup(tmp_path, store)
-    sent, registered, stages = _capture_submission(channel)
+    sent, stages = _capture_submission(channel)
     _invalidate(cache, talker, change)
 
     assert _invoke(channel, context, output) is False
 
-    assert sent == registered == stages == []
+    assert sent == stages == []
     assert context["wechat_desktop_queue_terminal"] == "skipped"
     assert store._get_connection().execute(
         "SELECT count(*) FROM conversation_history WHERE direction='outgoing'").fetchone()[0] == 0
@@ -67,12 +66,11 @@ def test_notices_revalidate_native_source_before_any_submission(tmp_path, store,
 @pytest.mark.parametrize("output", ["failure", "tool"])
 def test_valid_source_notice_still_submits(tmp_path, store, output):
     _, _, _, channel, context = _reply_setup(tmp_path, store)
-    sent, registered, _ = _capture_submission(channel)
+    sent, _ = _capture_submission(channel)
 
     assert _invoke(channel, context, output) is True
 
     assert len(sent) == 1
-    assert len(registered) == int(output == "tool")
     assert store._get_connection().execute(
         "SELECT count(*) FROM conversation_history WHERE direction='outgoing'").fetchone()[0] == 1
 
@@ -94,13 +92,13 @@ def test_aggregate_reply_revalidates_earlier_source(tmp_path, store, output, def
     context.update(msg=WechatDesktopMessage(target),
                    wechat_desktop_source_event_ids=target.task.source_event_ids)
     assert channel._driver.validate_reply_target(last).valid
-    sent, registered, stages = _capture_submission(channel)
+    sent, stages = _capture_submission(channel)
     _invalidate(cache, talker, change, local_id=1)
     assert channel._driver.validate_reply_target(last).valid
 
     _invoke(channel, context, output)
 
-    assert sent == registered == stages == []
+    assert sent == stages == []
     assert context["wechat_desktop_queue_terminal"] == "skipped"
     assert store._get_connection().execute(
         "SELECT count(*) FROM conversation_history WHERE direction='outgoing'").fetchone()[0] == 0
@@ -135,7 +133,7 @@ def test_tool_callback_on_withdrawn_source_finishes_queue_as_skipped(tmp_path, s
     channel._reply_queue.enqueue(event)
     item = channel._reply_queue.get()
     context["wechat_desktop_queue_token"] = item.token
-    sent, registered, _ = _capture_submission(channel)
+    sent, _ = _capture_submission(channel)
     cancelled = []
     monkeypatch.setattr(agent.protocol, "get_cancel_registry",
                         lambda: SimpleNamespace(cancel_request=cancelled.append))
@@ -146,7 +144,7 @@ def test_tool_callback_on_withdrawn_source_finishes_queue_as_skipped(tmp_path, s
 
     assert item.done.is_set() and item.terminal == "skipped"
     assert cancelled == [event.event_id]
-    assert sent == registered == []
+    assert sent == []
     channel._send_reply_impl(Reply(ReplyType.TEXT, "迟到回复"), context)
     channel._fail_callback(event.conversation_id, RuntimeError("合成模型异常"), context=context)
     assert item.terminal == context["wechat_desktop_queue_terminal"] == "skipped"
@@ -164,7 +162,7 @@ def test_event_only_failure_notice_preserves_skipped_worker_terminal(tmp_path, s
     event = context["msg"].event
     channel._reply_queue.enqueue(event)
     item = channel._reply_queue.get()
-    sent, registered, stages = _capture_submission(channel)
+    sent, stages = _capture_submission(channel)
     channel._dispatch_message = lambda *args: True
     monkeypatch.setattr(AgentReplyCoordinator, "wait_for_reply", lambda self, item: terminal)
     _invalidate(cache, talker, "delete")
@@ -173,7 +171,7 @@ def test_event_only_failure_notice_preserves_skipped_worker_terminal(tmp_path, s
 
     assert result == "skipped"
     assert event.task.source_invalid
-    assert sent == registered == []
+    assert sent == []
     assert "send_started" not in stages
     audit = store._get_connection().execute(
         "SELECT action_type,result FROM audit ORDER BY id DESC LIMIT 1").fetchone()
@@ -192,7 +190,7 @@ def test_deferred_preflight_revalidates_all_sources_before_materialization(tmp_p
     target = channel._prepare_deferred_materialization([first, last])
     channel._reply_queue.enqueue(target)
     item = channel._reply_queue.get()
-    sent, registered, stages = _capture_submission(channel)
+    sent, stages = _capture_submission(channel)
     channel._materialize_batch = lambda *args, **kwargs: pytest.fail("失效来源仍被物化")
     channel._dispatch_message = lambda *args: pytest.fail("失效来源仍启动 Agent")
     _invalidate(cache, talker, "delete", local_id=1)
@@ -201,5 +199,5 @@ def test_deferred_preflight_revalidates_all_sources_before_materialization(tmp_p
 
     assert result == "skipped"
     assert item.done.is_set() and item.terminal == "skipped"
-    assert sent == registered == []
+    assert sent == []
     assert "send_started" not in stages

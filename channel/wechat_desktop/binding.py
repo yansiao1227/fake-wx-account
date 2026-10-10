@@ -69,30 +69,54 @@ class DatabaseUiaTargetBinder:
         if session_epoch is not None and session_epoch != self._source.session_epoch:
             raise DatabaseReadError("account_binding_changed", "发送期间数据库账号绑定已变化")
 
-    def resolve_target(self, conversation, *, session_epoch=None):
+    @classmethod
+    def _trusted_database_target(cls, reader, conversation):
+        contact, failure = cls._database_target(reader, conversation)
+        if failure:
+            return None, failure
+        duplicates = [item for item in reader.match_contacts(contact["display_name"])
+                      if cls._titles_match(item["display_name"], contact["display_name"],
+                                           is_group=item["is_group"] and contact["is_group"])]
+        if len(duplicates) != 1:
+            return None, TargetResolution(TargetStatus.AMBIGUOUS, reason="数据库显示名无法唯一绑定微信界面")
+        if not contact["display_name"] or not isinstance(contact.get("is_group"), bool):
+            return None, TargetResolution(TargetStatus.STALE, reason="数据库会话名称或类型无法验证")
+        return contact, None
+
+    def resolve_send_target(self, conversation):
+        """策略授权使用数据库规范身份，不创建网关或访问桌面控件。"""
+        try:
+            with self._source.reader_session() as reader:
+                reader.refresh()
+                contact, failure = self._trusted_database_target(reader, conversation)
+                if failure:
+                    return failure
+                return TargetResolution(TargetStatus.RESOLVED, ConversationTarget(
+                    contact["conversation_id"], contact["display_name"], contact["is_group"]),
+                    "database_identity_verified; ui_binding_pending")
+        except Exception as exc:
+            return TargetResolution(TargetStatus.STALE, reason=getattr(exc, "code", "target_resolution_failed"))
+
+    def resolve_target(self, conversation, *, session_epoch=None, attachment=False):
         try:
             # 无效数据库身份在创建桌面组件前拒绝。
             with self._source.reader_session() as reader:
                 self._require_epoch(session_epoch)
                 reader.refresh()
-                contact, failure = self._database_target(reader, conversation)
+                contact, failure = self._trusted_database_target(reader, conversation)
                 if failure:
                     return failure
             gateway = self._gateway_provider()
             # 锁顺序固定为 UI 租约 -> 绑定 -> 来源，发送段复核也沿用此顺序。
-            with gateway.operation(), self._lock, self._source.reader_session() as reader:
+            operation = gateway.operation(reply=False) if attachment else gateway.operation()
+            with operation, self._lock, self._source.reader_session() as reader:
                 self._require_epoch(session_epoch)
                 self._sync_session_epoch()
                 reader.refresh()
-                contact, failure = self._database_target(reader, conversation)
+                contact, failure = self._trusted_database_target(reader, conversation)
                 if failure:
                     return failure
                 self._verify_account(reader, gateway)
-                duplicates = [item for item in reader.match_contacts(contact["display_name"])
-                              if self._titles_match(item["display_name"], contact["display_name"],
-                                                    is_group=item["is_group"] and contact["is_group"])]
-                if len(duplicates) != 1:
-                    return TargetResolution(TargetStatus.AMBIGUOUS, reason="数据库显示名无法唯一绑定微信界面")
                 matches = [row for row in gateway.list_conversations()
                            if self._titles_match(row.conversation_title, contact["display_name"],
                                                  is_group=contact["is_group"])]
@@ -104,7 +128,10 @@ class DatabaseUiaTargetBinder:
                 if not row.runtime_id:
                     return TargetResolution(TargetStatus.STALE, reason="目标会话缺少稳定 RuntimeId")
                 cid = contact["conversation_id"]
-                binding = (row.runtime_id, row.conversation_title, reader.account_id, reader.binding.pid)
+                window = gateway.inspect_window_identity() if hasattr(gateway, "inspect_window_identity") else None
+                if attachment and (not window or not window[0] or window[1] != reader.binding.pid):
+                    return TargetResolution(TargetStatus.STALE, reason="attachment_window_unverified")
+                binding = (row.runtime_id, row.conversation_title, reader.account_id, reader.binding.pid, window)
                 previous = self._bindings.get(cid)
                 if previous and previous != binding:
                     return TargetResolution(TargetStatus.STALE, reason="目标会话绑定已变化，需要重启后重新绑定")
@@ -126,6 +153,15 @@ class DatabaseUiaTargetBinder:
             raise SendNotSubmitted(result.reason)
         if authorized_target is not None and result.target != authorized_target:
             raise SendNotSubmitted("authorized_target_changed")
+        return result.target
+
+    def require_attachment_target(self, conversation, *, session_epoch=None, authorized_target=None):
+        """附件 UI 段沿用账号、窗口和 RuntimeId 绑定，且不标记为发送任务。"""
+        result = self.resolve_target(conversation, session_epoch=session_epoch, attachment=True)
+        if result.status != TargetStatus.RESOLVED or result.target is None:
+            raise SendNotSubmitted(result.reason)
+        if authorized_target is not None and result.target != authorized_target:
+            raise SendNotSubmitted("attachment_target_changed")
         return result.target
 
     def current_conversation(self):

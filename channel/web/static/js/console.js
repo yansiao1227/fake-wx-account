@@ -6993,8 +6993,9 @@ function loadWechatDesktopPanel() {
         const stateText = escapeHtml(s.login_status || 'unknown');
         const modeText = escapeHtml(s.mode || 'unavailable');
         const accountText = escapeHtml(s.owner_name || '-');
-        const uiaText = s.uia_available ? (zh ? '可用' : 'Available') : (zh ? '不可用' : 'Unavailable');
-        const hookText = s.shell_hook_active ? (zh ? '运行中' : 'Active') : (zh ? '未运行' : 'Inactive');
+        const uiaText = s.uia_available ? (zh ? '已初始化' : 'Initialized') : (zh ? '按需初始化' : 'Initialized on demand');
+        const dbText = s.db_read_stale ? (zh ? '缓存陈旧，暂停接收' : 'Stale cache, reception paused')
+            : s.db_read_healthy ? (zh ? '正常' : 'Healthy') : (zh ? '等待读取' : 'Waiting for read');
         const queueText = `${Number(s.queue_depth || 0)}${s.queue_active_conversation ? ` / ${escapeHtml(s.queue_active_conversation)}` : ''}`;
         const observedText = s.last_observation_at
             ? new Date(Number(s.last_observation_at) * 1000).toLocaleTimeString()
@@ -7013,7 +7014,7 @@ function loadWechatDesktopPanel() {
                         <span>${zh ? '观测' : 'Observation'}: ${modeText}</span>
                         <span>${zh ? '微信账号' : 'WeChat account'}: ${accountText}</span>
                         <span>UIA: ${escapeHtml(uiaText)}</span>
-                        <span>Shell Hook: ${escapeHtml(hookText)}</span>
+                        <span>${zh ? '数据库接收' : 'Database reception'}: ${escapeHtml(dbText)}</span>
                         <span>${zh ? '消息队列' : 'Reply queue'}: ${queueText}</span>
                         <span>${zh ? '最后观测' : 'Last observed'}: ${escapeHtml(observedText)}</span>
                     </div>

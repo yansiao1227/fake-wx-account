@@ -14,7 +14,6 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from channel.wechat_desktop.uia.shell_hook import WindowsShellHook
 from channel.wechat_desktop.uia.client import (
     MESSAGE_LIST_ID,
     WechatUiaClient,
@@ -335,7 +334,6 @@ def main() -> int:
             "uia_selection_settle_ms_max": 1100,
         }
     )
-    hook = WindowsShellHook(client.allowed_process_ids)
     report = {"backend": "uia", "screenshot": False, "ocr": False}
     try:
         client.focus_window()
@@ -360,8 +358,6 @@ def main() -> int:
         report["mentioned_conversations"] = sum(
             item.mentions_self is True for item in conversations
         )
-        report["shell_hook_active"] = hook.start()
-        report["shell_hook_error"] = hook.error
         if args.conversation:
             messages = client.get_chat_history(args.conversation, args.limit)
             report["history"] = {
@@ -483,8 +479,6 @@ def main() -> int:
         report["error"] = str(exc)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 1
-    finally:
-        hook.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))
     print("[WARN] The report contains visible chat text; review before sharing.")
     return 0
