@@ -381,3 +381,114 @@ def test_bridge_image_delivery_and_future_pointer_both_survive(monkeypatch, tmp_
     assert reply.content == "file://" + str(image)
     restored = AgentInitializer._filter_text_only_messages(store.load_messages("synthetic_wechat"))
     assert str(image) in text_of(_compact(restored)[-1])
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+def test_bridge_blocks_idle_evolution_through_session_finalization(monkeypatch, tmp_path, with_image):
+    import agent.evolution.trigger as trigger
+
+    mark_run_active = trigger.mark_run_active
+    note_user_turn = trigger.note_user_turn
+    files = []
+    if with_image:
+        image = tmp_path / "generated.png"
+        image.write_bytes(b"synthetic image marker")
+        files.append({"file_type": "image", "path": str(image)})
+    agent = _FakeAgent([], files=files)
+    agent._evo_turns = 1
+    bridge, store = _bridge(monkeypatch, tmp_path, agent)
+    bridge.agents = {"synthetic_wechat": agent}
+    now = [1000.0]
+    monkeypatch.setattr(trigger.time, "time", lambda: now[0])
+    cfg = SimpleNamespace(min_turns=1, idle_seconds=10)
+    transcripts = []
+
+    def evolve(*args, **kwargs):
+        with agent.messages_lock:
+            transcripts.append(deepcopy(agent.messages))
+
+    monkeypatch.setattr(trigger, "run_evolution_for_session", evolve)
+    marks = []
+    checkpoints = []
+
+    def mark(target, active):
+        marks.append(active)
+        mark_run_active(target, active)
+        if not active:
+            trigger._scan_once(bridge, cfg)
+
+    def scan_checkpoint(phase):
+        now[0] = 1100.0  # 模拟本轮已超过 idle_seconds。
+        checkpoints.append((phase, agent._evo_run_active))
+        trigger._scan_once(bridge, cfg)
+
+    monkeypatch.setattr(trigger, "mark_run_active", mark)
+    monkeypatch.setattr(bridge_module.AgentEventHandler, "log_summary", lambda self: scan_checkpoint("summary"))
+    persist_messages = bridge._persist_messages
+
+    def persist(*args, **kwargs):
+        scan_checkpoint("persist")
+        persist_messages(*args, **kwargs)
+
+    def note(target, **kwargs):
+        scan_checkpoint("note")
+        note_user_turn(target, **kwargs)
+
+    monkeypatch.setattr(bridge, "_persist_messages", persist)
+    monkeypatch.setattr(trigger, "note_user_turn", note)
+    reply = bridge.agent_reply(_legacy_prompt("新的原消息", "不应进入 evolution 的候选历史"), _context())
+
+    assert reply.type == (ReplyType.IMAGE_URL if with_image else ReplyType.TEXT)
+    assert marks == [True, False]
+    assert checkpoints == [("summary", True), ("persist", True), ("note", True)]
+    assert transcripts == []
+    assert agent._evo_run_active is False
+    assert agent._evo_last_active == 1100.0
+    assert text_of(store.load_messages("synthetic_wechat")[0]) == "新的原消息"
+    now[0] = 1200.0
+    trigger._scan_once(bridge, cfg)
+    assert len(transcripts) == 1
+    assert text_of(transcripts[0][0]) == "新的原消息"
+    assert "不应进入 evolution 的候选历史" not in str(transcripts[0])
+    assert "[回复要求]" not in str(transcripts[0])
+    if with_image:
+        assert str(image) in text_of(transcripts[0][-1])
+
+
+@pytest.mark.parametrize("phase", ["run", "summary", "sanitize", "persist", "note"])
+def test_bridge_releases_evolution_flag_when_finalization_fails(monkeypatch, tmp_path, phase):
+    import agent.evolution.trigger as trigger
+    import channel.wechat_desktop.pipeline.session_context as session_context
+
+    mark_run_active = trigger.mark_run_active
+    agent = _FakeAgent([])
+    bridge, store = _bridge(monkeypatch, tmp_path, agent)
+    marks = []
+    active_at_failure = []
+
+    def mark(target, active):
+        marks.append(active)
+        mark_run_active(target, active)
+
+    def fail(*args, **kwargs):
+        active_at_failure.append(agent._evo_run_active)
+        raise RuntimeError("synthetic finalization failure")
+
+    monkeypatch.setattr(trigger, "mark_run_active", mark)
+    if phase == "run":
+        monkeypatch.setattr(agent, "run_stream", fail)
+    elif phase == "summary":
+        monkeypatch.setattr(bridge_module.AgentEventHandler, "log_summary", fail)
+    elif phase == "sanitize":
+        monkeypatch.setattr(session_context, "replace_run_user", fail)
+    elif phase == "persist":
+        monkeypatch.setattr(bridge, "_persist_messages", fail)
+    else:
+        monkeypatch.setattr(trigger, "note_user_turn", fail)
+
+    reply = bridge.agent_reply(_legacy_prompt(), _context())
+    assert reply.type == (ReplyType.TEXT if phase == "note" else ReplyType.ERROR)
+    assert active_at_failure == [True]
+    assert marks == [True, False]
+    assert agent._evo_run_active is False
+    assert text_of(store.load_messages("synthetic_wechat")[0]) == "新的原消息"
