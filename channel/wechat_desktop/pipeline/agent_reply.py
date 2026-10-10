@@ -13,7 +13,7 @@ from channel.wechat_desktop.pipeline.prompts import (
     _is_user_visible_tool_notice,
     _link_reading_instruction,
     _preflight_tool_notice_data,
-    _render_event_context_lines,
+    _render_event_context,
     _reply_requirements,
     _strip_group_bot_mentions,
     _tool_notice_subject,
@@ -124,18 +124,6 @@ class AgentReplyCoordinator:
                 if not any(str(item.get(key) or "") in invalid_context_ids
                            for key in ("_message_stable_id", "source_message_id"))
             ]
-        # 只保留实际进入提示词的上文证据；已排除的来源不再阻断最终回复。
-        history_ids = {
-            str(item.get(key) or "") for item in event.history
-            for key in ("_message_stable_id", "source_message_id")
-            if item.get(key)
-        }
-        event.task.context_source_events = [] if event.reference else [
-            source for source in valid_context_sources
-            if any(identity and identity in history_ids
-                   for identity in (source.message_stable_id, source.source_message_id))
-        ]
-        used_context_sources = deepcopy(event.task.context_source_events)
         msg = WechatDesktopMessage(event)
         ctype = msg.ctype
         content = msg.content
@@ -191,8 +179,9 @@ class AgentReplyCoordinator:
                     "被引用的文件未能从微信缓存中取得。"
                     "不要猜测文件内容，直接说明目前无法读取该文件。"
                 )
+        used_history = []
         if ctype == ContextType.TEXT:
-            history_heading, history_lines = _render_event_context_lines(event, channel.config)
+            history_heading, history_lines, used_history = _render_event_context(event, channel.config)
             channel._trace(
                 "09-context",
                 "id=%s conversation=%s history_available=%s history_used=%s history_chars=%s history_source=%s",
@@ -241,6 +230,18 @@ class AgentReplyCoordinator:
                         channel.config.get("self_display_name", ""),
                     ],
                 )
+        # 条数/字符预算剔除的上文未交给模型，不能再阻断最终回复。
+        history_ids = {
+            str(item.get(key) or "") for item in used_history
+            for key in ("_message_stable_id", "source_message_id")
+            if item.get(key)
+        }
+        event.task.context_source_events = [
+            source for source in valid_context_sources
+            if any(identity and identity in history_ids
+                   for identity in (source.message_stable_id, source.source_message_id))
+        ]
+        used_context_sources = deepcopy(event.task.context_source_events)
         context = channel._compose_context(
             ctype,
             content,

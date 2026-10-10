@@ -476,6 +476,7 @@ class AgentBridge:
         token_key = None
         steer_inbox = None
         evolution_run_active = False
+        session_reply_active = False
         from channel.wechat_desktop.pipeline.session_context import (
             current_run_messages,
             is_wechat_auto_reply,
@@ -507,6 +508,17 @@ class AgentBridge:
             agent = self.get_agent(session_id=session_id)
             if not agent:
                 return Reply(ReplyType.ERROR, "Failed to initialize super agent")
+
+            # 取得会话后立即保护整个准备、执行和收尾阶段。
+            with agent.messages_lock:
+                agent._bridge_reply_active = True
+                session_reply_active = True
+                try:
+                    from agent.evolution.trigger import mark_run_active
+                    mark_run_active(agent, True)
+                    evolution_run_active = True
+                except Exception:
+                    pass
             
             # Create event handler for logging and channel communication
             event_handler = AgentEventHandler(context=context, original_callback=on_event)
@@ -562,16 +574,6 @@ class AgentBridge:
             pre_persisted = self._pre_persist_user_message(
                 session_id, query, context, clear_history
             )
-
-            # Mark this session as mid-run so the self-evolution idle scan does
-            # not fire concurrently when a single turn runs longer than
-            # idle_minutes.
-            try:
-                from agent.evolution.trigger import mark_run_active
-                mark_run_active(agent, True)
-                evolution_run_active = True
-            except Exception:
-                pass
 
             try:
                 if session_id:
@@ -721,14 +723,28 @@ class AgentBridge:
                     pass
             return Reply(ReplyType.ERROR, f"Agent error: {str(e)}")
         finally:
-            # 会话原文替换、持久化与用户活动记录完成后，才允许空闲扫描。
-            # 最外层 finally 同时覆盖执行、整理和错误处理中的异常。
-            if evolution_run_active:
-                try:
-                    from agent.evolution.trigger import mark_run_active
-                    mark_run_active(agent, False)
-                except Exception:
-                    pass
+            # 后台结果在本轮整理和持久化之后写入，避免混入本轮审计切片。
+            try:
+                if session_reply_active:
+                    with agent.messages_lock:
+                        pending = getattr(agent, "_pending_scheduled_outputs", [])
+                        agent._pending_scheduled_outputs = []
+                        try:
+                            for scheduled_args in pending:
+                                try:
+                                    self._apply_scheduled_output(*scheduled_args, agent=agent)
+                                except Exception as e:
+                                    logger.warning(f"[AgentBridge] Failed to flush scheduled output: {e}")
+                        finally:
+                            agent._bridge_reply_active = False
+            finally:
+                # 包括准备、执行、整理及后台结果入库异常，均解除保护。
+                if evolution_run_active:
+                    try:
+                        from agent.evolution.trigger import mark_run_active
+                        mark_run_active(agent, False)
+                    except Exception:
+                        pass
     
     def _schedule_mcp_hot_reload(self, agent):
         """
@@ -1042,6 +1058,8 @@ class AgentBridge:
         content: str,
         channel_type: str = "",
         task_description: str = "",
+        *,
+        evolution_backup_id: Optional[str] = None,
     ) -> None:
         """Add the visible output of a scheduled task to the receiver's session.
 
@@ -1070,20 +1088,40 @@ class AgentBridge:
         if len(content) > max_len:
             content = content[:max_len] + "..."
 
-        user_text = self._SCHEDULED_MARKER
-        if task_description:
-            user_text = f"{self._SCHEDULED_MARKER} {task_description}"
-
+        from channel.wechat_desktop.pipeline.session_context import (
+            scheduled_user_message, scheduled_assistant_message,
+        )
         messages = [
-            {"role": "user", "content": [{"type": "text", "text": user_text}]},
-            {"role": "assistant", "content": [{"type": "text", "text": content}]},
+            scheduled_user_message(task_description),
+            scheduled_assistant_message(
+                content, backup_id=(evolution_backup_id if task_description == "self-evolution" else None),
+            ),
         ]
+
+        keep_last_n = max(int(conf().get("scheduler_inject_max_per_session", 3) or 0), 0)
+        scheduled_args = (session_id, messages, channel_type, keep_last_n)
+        agent = self.agents.get(session_id)
+        if agent:
+            with agent.messages_lock:
+                if getattr(agent, "_bridge_reply_active", False):
+                    if not hasattr(agent, "_pending_scheduled_outputs"):
+                        agent._pending_scheduled_outputs = []
+                    agent._pending_scheduled_outputs.append(scheduled_args)
+                    return
+                self._apply_scheduled_output(*scheduled_args, agent=agent)
+        else:
+            self._apply_scheduled_output(*scheduled_args)
+
+    def _apply_scheduled_output(
+        self, session_id: str, messages: list, channel_type: str,
+        keep_last_n: int, *, agent=None,
+    ) -> None:
+        """调用方持有会话 messages_lock，整个注入不会与回复整理交错。"""
 
         # Persist first so the new pair gets a stable seq, then prune old
         # scheduler pairs in DB, then sync the in-memory agent.messages buffer.
         self._persist_messages(session_id, messages, channel_type)
 
-        keep_last_n = max(int(conf().get("scheduler_inject_max_per_session", 3) or 0), 0)
         try:
             from agent.memory import get_conversation_store
             deleted = get_conversation_store().prune_scheduled_messages(
@@ -1100,12 +1138,10 @@ class AgentBridge:
                 f"for session={session_id}: {e}"
             )
 
-        agent = self.agents.get(session_id)
         if agent:
             try:
-                with agent.messages_lock:
-                    agent.messages.extend(messages)
-                    self._prune_scheduled_in_memory(agent, keep_last_n)
+                agent.messages.extend(messages)
+                self._prune_scheduled_in_memory(agent, keep_last_n)
             except Exception as e:
                 logger.warning(
                     f"[AgentBridge] Failed to update in-memory scheduled output "

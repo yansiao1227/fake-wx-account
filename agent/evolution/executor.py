@@ -514,6 +514,7 @@ def _inject_evolution_record(
             content=note,
             channel_type=channel_type,
             task_description="self-evolution",
+            evolution_backup_id=backup_id,
         )
     except Exception as e:
         logger.debug(f"[Evolution] Failed to inject evolution record: {e}")

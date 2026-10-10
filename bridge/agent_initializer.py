@@ -217,14 +217,16 @@ class AgentInitializer:
 
         # Group into turns: each turn starts with a real user message
         from channel.wechat_desktop.pipeline.session_context import (
-            is_internal_user_hint, is_wechat_session_user,
+            SCHEDULED_SOURCE, is_internal_user_hint, is_wechat_session_user,
+            is_scheduled_session_user, scheduled_assistant_message,
         )
         turns = []
         current_turn = None
         for msg in messages:
             if _is_real_user_msg(msg):
                 if (current_turn is not None
-                        and is_wechat_session_user(current_turn["user"])
+                        and (is_wechat_session_user(current_turn["user"])
+                             or is_scheduled_session_user(current_turn["user"]))
                         and is_internal_user_hint(msg)):
                     # 只在确知的微信轮次中排除固定 Agent 提醒，不吞掉真实原消息。
                     continue
@@ -234,7 +236,7 @@ class AgentInitializer:
             elif current_turn is not None and msg.get("role") == "assistant":
                 text = _extract_text(msg.get("content"))
                 if text:
-                    current_turn["assistants"].append(text)
+                    current_turn["assistants"].append(msg)
         if current_turn is not None:
             turns.append(current_turn)
 
@@ -263,16 +265,31 @@ class AgentInitializer:
                             input_paths.extend(path for path in paths if isinstance(path, str))
                 if input_paths:
                     user_block["input_artifact_paths"] = input_paths[-2:]
+            if is_scheduled_session_user(turn["user"]):
+                user_block["source"] = SCHEDULED_SOURCE
             filtered.append({
                 "role": "user",
                 "content": [user_block]
             })
             if turn["assistants"]:
-                final_reply = turn["assistants"][-1]
-                filtered.append({
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": final_reply}]
-                })
+                final_message = turn["assistants"][-1]
+                final_reply = _extract_text(final_message.get("content"))
+                if is_scheduled_session_user(turn["user"]):
+                    backup_id = None
+                    blocks = final_message.get("content")
+                    if isinstance(blocks, list):
+                        backup_id = next((
+                            block.get("evolution_backup_id") for block in blocks
+                            if isinstance(block, dict) and block.get("type") == "text"
+                            and block.get("source") == SCHEDULED_SOURCE
+                            and block.get("evolution_backup_id")
+                        ), None)
+                    filtered.append(scheduled_assistant_message(final_reply, backup_id=backup_id))
+                else:
+                    filtered.append({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": final_reply}]
+                    })
 
         return filtered
     

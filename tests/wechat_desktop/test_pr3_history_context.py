@@ -38,7 +38,7 @@ def test_cross_batch_history_keeps_native_evidence_for_later_validation(tmp_path
 
 def test_only_selected_history_keeps_evidence_and_outgoing_sources_validate(tmp_path):
     reader, talker = make_reader(tmp_path)
-    reader.config["wechat_history_max_messages"] = 2
+    reader.config["reply_context_max_messages"] = 2
     cache = reader.caches["message/message_0.db"]
     for local_id in range(1, 6):
         add_message(cache, talker, local_id, content=f"body {local_id}", created=local_id,
@@ -76,7 +76,7 @@ def test_clock_rollback_does_not_hide_prior_batch_context_for_later_event(tmp_pa
 @pytest.mark.parametrize("timestamp_index", [False, True])
 def test_small_scan_budget_preserves_history_for_every_event_in_same_batch(tmp_path, timestamp_index):
     reader, talker = make_reader(tmp_path)
-    reader.config.update(wechat_history_max_messages=2, db_reply_context_max_rows_per_stream=3)
+    reader.config.update(reply_context_max_messages=2, db_reply_context_max_rows_per_stream=3)
     cache = reader.caches["message/message_0.db"]
     for local_id in range(1, 61):
         add_message(cache, talker, local_id, content=f"body {local_id}", created=local_id)

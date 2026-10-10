@@ -6,6 +6,7 @@ from channel.wechat_desktop.pipeline.session_context import (
     compact_session_messages,
     text_of,
     user_message,
+    preserve_image_pointers,
 )
 
 
@@ -70,3 +71,24 @@ def test_unrepresentable_middle_turn_does_not_open_a_gap_in_retained_history(max
 
     assert [text_of(message) for message in compact] == ["新问", "新答"]
     assert sum(len(text_of(message)) for message in compact) <= max_chars
+
+
+@pytest.mark.parametrize("artifact_type", ["image", "input"])
+def test_artifact_pointer_is_kept_when_it_exactly_fits_budget(tmp_path, artifact_type):
+    artifact = tmp_path / ("result.png" if artifact_type == "image" else "input.txt")
+    artifact.write_bytes(b"artifact")
+    path = str(artifact.resolve())
+    if artifact_type == "image":
+        messages = preserve_image_pointers(
+            _turn("问", "答"), [{"file_type": "image", "path": path}]
+        )
+        pointer = "[本地图片产物] " + path
+    else:
+        messages = [user_message("问", [path]), {"role": "assistant", "content": "答"}]
+        pointer = "[本地输入附件] " + path
+    budget = len(pointer) + 3
+
+    compact = compact_session_messages(messages, max_turns=1, max_chars=budget)
+
+    assert [text_of(message) for message in compact] == ["问", "答\n" + pointer]
+    assert sum(len(text_of(message)) for message in compact) == budget

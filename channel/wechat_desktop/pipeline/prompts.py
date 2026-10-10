@@ -174,10 +174,18 @@ def _strip_group_bot_mentions(value: str, aliases) -> str:
 
 
 def _render_event_context_lines(event: WechatDesktopEvent, config: dict | None = None) -> tuple[str, list[str]]:
+    """保留提示词片段接口；来源证据由渲染结果统一提供。"""
+    heading, lines, _history = _render_event_context(event, config)
+    return heading, lines
+
+
+def _render_event_context(
+    event: WechatDesktopEvent, config: dict | None = None
+) -> tuple[str, list[str], list[dict]]:
     """将事件快照渲染成提示词片段，不在这里重新读取微信 UI。
 
     引用消息只返回被引用的一层内容；普通消息返回候选历史，后续由提示词要求
-    Agent 按相关性筛选。这样可以保证排队期间 UI 变化不会改变回复依据。
+    Agent 按相关性筛选。第三项仅含实际渲染的历史，供最终发送复核来源。
     """
     if event.reference:
         reference = event.reference
@@ -211,7 +219,7 @@ def _render_event_context_lines(event: WechatDesktopEvent, config: dict | None =
         elif not reference_content:
             labels = {"image": "图片", "file": "文件"}
             reference_content = f"[{labels.get(reference_type, '原消息')}内容不可用]"
-        return "[被引用的内容]", [f"{speaker}: {reference_content}"]
+        return "[被引用的内容]", [f"{speaker}: {reference_content}"], []
 
     from channel.wechat_desktop.config import DEFAULT_CONFIG
 
@@ -219,6 +227,7 @@ def _render_event_context_lines(event: WechatDesktopEvent, config: dict | None =
     limit = max(0, min(50, int(config.get("reply_context_max_messages", DEFAULT_CONFIG["reply_context_max_messages"]))))
     budget = max(0, int(config.get("reply_context_max_chars", DEFAULT_CONFIG["reply_context_max_chars"])))
     history_lines = []
+    used_history = []
     # 最近消息优先占用预算；输出仍按时间顺序。标签和换行也计入总字数。
     for item in reversed(event.history[-limit:] if limit else []):
         if budget <= 0:
@@ -237,8 +246,13 @@ def _render_event_context_lines(event: WechatDesktopEvent, config: dict | None =
             marker = "…[历史片段已截断，完整内容需查询]"
             line = line[:max(0, available - len(marker))] + marker[:available]
         history_lines.append(line)
+        used_history.append(item)
         budget -= len(line) + (1 if len(history_lines) > 1 else 0)
-    return "[候选会话上下文，需按关联度筛选]", list(reversed(history_lines))
+    return (
+        "[候选会话上下文，需按关联度筛选]",
+        list(reversed(history_lines)),
+        list(reversed(used_history)),
+    )
 
 
 def _reply_requirements(event: WechatDesktopEvent) -> str:

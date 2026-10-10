@@ -727,12 +727,19 @@ class WechatDatabaseReader:
         return []
 
     def _attach_reply_context(self, records, rows, connections):
-        """同批复用已读行，每流额外索引读取有硬上限，完整排序只在内存进行。"""
+        """同批复用已读行，额外索引读取同时受单流和全批预算限制。
+
+        所有会话/分片共享额外读取预算，预分配 SQL LIMIT；过滤行和边界外
+        行同样占额，耗尽后不寻找更旧消息。本批已读行继续复用，不重复计额。
+        完整排序只在内存进行，没有合适索引时不退回 SQLite 全表扫描。
+        """
         from channel.wechat_desktop.config import DEFAULT_CONFIG
         limit = max(0, min(50, int(self.config.get(
             "reply_context_max_messages", DEFAULT_CONFIG["reply_context_max_messages"]))))
-        scan_limit = max(1, min(10000, int(self.config.get(
+        stream_scan_limit = max(1, min(10000, int(self.config.get(
             "db_reply_context_max_rows_per_stream", DEFAULT_CONFIG["db_reply_context_max_rows_per_stream"]))))
+        scan_budget = max(0, int(self.config.get(
+            "reply_context_scan_max_rows", DEFAULT_CONFIG["reply_context_scan_max_rows"])))
         targets = {}
         batch_rows = {}
         reference_lookup_cache = {}
@@ -748,21 +755,31 @@ class WechatDatabaseReader:
                 stream = self._streams[record.stream_id]
                 targets.setdefault(stream.talker, []).append(
                     (self._row_order(stream, rows[record.source_message_id]), event))
-        for talker, events in targets.items():
+        for events in targets.values():
             events.sort(key=lambda pair: pair[0], reverse=True)
+        streams_by_talker = {talker: [] for talker in targets}
+        for stream in self._streams.values():
+            events = targets.get(stream.talker)
+            if not events or self._highwaters[stream.stream_id]["cursor"] <= 0:
+                continue  # 空来源复用已缓存高水位，不为上下文重新打开查询。
+            if all(event.source_stream_id == stream.stream_id and event.source_local_id <= 1
+                   for _, event in events):
+                continue  # 首个原生消息没有同来源前序正主键。
+            streams_by_talker[stream.talker].append(stream)
+        remaining_streams = sum(len(streams) for streams in streams_by_talker.values())
+        for talker, events in targets.items():
             candidates = {event.source_message_id: [] for _, event in events}
-            for stream in self._streams.values():
-                if stream.talker != talker:
-                    continue
-                if self._highwaters[stream.stream_id]["cursor"] <= 0:
-                    continue  # 空来源复用已缓存高水位，不为上下文重新打开查询。
-                if all(event.source_stream_id == stream.stream_id and event.source_local_id <= 1
-                       for _, event in events):
-                    continue  # 首个原生消息没有同来源前序正主键。
+            for stream in streams_by_talker[talker]:
+                # 提前保留 SQL 查询额度，所有 LIMIT 的总和不超过批次预算；
+                # 不因某 target 缺少可用消息而给它重新分配扫描额度。
+                scan_limit = min(stream_scan_limit, (scan_budget + remaining_streams - 1) // remaining_streams)
+                remaining_streams -= 1
+                scan_budget -= scan_limit
                 candidates_by_id = dict(batch_rows.get(stream.stream_id, {}))
-                candidates_by_id.update({int(row["local_id"]): row for row in self._reply_context_rows(
-                    stream, events, connections[stream.database], scan_limit,
-                    batch_local_ids=candidates_by_id)})
+                if scan_limit:
+                    candidates_by_id.update({int(row["local_id"]): row for row in self._reply_context_rows(
+                        stream, events, connections[stream.database], scan_limit,
+                        batch_local_ids=candidates_by_id)})
                 ordered_rows = sorted(candidates_by_id.values(),
                                       key=lambda row: self._row_order(stream, row), reverse=True)
                 windows = {event.source_message_id: [] for _, event in events}
