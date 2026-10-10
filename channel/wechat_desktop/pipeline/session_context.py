@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from copy import deepcopy
 import os
+import re
 from typing import Any, Mapping
 
 
 USER_SOURCE = "wechat_desktop_user_v1"
 IMAGE_SOURCE = "wechat_desktop_image_artifact_v1"
+SCHEDULED_SOURCE = "wechat_desktop_scheduled_v1"
+_SCHEDULED_PREFIX = "[SCHEDULED]"
+_BACKUP_PREFIX = "[进化备份] backup_id: "
 _IMAGE_PREFIX = "[本地图片产物] "
 _INPUT_PREFIX = "[本地输入附件] "
 _TRUNCATED = "…[已截断]"
@@ -84,6 +88,51 @@ def user_message(user_text: str, input_paths: list[str] | None = None, *, is_ref
     }
 
 
+def scheduled_user_message(task_name: str) -> dict:
+    """仅内部调度注入使用此结构标记，用户输入的同名文本不获得信任。"""
+    text = _SCHEDULED_PREFIX + (" " + task_name if task_name else "")
+    return {"role": "user", "content": [{"type": "text", "text": text, "source": SCHEDULED_SOURCE}]}
+
+
+def _valid_backup_id(backup_id: Any) -> str:
+    if isinstance(backup_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", backup_id):
+        return backup_id
+    return ""
+
+
+def scheduled_assistant_message(content: str, *, backup_id: str | None = None) -> dict:
+    """备份 ID 独立于摘要保存，长摘要裁剪不能破坏撤销所需标识。"""
+    block = {"type": "text", "text": content, "source": SCHEDULED_SOURCE}
+    valid_id = _valid_backup_id(backup_id)
+    if valid_id:
+        block["evolution_backup_id"] = valid_id
+    return {"role": "assistant", "content": [block]}
+
+
+def is_scheduled_session_user(message: Mapping[str, Any]) -> bool:
+    content = message.get("content")
+    return bool(message.get("role") == "user" and isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "text"
+        and block.get("source") == SCHEDULED_SOURCE
+        and isinstance(block.get("text"), str)
+        and (block["text"] == _SCHEDULED_PREFIX or block["text"].startswith(_SCHEDULED_PREFIX + " "))
+        for block in content
+    ))
+
+
+def _message_backup_id(message: Mapping[str, Any]) -> str:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "text"
+                and block.get("source") == SCHEDULED_SOURCE):
+            valid_id = _valid_backup_id(block.get("evolution_backup_id"))
+            if valid_id:
+                return valid_id
+    return ""
+
+
 def _original_user(message: Mapping[str, Any]) -> str:
     content = message.get("content")
     if isinstance(content, list) and any(
@@ -129,7 +178,7 @@ def model_messages(messages: list[dict]) -> list[dict]:
     """API 仅接收协议字段，内部 text 元数据留在 Agent 与持久化记录。"""
     has_marker = any(
         isinstance(block, dict) and block.get("type") == "text"
-        and block.get("source") in (USER_SOURCE, IMAGE_SOURCE)
+        and block.get("source") in (USER_SOURCE, IMAGE_SOURCE, SCHEDULED_SOURCE)
         for message in messages for block in (
             message.get("content") if isinstance(message.get("content"), list) else []
         )
@@ -143,8 +192,8 @@ def model_messages(messages: list[dict]) -> list[dict]:
             continue
         for block in content:
             if (isinstance(block, dict) and block.get("type") == "text"
-                    and block.get("source") in (USER_SOURCE, IMAGE_SOURCE)):
-                for key in ("source", "input_artifact_paths", "is_reference"):
+                    and block.get("source") in (USER_SOURCE, IMAGE_SOURCE, SCHEDULED_SOURCE)):
+                for key in ("source", "input_artifact_paths", "is_reference", "evolution_backup_id"):
                     block.pop(key, None)
     return result
 
@@ -233,7 +282,8 @@ def compact_session_messages(
                         if isinstance(stored_paths, list):
                             input_paths.extend(stored_paths)
                         was_reference = was_reference or block.get("is_reference") is True
-            original_user = _original_user(message)
+            scheduled = is_scheduled_session_user(message)
+            original_user = text_of(message) if scheduled else _original_user(message)
             if original_user and not was_reference:
                 legacy = text_of(message)
                 marked_user = isinstance(blocks, list) and any(
@@ -248,6 +298,7 @@ def compact_session_messages(
                 "user": original_user, "messages": [], "reply": "",
                 "input_paths": _valid_input_paths(input_paths),
                 "is_reference": was_reference,
+                "is_scheduled": scheduled,
             }
         elif current is not None:
             current["messages"].append(message)
@@ -278,37 +329,76 @@ def compact_session_messages(
     remaining = max_chars
     for turn in reversed(turns):
         paths = _turn_image_paths(turn["messages"])
+        backup_id = _message_backup_id(turn["messages"][-1]) if turn["is_scheduled"] else ""
+        backup_line = _BACKUP_PREFIX + backup_id if backup_id else ""
         reply_lines = [
             line for line in turn["reply"].splitlines()
             if not line.startswith((_IMAGE_PREFIX, _INPUT_PREFIX))
+            and (not backup_line or line != backup_line)
         ]
         reply = "\n".join(reply_lines)
         pointer_lines = [_IMAGE_PREFIX + path for path in paths]
         pointer_lines.extend(_INPUT_PREFIX + path for path in turn["input_paths"] if path not in paths)
-        while pointer_lines and len("\n".join(pointer_lines)) + 3 >= remaining:
-            pointer_lines.pop(0)
-        pointer = "\n".join(pointer_lines)
-        reserve = len(pointer) + (1 if pointer else 0)
-        available = remaining - reserve
-        if available < 2:
-            break
-        user = turn["user"]
-        if len(user) + len(reply) > available:
-            user = _truncate(user, min(len(user), max(1, available // 2)))
-            reply = _truncate(reply, available - len(user))
-            if not user or not reply:
-                # 无法表示当前轮次时停止，不能跳过它再注入更旧话题。
+        if backup_line:
+            # 备份指针优先完整保留；摘要和可选附件只能使用余下的字符。
+            while pointer_lines and len("\n".join(pointer_lines + [backup_line])) + len(_SCHEDULED_PREFIX) > remaining:
+                pointer_lines.pop(0)
+            pointer = "\n".join(pointer_lines + [backup_line])
+            available = remaining - len(pointer)
+            if available < len(_SCHEDULED_PREFIX):
                 break
-        if pointer:
-            reply = reply + "\n" + pointer
+            user = turn["user"]
+            if len(user) + len(reply) + (1 if reply else 0) + len(pointer) > remaining:
+                user = _truncate_scheduled_user(user, min(
+                    len(user), max(len(_SCHEDULED_PREFIX), available // 2)
+                ))
+                reply = _truncate(reply, remaining - len(user) - len(pointer) - 1)
+            reply = reply + "\n" + pointer if reply else pointer
+        else:
+            while pointer_lines and len("\n".join(pointer_lines)) + 3 > remaining:
+                pointer_lines.pop(0)
+            pointer = "\n".join(pointer_lines)
+            reserve = len(pointer) + (1 if pointer else 0)
+            available = remaining - reserve
+            if available < 2:
+                break
+            user = turn["user"]
+            if len(user) + len(reply) > available:
+                if turn["is_scheduled"]:
+                    user = _truncate_scheduled_user(user, min(
+                        len(user), max(len(_SCHEDULED_PREFIX), available // 2)
+                    ))
+                else:
+                    user = _truncate(user, min(len(user), max(1, available // 2)))
+                reply = _truncate(reply, available - len(user))
+                if not user or not reply:
+                    # 无法表示当前轮次时停止，不能跳过它再注入更旧话题。
+                    break
+            if pointer:
+                reply = reply + "\n" + pointer
+        if turn["is_scheduled"]:
+            retained_user = scheduled_user_message(user[len(_SCHEDULED_PREFIX):].lstrip())
+            retained_reply = scheduled_assistant_message(reply, backup_id=backup_id)
+        else:
+            retained_user = user_message(user, turn["input_paths"], is_reference=turn["is_reference"])
+            retained_reply = {"role": "assistant", "content": [{"type": "text", "text": reply}]}
         retained.append([
-            user_message(user, turn["input_paths"], is_reference=turn["is_reference"]),
-            {"role": "assistant", "content": [{"type": "text", "text": reply}]},
+            retained_user, retained_reply,
         ])
         remaining -= len(user) + len(reply)
         if remaining < 2:
             break
     return [msg for pair in reversed(retained) for msg in pair]
+
+
+def _truncate_scheduled_user(text: str, limit: int) -> str:
+    if limit < len(_SCHEDULED_PREFIX):
+        return ""
+    if len(text) <= limit:
+        return text
+    task_name = text[len(_SCHEDULED_PREFIX):].lstrip()
+    task_name = _truncate(task_name, limit - len(_SCHEDULED_PREFIX) - 1)
+    return _SCHEDULED_PREFIX + (" " + task_name if task_name else "")
 
 
 def _truncate(text: str, limit: int) -> str:

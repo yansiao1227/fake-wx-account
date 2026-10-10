@@ -101,6 +101,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # 自动回复上下文独立于按需历史查询上限；0 可关闭对应的历史注入。
     "reply_context_max_messages": 3,
     "reply_context_max_chars": 1500,
+    # 每个实时批次普通候选历史额外索引补读的原生行预算，各会话/分片共享。
+    # 无效正文、系统消息及边界外行同样占额度；0 关闭补读，本批已读行仍复用。
+    "reply_context_scan_max_rows": 1000,
     # 普通回复仅保留少量原消息与最终回复；引用回复不带旧 Agent 会话。
     "reply_session_max_turns": 2,
     "reply_session_max_chars": 1500,

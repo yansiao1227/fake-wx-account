@@ -324,6 +324,7 @@ def _bridge(monkeypatch, tmp_path, agent):
     monkeypatch.setattr(trigger, "mark_run_active", lambda *args: None)
     monkeypatch.setattr(trigger, "note_user_turn", lambda *args, **kwargs: None)
     bridge = AgentBridge.__new__(AgentBridge)
+    bridge.agents = {"synthetic_wechat": agent}
     bridge.get_agent = lambda session_id=None: agent
     bridge._schedule_mcp_hot_reload = lambda target: None
     return bridge, store
@@ -386,6 +387,7 @@ def test_bridge_image_delivery_and_future_pointer_both_survive(monkeypatch, tmp_
 @pytest.mark.parametrize("with_image", [False, True])
 def test_bridge_blocks_idle_evolution_through_session_finalization(monkeypatch, tmp_path, with_image):
     import agent.evolution.trigger as trigger
+    import channel.wechat_desktop.pipeline.session_context as session_context
 
     mark_run_active = trigger.mark_run_active
     note_user_turn = trigger.note_user_turn
@@ -396,6 +398,7 @@ def test_bridge_blocks_idle_evolution_through_session_finalization(monkeypatch, 
         files.append({"file_type": "image", "path": str(image)})
     agent = _FakeAgent([], files=files)
     agent._evo_turns = 1
+    agent._evo_last_active = 900.0
     bridge, store = _bridge(monkeypatch, tmp_path, agent)
     bridge.agents = {"synthetic_wechat": agent}
     now = [1000.0]
@@ -419,10 +422,23 @@ def test_bridge_blocks_idle_evolution_through_session_finalization(monkeypatch, 
 
     def scan_checkpoint(phase):
         now[0] = 1100.0  # 模拟本轮已超过 idle_seconds。
-        checkpoints.append((phase, agent._evo_run_active))
+        checkpoints.append((phase, getattr(agent, "_evo_run_active", False)))
         trigger._scan_once(bridge, cfg)
 
     monkeypatch.setattr(trigger, "mark_run_active", mark)
+    prepare_session = session_context.prepare_agent_session
+    pre_persist_user = bridge._pre_persist_user_message
+
+    def prepare(*args, **kwargs):
+        scan_checkpoint("prepare")
+        return prepare_session(*args, **kwargs)
+
+    def pre_persist(*args, **kwargs):
+        scan_checkpoint("pre_persist")
+        return pre_persist_user(*args, **kwargs)
+
+    monkeypatch.setattr(session_context, "prepare_agent_session", prepare)
+    monkeypatch.setattr(bridge, "_pre_persist_user_message", pre_persist)
     monkeypatch.setattr(bridge_module.AgentEventHandler, "log_summary", lambda self: scan_checkpoint("summary"))
     persist_messages = bridge._persist_messages
 
@@ -440,7 +456,8 @@ def test_bridge_blocks_idle_evolution_through_session_finalization(monkeypatch, 
 
     assert reply.type == (ReplyType.IMAGE_URL if with_image else ReplyType.TEXT)
     assert marks == [True, False]
-    assert checkpoints == [("summary", True), ("persist", True), ("note", True)]
+    assert checkpoints == [("prepare", True), ("pre_persist", True),
+                           ("summary", True), ("persist", True), ("note", True)]
     assert transcripts == []
     assert agent._evo_run_active is False
     assert agent._evo_last_active == 1100.0
@@ -455,7 +472,7 @@ def test_bridge_blocks_idle_evolution_through_session_finalization(monkeypatch, 
         assert str(image) in text_of(transcripts[0][-1])
 
 
-@pytest.mark.parametrize("phase", ["run", "summary", "sanitize", "persist", "note"])
+@pytest.mark.parametrize("phase", ["prepare", "pre_persist", "run", "summary", "sanitize", "persist", "note"])
 def test_bridge_releases_evolution_flag_when_finalization_fails(monkeypatch, tmp_path, phase):
     import agent.evolution.trigger as trigger
     import channel.wechat_desktop.pipeline.session_context as session_context
@@ -471,11 +488,15 @@ def test_bridge_releases_evolution_flag_when_finalization_fails(monkeypatch, tmp
         mark_run_active(target, active)
 
     def fail(*args, **kwargs):
-        active_at_failure.append(agent._evo_run_active)
+        active_at_failure.append(getattr(agent, "_evo_run_active", False))
         raise RuntimeError("synthetic finalization failure")
 
     monkeypatch.setattr(trigger, "mark_run_active", mark)
-    if phase == "run":
+    if phase == "prepare":
+        monkeypatch.setattr(session_context, "prepare_agent_session", fail)
+    elif phase == "pre_persist":
+        monkeypatch.setattr(bridge, "_pre_persist_user_message", fail)
+    elif phase == "run":
         monkeypatch.setattr(agent, "run_stream", fail)
     elif phase == "summary":
         monkeypatch.setattr(bridge_module.AgentEventHandler, "log_summary", fail)
@@ -491,4 +512,140 @@ def test_bridge_releases_evolution_flag_when_finalization_fails(monkeypatch, tmp
     assert active_at_failure == [True]
     assert marks == [True, False]
     assert agent._evo_run_active is False
-    assert text_of(store.load_messages("synthetic_wechat")[0]) == "新的原消息"
+    stored = store.load_messages("synthetic_wechat")
+    if phase in ("prepare", "pre_persist"):
+        assert stored == []
+    else:
+        assert text_of(stored[0]) == "新的原消息"
+
+
+@pytest.mark.parametrize("phase", ["tool_loop", "summary", "persist", "run_failure"])
+def test_bridge_defers_scheduled_injection_until_current_reply_is_persisted(monkeypatch, tmp_path, phase):
+    agent = _FakeAgent([])
+    bridge, store = _bridge(monkeypatch, tmp_path, agent)
+    during_run = []
+    injected = False
+
+    def inject():
+        nonlocal injected
+        if injected:
+            return
+        injected = True
+        bridge.remember_scheduled_output(
+            "synthetic_wechat", "后台任务结果", "wechat_desktop", "合成任务",
+        )
+        during_run.append((deepcopy(agent.messages), store.load_messages("synthetic_wechat")))
+
+    original_run = agent.run_stream
+
+    def run(**kwargs):
+        if phase in ("tool_loop", "run_failure"):
+            agent.messages.extend([
+                {"role": "user", "content": kwargs["user_message"]},
+                _assistant("工具调用", {"type": "tool_use", "id": "test", "name": "bash", "input": {}}),
+            ])
+            inject()
+            if phase == "run_failure":
+                raise RuntimeError("synthetic interrupted run")
+            agent.messages.extend([
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "test", "content": "工具正文"}]},
+                _assistant("本轮最终答复"),
+            ])
+            agent._last_run_new_messages = agent.messages[-1:]
+            return "本轮最终答复"
+        return original_run(**kwargs)
+
+    monkeypatch.setattr(agent, "run_stream", run)
+    if phase == "summary":
+        monkeypatch.setattr(bridge_module.AgentEventHandler, "log_summary", lambda self: inject())
+    elif phase == "persist":
+        persist_messages = bridge._persist_messages
+
+        def persist(*args, **kwargs):
+            inject()
+            persist_messages(*args, **kwargs)
+
+        monkeypatch.setattr(bridge, "_persist_messages", persist)
+
+    reply = bridge.agent_reply(_legacy_prompt("新的原消息"), _context())
+    assert reply.type == (ReplyType.ERROR if phase == "run_failure" else ReplyType.TEXT)
+    assert len(during_run) == 1
+    assert all("后台任务结果" not in str(messages) for messages in during_run[0])
+    stored = store.load_messages("synthetic_wechat")
+    assert [text_of(message) for message in stored].count("后台任务结果") == 1
+    assert [text_of(message) for message in agent.messages].count("后台任务结果") == 1
+    assert text_of(stored[-2]) == "[SCHEDULED] 合成任务"
+    assert text_of(stored[-1]) == "后台任务结果"
+    if phase != "run_failure":
+        assert [text_of(message) for message in stored].index("本轮最终答复") < len(stored) - 2
+
+
+def test_background_thread_scheduled_injection_is_not_mixed_into_running_reply(monkeypatch, tmp_path):
+    agent = _FakeAgent([])
+    bridge, store = _bridge(monkeypatch, tmp_path, agent)
+    run_started = threading.Event()
+    injection_returned = threading.Event()
+    errors = []
+    snapshots = []
+
+    def inject_from_background():
+        try:
+            assert run_started.wait(2)
+            bridge.remember_scheduled_output("synthetic_wechat", "后台线程结果", "wechat_desktop", "线程任务")
+        except Exception as e:
+            errors.append(e)
+        finally:
+            injection_returned.set()
+
+    def run(**kwargs):
+        agent.messages.append({"role": "user", "content": kwargs["user_message"]})
+        run_started.set()
+        assert injection_returned.wait(2)
+        snapshots.append((deepcopy(agent.messages), store.load_messages("synthetic_wechat")))
+        agent.messages.append(_assistant("本轮最终答复"))
+        agent._last_run_new_messages = agent.messages[-1:]
+        return "本轮最终答复"
+
+    monkeypatch.setattr(agent, "run_stream", run)
+    thread = threading.Thread(target=inject_from_background, daemon=True)
+    thread.start()
+    reply = bridge.agent_reply(_legacy_prompt(), _context())
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert errors == []
+    assert reply.type == ReplyType.TEXT
+    assert len(snapshots) == 1
+    assert all("后台线程结果" not in str(messages) for messages in snapshots[0])
+    assert [text_of(message) for message in store.load_messages("synthetic_wechat")] == [
+        "新的原消息", "本轮最终答复", "[SCHEDULED] 线程任务", "后台线程结果",
+    ]
+    assert getattr(agent, "_pending_scheduled_outputs", []) == []
+    assert agent._bridge_reply_active is False
+
+
+def test_evolution_backup_id_reaches_undo_request_after_persistence_and_restart(monkeypatch, tmp_path):
+    from agent.evolution.executor import _inject_evolution_record
+    from channel.wechat_desktop.pipeline.session_context import model_messages
+
+    agent = _FakeAgent([])
+    bridge, store = _bridge(monkeypatch, tmp_path, agent)
+    backup_id = "20261010T175500_undo_backup"
+    _inject_evolution_record(
+        bridge, "synthetic_wechat", "wechat_desktop", "长进化摘要" * 1000, backup_id,
+    )
+    stored = store.load_messages("synthetic_wechat")
+    assert len(stored) == 2
+    assert backup_id not in text_of(stored[1])  # 摘要截断时 ID 仍单独保存。
+    assert stored[1]["content"][0]["evolution_backup_id"] == backup_id
+    agent.messages = AgentInitializer._filter_text_only_messages(stored)
+    reply = bridge.agent_reply(
+        "撤销上次进化", _context(wechat_desktop_user_message="撤销上次进化", wechat_desktop_session_max_chars=120),
+    )
+    assert reply.type == ReplyType.TEXT
+    history = agent.run_calls[0][0]
+    assert len(history) == 2
+    assert sum(len(text_of(message)) for message in history) <= 120
+    assert text_of(history[-1]).endswith("[进化备份] backup_id: " + backup_id)
+    projected = model_messages(history)
+    assert backup_id in text_of(projected[-1])
+    assert "evolution_backup_id" not in str(projected)

@@ -100,6 +100,7 @@ def receive_batch(native_channel):
 
 def test_five_native_aggregated_messages_keep_recent_database_window_and_fifo(native_channel):
     backend, reader, _, talker, _, _ = native_channel
+    reader.config["reply_context_max_messages"] = 3
     cache = reader.caches["message/message_0.db"]
     for local_id in range(1, 6):
         add_message(cache, talker, local_id, content=f"synthetic {local_id}", created=local_id)
@@ -109,7 +110,9 @@ def test_five_native_aggregated_messages_keep_recent_database_window_and_fifo(na
 
     assert [item["content"] for item in result.history] == ["synthetic 2", "synthetic 3", "synthetic 4"]
     assert result.task.source_event_ids == [event.event_id for event in events]
-    assert len(result.task.context_source_events) == 4
+    assert [source.source_message_id for source in result.task.context_source_events] == [
+        item["source_message_id"] for item in result.history]
+    assert [source.source_local_id for source in result.task.source_validation_events] == [1, 2, 3, 4, 5]
     reply_queue = WechatReplyQueue()
     assert reply_queue.enqueue(result)
     queued = reply_queue.get()

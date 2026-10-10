@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import threading
 
 import pytest
 
@@ -167,6 +168,10 @@ def test_agent_bridge_returns_fun_text_for_terminal_model_api_failure(monkeypatc
     class _Agent:
         tools = []
         model = SimpleNamespace()
+
+        def __init__(self):
+            self.messages = []
+            self.messages_lock = threading.Lock()
 
         @staticmethod
         def run_stream(**_kwargs):

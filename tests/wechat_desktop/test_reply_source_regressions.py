@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from bridge.context import Context
 from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.contracts import SendResult, SendStatus
 from channel.wechat_desktop.models import ReplyTargetValidation, WechatDesktopMessage
@@ -201,3 +202,66 @@ def test_deferred_preflight_revalidates_all_sources_before_materialization(tmp_p
     assert item.done.is_set() and item.terminal == "skipped"
     assert sent == []
     assert "send_started" not in stages
+
+
+def _dispatch_with_prior_history(tmp_path, store, budget):
+    _, talker, cache, channel, _ = _reply_setup(tmp_path, store)
+    add_message(cache, talker, 2, content="selected prior", created=1001)
+    add_message(cache, talker, 3, content="current question", created=1002)
+    observation, events = channel._driver.observe_events()
+    store.receive_source_batch(observation["source_batch"])
+    channel._driver.acknowledge_events([observation["source_batch"].batch_id])
+    event = events[-1]
+    assert [item["source_local_id"] for item in event.history] == [1, 2]
+    channel.config.update(budget)
+    produced = []
+
+    def compose(ctype, content, **kwargs):
+        return Context(ctype, content, {**kwargs, "session_id": event.conversation_id,
+                                      "receiver": event.conversation_id})
+
+    channel._compose_context = compose
+    channel.produce = produced.append
+    assert AgentReplyCoordinator(channel).dispatch(event)
+    return talker, cache, channel, event, produced[0]
+
+
+@pytest.mark.parametrize("budget,selected", [
+    ({"reply_context_max_messages": 0}, []),
+    ({"reply_context_max_chars": 0}, []),
+    ({"reply_context_max_messages": 1}, [2]),
+    ({"reply_context_max_chars": len("历史消息: selected prior")}, [2]),
+])
+def test_unused_history_withdrawal_does_not_block_reply(tmp_path, store, budget, selected):
+    talker, cache, channel, event, context = _dispatch_with_prior_history(tmp_path, store, budget)
+    sent, _ = _capture_submission(channel)
+    assert "synthetic text" not in context.content
+    assert ("selected prior" in context.content) is bool(selected)
+    _invalidate(cache, talker, "delete", local_id=1)
+
+    _invoke(channel, context, ReplyType.TEXT)
+
+    assert len(sent) == 1
+    assert context["wechat_desktop_queue_terminal"] == "completed"
+    assert [source.source_local_id for source in event.task.context_source_events] == selected
+    assert [source.source_local_id for source in context["wechat_desktop_context_source_events"]] == selected
+
+
+@pytest.mark.parametrize("budget", [
+    {"reply_context_max_messages": 1},
+    {"reply_context_max_chars": len("历史消息: selected prior")},
+    {"reply_context_max_chars": 10},
+])
+def test_selected_history_withdrawal_still_blocks_reply_after_event_mutation(tmp_path, store, budget):
+    talker, cache, channel, event, context = _dispatch_with_prior_history(tmp_path, store, budget)
+    sent, stages = _capture_submission(channel)
+    # 后续任务快照变化不能抹掉实际已经交给模型的来源证据。
+    event.task.context_source_events = []
+    event.history = []
+    _invalidate(cache, talker, "delete", local_id=2)
+
+    _invoke(channel, context, ReplyType.TEXT)
+
+    assert sent == stages == []
+    assert context["wechat_desktop_queue_terminal"] == "skipped"
+    assert [source.source_local_id for source in context["wechat_desktop_context_source_events"]] == [2]
