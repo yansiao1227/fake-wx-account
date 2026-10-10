@@ -49,7 +49,7 @@ def test_tool_progress_and_timeout_notice_are_persisted_as_interim(tmp_path, sto
     item = channel._reply_queue.get()
     context["wechat_desktop_queue_token"] = item.token
     sent = []
-    channel._driver.send_interim_text = lambda *args: sent.append(args) or SendResult(SendStatus.UNVERIFIED)
+    channel._driver.send_interim_text = lambda *args, **kwargs: sent.append((args, kwargs)) or SendResult(SendStatus.UNVERIFIED)
     channel._dispatch_message = lambda *args: channel._send_agent_tool_notice(context, {"tool_name": "web_search"})
 
     def timeout(self, current):
@@ -64,6 +64,7 @@ def test_tool_progress_and_timeout_notice_are_persisted_as_interim(tmp_path, sto
     assert outcome == "timeout"
     assert message.task.failure_notice_sent
     assert len(sent) == 2
+    assert all(kwargs["authorized_target"].conversation_id == message.conversation_id for _, kwargs in sent)
     rows = store._get_connection().execute("SELECT kind,status FROM deliveries ORDER BY updated_at").fetchall()
     assert [tuple(row) for row in rows] == [("interim", "unverified"), ("interim", "unverified")]
     assert store.event_state(message.event_id)["state"] == "timeout"

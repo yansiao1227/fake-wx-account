@@ -30,8 +30,11 @@ class AttachmentClient(Client):
         self.focus_count += 1
         return True
 
-    def locate_conversation(self, title, **kwargs):
-        return title == "Synthetic" and kwargs["runtime_id"] == "row-1"
+    def focus_window(self):
+        self.focus_count += 1
+
+    def locate_conversation(self, title, runtime_id="", row_index=-1):
+        return title == "Synthetic" and runtime_id == "row-1"
 
     def get_chat_scroll_position_passive(self):
         return self.bottom
