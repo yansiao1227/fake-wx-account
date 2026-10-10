@@ -50,22 +50,26 @@ def database_backend(tmp_path, store, *, group=False):
     return backend, reader, gateway, reader.conversation_id(talker)
 
 
-def test_database_stable_id_cannot_bypass_display_name_blacklist(tmp_path, store):
-    backend, _, gateway, cid = database_backend(tmp_path, store)
-    channel = channel_for(backend, store, auto_reply_private_all=True,
-                          auto_reply_blacklist=["Synthetic"])
+@pytest.mark.parametrize("group", [False, True])
+@pytest.mark.parametrize("identifier", ["stable_id", "display_name", "username"])
+def test_database_identifiers_cannot_bypass_display_name_blacklist(tmp_path, store, group, identifier):
+    backend, reader, gateway, cid = database_backend(tmp_path, store, group=group)
+    contact = reader.get_contact_by_conversation_id(cid)
+    conversation = {"stable_id": cid, "display_name": "Synthetic", "username": contact["username"]}[identifier]
+    key = "auto_reply_group_blacklist" if group else "auto_reply_private_blacklist"
+    channel = channel_for(backend, store, **{key: ["Synthetic"]})
 
-    result = channel._execute_agent_action("send_text", conversation=cid, text="合成消息")
+    result = channel._execute_agent_action("send_text", conversation=conversation,
+                                           text="合成消息", is_group=not group)
 
     assert result["status"] == "blocked"
     assert gateway.client.sent == []
     assert gateway.client.ui_calls == []
 
 
-def test_database_group_cannot_use_private_allow_all_by_omitting_kind(tmp_path, store):
+def test_database_group_cannot_bypass_group_blacklist_by_claiming_private_kind(tmp_path, store):
     backend, _, gateway, cid = database_backend(tmp_path, store, group=True)
-    channel = channel_for(backend, store, auto_reply_private_all=True,
-                          auto_reply_groups_all=False, auto_reply_groups=[])
+    channel = channel_for(backend, store, auto_reply_group_blacklist=["Synthetic"])
 
     result = channel._execute_agent_action("send_text", conversation=cid, text="合成消息",
                                            is_group=False)
@@ -77,13 +81,13 @@ def test_database_group_cannot_use_private_allow_all_by_omitting_kind(tmp_path, 
 
 @pytest.mark.parametrize("group", [False, True])
 @pytest.mark.parametrize("identifier", ["stable_id", "display_name", "username"])
-def test_database_allowlist_uses_canonical_name_and_real_kind(tmp_path, store, group, identifier):
+def test_database_opposite_kind_blacklist_allows_same_name_with_trusted_kind(tmp_path, store, group, identifier):
     backend, reader, gateway, cid = database_backend(tmp_path, store, group=group)
     contact = reader.get_contact_by_conversation_id(cid)
     conversation = {"stable_id": cid, "display_name": "Synthetic", "username": contact["username"]}[identifier]
-    channel = channel_for(backend, store, auto_reply_private_all=False, auto_reply_groups_all=False,
-                          auto_reply_contacts=[] if group else ["Synthetic"],
-                          auto_reply_groups=["Synthetic"] if group else [])
+    channel = channel_for(backend, store,
+                          auto_reply_private_blacklist=["Synthetic"] if group else [],
+                          auto_reply_group_blacklist=[] if group else ["Synthetic"])
 
     result = channel._execute_agent_action("send_text", conversation=conversation,
                                            text="合成消息", is_group=not group)
@@ -108,7 +112,7 @@ def test_database_unverified_identity_never_submits(tmp_path, store, failure):
             connection.execute("INSERT INTO contact VALUES (?,?,?,?)", ("other-user", "Synthetic", "", ""))
         cache.changed = True
         conversation = cid
-    channel = channel_for(backend, store, auto_reply_private_all=True)
+    channel = channel_for(backend, store)
 
     result = channel._execute_agent_action("send_text", conversation=conversation, text="合成消息")
 
@@ -119,8 +123,7 @@ def test_database_unverified_identity_never_submits(tmp_path, store, failure):
 
 def test_database_rechecks_authorized_name_immediately_before_submission(tmp_path, store):
     backend, reader, gateway, cid = database_backend(tmp_path, store)
-    channel = channel_for(backend, store, auto_reply_private_all=True,
-                          auto_reply_blacklist=["Blocked"])
+    channel = channel_for(backend, store, auto_reply_private_blacklist=["Blocked"])
 
     def rename_before_submission():
         cache = reader.caches["contact/contact.db"]
@@ -173,9 +176,7 @@ def test_database_authorized_identity_reaches_real_uia_gateway(tmp_path, store, 
     group = kind == "group"
     backend, _, client, cid = database_backend_with_real_gateway(tmp_path, store, group=group)
     conversation = "Synthetic" if identifier == "Synthetic" else cid
-    channel = channel_for(backend, store, auto_reply_private_all=False, auto_reply_groups_all=False,
-                          auto_reply_contacts=[] if group else ["Synthetic"],
-                          auto_reply_groups=["Synthetic"] if group else [])
+    channel = channel_for(backend, store)
     result = channel._execute_agent_action("send_text", conversation=conversation,
                                            text="合成消息", is_group=not group)
     assert result["status"] == "sent", result
@@ -224,8 +225,7 @@ def test_one_member_group_requires_independent_count_control(monkeypatch):
 @pytest.mark.parametrize("change", ["deleted", "name", "identity"])
 def test_database_rechecks_identity_inside_real_uia_submission(tmp_path, store, change):
     backend, reader, client, cid = database_backend_with_real_gateway(tmp_path, store)
-    channel = channel_for(backend, store, auto_reply_private_all=True,
-                          auto_reply_groups_all=False, auto_reply_blacklist=["Blocked"])
+    channel = channel_for(backend, store, auto_reply_private_blacklist=["Blocked"])
     def change_before_submit():
         if change == "deleted":
             cache = reader.caches["contact/contact.db"]
@@ -250,7 +250,7 @@ def test_database_rechecks_identity_inside_real_uia_submission(tmp_path, store, 
 def test_backend_without_trusted_kind_cannot_authorize_send(store):
     backend = SimpleNamespace(resolve_send_target=lambda name: TargetResolution(
         TargetStatus.RESOLVED, ConversationTarget("opaque-id", "Synthetic")))
-    channel = channel_for(backend, store, auto_reply_private_all=True)
+    channel = channel_for(backend, store)
 
     result = channel._execute_agent_action("send_text", conversation="Synthetic", text="合成消息")
 

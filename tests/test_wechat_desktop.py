@@ -63,59 +63,37 @@ def test_image_event_fingerprint_uses_bytes_not_capture_path(tmp_path):
     assert first.fingerprint() == second.fingerprint()
 
 
-def test_policy_requires_allowlist_and_non_shadow(tmp_path):
+def test_policy_defaults_to_admit_new_conversations_and_respects_send_limits(tmp_path):
     store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
     config = {
         "shadow_mode": False,
-        "auto_reply_contacts": ["Alice"],
-        "auto_reply_groups": ["Team"],
         "max_send_per_minute": 2,
         "max_send_per_hour": 10,
     }
     policy = WechatDesktopPolicy(config, store)
     assert policy.allows_send("Alice", False, "text") is True
-    assert policy.allows_send("Mallory", False, "text") is False
+    assert policy.allows_send("Mallory", False, "text") is True
+    assert policy.allows_send("萌新打怪躺平日记", True, "text") is True
     assert policy.allows_send("Alice", False, "image") is False
     assert policy.reserve_send(units=2) is True
     assert policy.reserve_send() is False
     assert policy.allows_send("Alice", False, "text") is True
+    config["shadow_mode"] = True
+    assert policy.allows_send("Alice", False, "text") is False
 
 
-def test_policy_can_allow_all_private_and_group_conversations(tmp_path):
+@pytest.mark.parametrize("is_group", [False, True])
+@pytest.mark.parametrize("target", ["同名会话", "  同名会话  "])
+def test_policy_blacklists_are_separate_for_private_and_group(tmp_path, is_group, target):
     store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
-    policy = WechatDesktopPolicy(
-        {
-            "shadow_mode": False,
-            "auto_reply_private_all": True,
-            "auto_reply_groups_all": True,
-            "auto_reply_contacts": [],
-            "auto_reply_groups": [],
-            "max_send_per_minute": 5,
-            "max_send_per_hour": 60,
-        },
-        store,
-    )
-    assert policy.is_allowlisted("Any contact", False) is True
-    assert policy.is_allowlisted("Any group", True) is True
-    assert policy.allows_send("Any contact", False, "text") is True
-    assert policy.allows_send("Any group", True, "text") is True
+    key = "auto_reply_group_blacklist" if is_group else "auto_reply_private_blacklist"
+    policy = WechatDesktopPolicy({"shadow_mode": False, key: ["同名会话"]}, store)
 
-
-def test_policy_blacklist_overrides_allow_all(tmp_path):
-    store = WechatDesktopStore(str(tmp_path / "wechat.sqlite3"))
-    policy = WechatDesktopPolicy(
-        {
-            "shadow_mode": False,
-            "auto_reply_private_all": True,
-            "auto_reply_blacklist": ["腾讯新闻"],
-            "max_send_per_minute": 5,
-            "max_send_per_hour": 60,
-        },
-        store,
-    )
-    assert policy.is_blocked("腾讯新闻") is True
-    assert policy.allows_send("腾讯新闻", False, "text") is False
-    assert policy.allows_send("Alice", False, "text") is True
+    assert policy.is_blocked(target, is_group) is True
+    assert policy.allows_send(target, is_group, "text") is False
+    assert policy.is_blocked(target, not is_group) is False
+    assert policy.allows_send(target, not is_group, "text") is True
+    assert policy.allows_send("其他会话", is_group, "text") is True
 
 
 def test_conversation_history_persists_and_deduplicates_recent_outgoing(tmp_path):

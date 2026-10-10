@@ -74,7 +74,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pip show rapidocr
 ## 配置归属（必须遵守）
 
 配置分三层，禁止混放。判断标准：**外层只放跨通道通用项；某个通道自己的行为、策略、
-节拍、白名单、文案模板，一律放该通道内部的 `config.py`。**
+节拍、会话名单、文案模板，一律放该通道内部的 `config.py`。**
 
 ### 1. 全局 / Agent 配置（外层：JSON 为源，根 `config.py` 只负责加载）
 
@@ -106,16 +106,16 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pip show rapidocr
 - 新增或修改通用项时改 `config.json`，并同步 `config-template.json`。
 - 禁止把 wechat_desktop 等通道业务写进根 `config.py` 的 `available_setting`。
 - 禁止在根 `config.json` / `config-template.json` 写 `wechat_desktop` 段，也禁止把
-  白名单、`shadow_mode`、UIA 节拍、通知模板等提升为最外层全局键。
+  私聊/群聊黑名单、`shadow_mode`、UIA 节拍、通知模板等提升为最外层全局键。
 - 根 `config.json` 里若仍残留 `wechat_desktop` 段，或把通道 `DEFAULT_CONFIG` 里的键
-  （如 `shadow_mode`、`auto_reply_groups`）写到最外层，加载时删除并打警告，不得再当覆盖源。
+  （如 `shadow_mode`、`auto_reply_group_blacklist`）写到最外层，加载时删除并打警告，不得再当覆盖源。
 
 ### 2. 通道业务配置（以 wechat_desktop 为例）
 
 位置：
 
 - **唯一配置源**：`channel/wechat_desktop/config.py` 的 `DEFAULT_CONFIG`
-- 白名单、`shadow_mode`、UIA 节拍、限流、进度/失败通知模板、引用/附件策略等
+- 私聊/群聊黑名单、`shadow_mode`、UIA 节拍、限流、进度/失败通知模板、引用/附件策略等
   **全部**写这里
 
 规则：
@@ -125,6 +125,11 @@ D:\Miniconda\envs\cowagent-wechat\python.exe -m pip show rapidocr
 3. 禁止在 `pipeline/`、`uia/`、`storage/` 等业务文件中再维护平行默认配置字典。
 4. 全局/Agent 通用项禁止放进 `channel/wechat_desktop/config.py`。
 5. 其他通道比照本约定，在对应通道目录下维护自己的 `config.py`。
+6. 微信桌面通道默认允许私聊和群聊自动回复，不维护白名单或全部放行开关。
+   `auto_reply_private_blacklist` 与 `auto_reply_group_blacklist` 分开维护，按会话显示名
+   完整匹配（去除首尾空白并执行 `casefold()`）；群聊不使用私聊黑名单过滤群成员。
+   黑名单禁止接收路由与所有发送，被屏蔽群即使 @ 也不回复；群触发仍遵守 `group_reply_mode`。
+   遗留桌面白名单、全部放行开关和混合黑名单在加载时剔除，不得再作覆盖源。
 
 ### 3. 密钥与环境变量（`~/.cow/.env`）
 

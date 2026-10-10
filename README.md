@@ -45,14 +45,14 @@ D:\Miniconda\envs\cowagent-wechat\python.exe .\app.py
 | 配置层 | 位置 | 内容 |
 | --- | --- | --- |
 | 全局 / Agent | [config-template.json](config-template.json) → 本机 `config.json` | 模型、Agent、通道启用、Web、通用工具与技能 |
-| 微信通道 | [channel/wechat_desktop/config.py](channel/wechat_desktop/config.py) 的 `DEFAULT_CONFIG` | 数据库、黑白名单、群触发、影子模式、节拍、限流与通知策略 |
+| 微信通道 | [channel/wechat_desktop/config.py](channel/wechat_desktop/config.py) 的 `DEFAULT_CONFIG` | 数据库、私聊/群聊黑名单、群触发、影子模式、节拍、限流与通知策略 |
 | 厂商密钥 | `~/.cow/.env` | 环境变量优先，配置字段仅作可选回退；真实密钥不提交 |
 
 根 JSON 不放 `wechat_desktop` 段或微信业务键。修改通道配置后，重启整个 `app.py` 进程。
 
-当前默认 `shadow_mode=False`、`auto_reply_private_all=True`、`auto_reply_groups_all=True`，允许全部私聊和群通过发送范围检查；群仍需满足 `group_reply_mode="at_only"` 的 @ 触发。若仅允许名单中的会话发送，将两个 `*_all` 改为 `False`，填写 `auto_reply_contacts` / `auto_reply_groups`；黑名单优先。
+当前默认 `shadow_mode=False`，私聊和群聊默认准入；`auto_reply_private_blacklist` / `auto_reply_group_blacklist` 均默认为空，分别按会话显示名屏蔽私聊和群聊，被屏蔽的群即使 @ 也不回复。群仍需满足 `group_reply_mode="at_only"` 的 @ 触发，【萌新打怪躺平日记】及其他新群无需添加名单。旧自动回复白名单和全部放行开关已移除。
 
-首次验证可设置 `shadow_mode=True` 禁止发送。发送白名单与影子模式不阻止正式通道运行 Agent 或必要附件读取；只测数据库接收时使用下方专用影子诊断。
+首次验证可设置 `shadow_mode=True` 禁止发送，正式通道仍可能运行 Agent 或必要附件读取。黑名单在接收路由和所有发送入口检查，屏蔽自动回复、通知及主动发送；只测数据库接收时使用下方专用影子诊断。
 
 `db_data_dir` / `db_account` 为空时自动发现数据目录并绑定唯一账号；账号有歧义时需显式指定。配置详情和故障处理见 [数据库后端说明](docs/wechat-db-backend.md)。
 

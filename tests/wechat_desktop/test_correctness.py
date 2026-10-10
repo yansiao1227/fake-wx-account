@@ -80,7 +80,6 @@ def test_row_index_cannot_disambiguate_same_name_sessions(same_name_sessions):
     assert not client.locate_conversation("同名", row_index=1)
 
 
-@pytest.mark.parametrize("known_group", [False, True])
 @pytest.mark.parametrize("mode,content,mention,expected", [
     ("all", "普通消息", False, True),
     ("prefix", "/cow 帮忙", False, True),
@@ -91,8 +90,8 @@ def test_row_index_cannot_disambiguate_same_name_sessions(same_name_sessions):
     ("at_or_prefix", "@小牛 帮忙", True, True),
     ("at_or_prefix", "普通消息", False, False),
 ])
-def test_group_trigger_modes_use_native_event_metadata(known_group, mode, content, mention, expected):
-    config = load_wechat_desktop_config({"group_reply_mode": mode, "auto_reply_groups": ["群"] if known_group else []})
+def test_group_trigger_modes_use_native_event_metadata(mode, content, mention, expected):
+    config = load_wechat_desktop_config({"group_reply_mode": mode})
     event = WechatDesktopEvent("message", "db-session:group", "群", "member", "成员", "text", content,
                                is_group=True, is_at=mention, source_type="group")
     assert WechatDesktopPolicy(config, None).group_triggered(event) is expected

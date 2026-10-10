@@ -42,7 +42,7 @@ def test_finished_progress_preserves_failure_notice(store, monkeypatch, terminal
 def test_tool_progress_and_timeout_notice_are_persisted_as_interim(tmp_path, store, monkeypatch):
     _, _, _, channel, context = _reply_setup(tmp_path, store)
     message = context["msg"].event
-    channel.config.update(auto_reply_private_all=True, agent_tool_notice_enabled=True,
+    channel.config.update(agent_tool_notice_enabled=True,
                           agent_tool_notice_templates=["正在调用 {tool_name}"],
                           agent_failure_notice_templates=["合成失败提示"])
     channel._reply_queue.enqueue(message)

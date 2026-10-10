@@ -26,7 +26,7 @@ def store(tmp_path):
 
 
 def _service(store, send, *, minute=2):
-    config = load_wechat_desktop_config({"shadow_mode": False, "auto_reply_private_all": True,
+    config = load_wechat_desktop_config({"shadow_mode": False,
                                        "max_send_per_minute": minute, "max_send_per_hour": 10})
     return DeliveryService(config, WechatDesktopPolicy(config, store),
                            SimpleNamespace(send_text=send), lambda: False, lambda: False,

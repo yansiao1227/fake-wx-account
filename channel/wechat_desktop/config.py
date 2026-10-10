@@ -1,6 +1,6 @@
 """wechat_desktop 通道配置。
 
-本通道的**全部业务配置**只写在本文件 ``DEFAULT_CONFIG``。包括 UIA 节拍、白名单、
+本通道的**全部业务配置**只写在本文件 ``DEFAULT_CONFIG``。包括 UIA 节拍、黑名单、
 ``shadow_mode``、限流、通知模板、引用/附件策略等。
 
 根目录 ``config.json`` / ``config-template.json`` / ``config.py`` 只放跨通道通用项
@@ -16,6 +16,15 @@ from typing import Any, Mapping, Optional
 
 from common.log import logger
 from config import conf
+
+# 已移除的准入配置仅用于清理遗留键，不再参与自动回复策略。
+RETIRED_AUTO_REPLY_KEYS = frozenset({
+    "auto_reply_private_all",
+    "auto_reply_groups_all",
+    "auto_reply_blacklist",
+    "auto_reply_contacts",
+    "auto_reply_groups",
+})
 
 DEFAULT_CONFIG: dict[str, Any] = {
     # 后端与 UI 操作节奏。db_uia 从加密库读取，发送仍使用 Windows UIA。
@@ -108,10 +117,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "reply_session_max_turns": 2,
     "reply_session_max_chars": 1500,
 
-    # 自动回复准入策略。shadow_mode=True 时只观察，不向微信发送内容。
-    "auto_reply_private_all": True,
-    "auto_reply_groups_all": True,
-    "auto_reply_blacklist": [],
+    # 私聊、群聊默认允许自动回复；两类黑名单按会话显示名分别匹配。
+    # 群聊仍遵守 group_reply_mode，黑名单群即使 @ 也不回复。
+    "auto_reply_private_blacklist": [],
+    "auto_reply_group_blacklist": [],
     "conversation_history_retention_days": 90,
 
     # 可选诊断能力：会话扫描细粒度日志写入 run.log，不打印到控制台。
@@ -162,9 +171,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "答案在路上迷了个路，这一轮先投降 🧭 你可以再发一次，我会重新出发。",
         "我刚和服务器猜拳输了，回复没拿回来 🤖 再问我一次吧。",
     ],
-    "auto_reply_contacts": [],
-    # 自动回复群白名单。
-    "auto_reply_groups": ["小小地下联络站", "JY生活问候群", "22~25级实验室科研天才们", "816吃喝玩乐群"],
     "group_reply_mode": "at_only",
     "group_command_prefixes": ["/cow"],
     "self_display_name": "",
@@ -235,7 +241,13 @@ def load_wechat_desktop_config(
             )
         return validate_config(merged)
     if isinstance(raw, Mapping):
-        merged.update(deepcopy(dict(raw)))
+        overrides = deepcopy(dict(raw))
+        dropped = sorted(RETIRED_AUTO_REPLY_KEYS.intersection(overrides))
+        for key in dropped:
+            del overrides[key]
+        if dropped:
+            logger.warning("[WechatDesktop] 已忽略废弃的自动回复配置: %s", ", ".join(dropped))
+        merged.update(overrides)
     return validate_config(merged)
 
 

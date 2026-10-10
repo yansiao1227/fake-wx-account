@@ -374,20 +374,22 @@ class AgentReplyCoordinator:
     def send_tool_notice(self, context: Context, data: dict) -> bool:
         """向当前微信会话发送工具/技能进度，并登记为不参与回复识别的临时文本。
 
-        发送前再次检查队列令牌、暂停状态、影子模式、白名单和底层工具过滤，
+        发送前再次检查队列令牌、暂停状态、影子模式、黑名单和底层工具过滤，
         防止过期 Agent 周期、只观察模式或 bash/read 一类内部动作产生额外消息。
         """
         channel = self.channel
         msg = context.get("msg")
+        event = getattr(msg, "event", None)
         target_name = (
-            getattr(msg, "other_user_nickname", "")
+            getattr(event, "conversation_name", "")
+            or getattr(msg, "other_user_nickname", "")
             or context.get("receiver", "")
         )
         target_id = (
-            getattr(msg, "other_user_id", "")
+            getattr(event, "conversation_id", "")
+            or getattr(msg, "other_user_id", "")
             or context.get("receiver", "")
         )
-        event = getattr(msg, "event", None)
         queue_token = str(context.get("wechat_desktop_queue_token") or "")
         if queue_token and not channel._reply_queue.is_active(queue_token):
             return False
@@ -403,8 +405,7 @@ class AgentReplyCoordinator:
         if (
             bool(channel._service.status().get("paused"))
             or bool(channel.config.get("shadow_mode", True))
-            or channel._policy.is_blocked(target_name)
-            or not channel._policy.is_allowlisted(target_name, is_group)
+            or channel._policy.is_blocked(target_name, is_group)
         ):
             return False
         if not channel._is_user_visible_tool_notice(data):
@@ -469,8 +470,8 @@ class AgentReplyCoordinator:
     def compose_context(self, ctype: ContextType, content, **kwargs):
         """创建 CowAgent Context，并允许插件在投递前修改或拦截。
 
-        微信桌面通道已经在自身策略层完成准入判断，因此这里不依赖其他 Channel 的
-        全局白名单；图片、语音等最终也会被规范为 Agent 可消费的文本上下文。
+        微信桌面通道已经在自身策略层完成准入判断；图片、语音等最终也会被规范为
+        Agent 可消费的文本上下文。
         """
         channel = self.channel
         context = Context(ctype, content)
