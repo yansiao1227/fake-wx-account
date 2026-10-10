@@ -102,14 +102,14 @@ def test_database_current_chat_requires_known_type():
         binder.current_conversation()
 
 
-def make_driver(*, kind="private", known_group=False):
+def make_driver(*, name="Alice", kind="private", known_group=False):
     client = FakeClient()
-    client.rows = [row("Alice", runtime_id="alice-row", mention=known_group)]
-    client.headers["alice-row"] = HeaderInfo("Alice", kind)
+    client.rows = [row(name, runtime_id="alice-row", mention=known_group)]
+    client.headers["alice-row"] = HeaderInfo(name, kind)
     client.histories["alice-row"] = [incoming("请回答", "first")]
     driver = WechatUiaDriver(
         {"bootstrap_existing_messages": True, "group_reply_mode": "all",
-         "auto_reply_groups": ["Alice"] if known_group else []},
+         "auto_reply_groups": [name] if known_group else []},
         client=client, shell_hook=FakeHook(),
     )
     return driver, client
@@ -181,6 +181,64 @@ def test_private_send_resolution_rejects_suffix_title_collision():
     driver.observe_events()
     client.headers["alice-row"] = HeaderInfo("Alice(1)", "private")
     assert driver.resolve_send_target("uia-session:alice-row").status == TargetStatus.STALE
+
+
+@pytest.mark.parametrize("observed,requested", [("Alice", "Alice(1)"),
+                                              ("Alice(1)", "Alice"),
+                                              ("Alice", "Alice（1）")])
+@pytest.mark.parametrize("known_group", [False, True])
+def test_private_active_send_resolution_never_strips_requested_name_suffix(observed, requested, known_group):
+    driver, _ = make_driver(name=observed, known_group=known_group)
+    driver.observe_events()
+    resolution = driver.resolve_send_target(requested)
+    assert resolution.status != TargetStatus.RESOLVED
+    assert resolution.target is None
+
+
+@pytest.mark.parametrize("requested,identity", [("Alice", "uia-session:alice-row"),
+                                               ("Alice(1)", "uia-session:alice-count-row")])
+def test_active_send_resolution_prefers_exact_display_name_over_suffix_alias(requested, identity):
+    driver, client = make_driver()
+    client.rows = [row("Alice", unread=0, runtime_id="alice-row"),
+                   row("Alice(1)", unread=0, runtime_id="alice-count-row")]
+    client.headers["alice-count-row"] = HeaderInfo("Alice(1)", "private")
+    driver.observe_events()
+    candidate = driver.resolve_target(requested)
+    assert candidate.status == TargetStatus.RESOLVED
+    assert candidate.target.conversation_id == identity
+    resolution = driver.resolve_send_target(requested)
+    assert resolution.status == TargetStatus.RESOLVED
+    assert resolution.target == ConversationTarget(identity, requested, False)
+
+
+def test_private_active_send_resolution_preserves_internal_identity():
+    driver, _ = make_driver(name="Alice(1)")
+    driver.observe_events()
+    resolution = driver.resolve_send_target("uia-session:alice-row")
+    assert resolution.status == TargetStatus.RESOLVED
+    assert resolution.target == ConversationTarget("uia-session:alice-row", "Alice(1)", False)
+
+
+@pytest.mark.parametrize("observed,requested", [("Alice", "Alice（9）"), ("Alice(9)", "Alice")])
+def test_active_send_resolution_allows_suffix_alias_after_current_group_verification(observed, requested):
+    driver, client = make_driver(name=observed, kind="group")
+    client.rows = [replace(client.rows[0], not_read_number=0)]
+    driver.observe_events()
+    assert driver._known_group_keys == set()
+    resolution = driver.resolve_send_target(requested)
+    assert resolution.status == TargetStatus.RESOLVED
+    assert resolution.target == ConversationTarget("uia-session:alice-row", observed, True)
+
+
+@pytest.mark.parametrize("current_kind", ["private", "unknown"])
+def test_active_send_group_suffix_alias_requires_current_group_evidence(current_kind):
+    driver, client = make_driver(kind="group")
+    driver.observe_events()
+    assert driver._known_group_keys == {"uia-session:alice-row"}
+    client.headers["alice-row"] = HeaderInfo("Alice", current_kind)
+    resolution = driver.resolve_send_target("Alice(9)")
+    assert resolution.status != TargetStatus.RESOLVED
+    assert resolution.target is None
 
 
 def test_group_scan_and_source_revalidation_allow_member_count_suffix():

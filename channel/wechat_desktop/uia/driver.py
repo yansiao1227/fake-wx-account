@@ -1295,7 +1295,11 @@ class WechatUiaDriver(WechatDesktopBackend):
         if key.startswith("uia-session:"):
             return TargetResolution(TargetStatus.STALE, reason="conversation identity is no longer visible")
         matches = [(identity, row) for identity, row in selectors.items()
-                   if conversation_titles_match(row.conversation_title, key)]
+                   if str(row.conversation_title or "").strip() == key]
+        if not matches:
+            # 后缀匹配只提供候选；发送时须用本次真实头部复核原始请求。
+            matches = [(identity, row) for identity, row in selectors.items()
+                       if conversation_titles_match(row.conversation_title, key)]
         if len(matches) > 1:
             return TargetResolution(TargetStatus.AMBIGUOUS, reason="multiple conversations have the same display name")
         if not matches:
@@ -1314,9 +1318,10 @@ class WechatUiaDriver(WechatDesktopBackend):
         """主动发送按真实聊天头部确认类型，不信任调用者或配置中的群类型。"""
 
         try:
+            requested = str(conversation or "").strip()
             # UI 租约先于状态锁，与接收扫描和最终发送保持相同锁顺序。
             with self._reply_uia(), self._operation_lock:
-                resolution = self.resolve_target(conversation)
+                resolution = self.resolve_target(requested)
                 if resolution.status != TargetStatus.RESOLVED or resolution.target is None:
                     return resolution
                 identity = resolution.target.conversation_id
@@ -1328,6 +1333,8 @@ class WechatUiaDriver(WechatDesktopBackend):
                     return TargetResolution(TargetStatus.STALE, reason="conversation type could not be verified")
                 if not self._header_matches_target(header, selector.title):
                     return TargetResolution(TargetStatus.STALE, reason="conversation header does not match target")
+                if requested != identity and not self._header_matches_target(header, requested):
+                    return TargetResolution(TargetStatus.STALE, reason="conversation header does not match requested display name")
                 return TargetResolution(TargetStatus.RESOLVED,
                                         ConversationTarget(identity, resolution.target.display_name,
                                                            header.header_type == "group"))
