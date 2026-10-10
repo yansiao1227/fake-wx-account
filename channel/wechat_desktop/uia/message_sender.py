@@ -199,7 +199,6 @@ class WechatMessageSender:
             return available and not value
 
         def reject_paste(control, actual_text: str, value_available: bool) -> None:
-            nonlocal input_readable_seen
             logger.warning(
                 "[WechatDesktop] paste attempt %s/%s did not match reply text: "
                 "expected_chars=%s actual_chars=%s keyboard_focus=%s value_pattern=%s",
@@ -216,7 +215,6 @@ class WechatMessageSender:
             win32api.keybd_event(win32con.VK_BACK, 0, 0, 0)
             win32api.keybd_event(win32con.VK_BACK, 0, win32con.KEYEVENTF_KEYUP, 0)
             clear_available, _ = client._try_input_value(control)
-            input_readable_seen = input_readable_seen or clear_available
             if clear_available and not client._wait_for_input_value(
                 control, lambda _: input_is_clear(control), 1.25
             ):
@@ -228,7 +226,6 @@ class WechatMessageSender:
         # another window to steal focus. Reassert WeChat immediately before
         # keyboard input and the physical Send-button click.
         attempts = max(1, min(int(client.config.get("uia_paste_attempts", 3)), 5))
-        input_readable_seen = False
         for attempt in range(1, attempts + 1):
             check_send_allowed()
             client.focus_window()
@@ -249,7 +246,6 @@ class WechatMessageSender:
                 # on every attempt so a transient focus loss cannot poison retries.
                 paste_into(control)
                 value_available, _value = client._try_input_value(control)
-                input_readable_seen = input_readable_seen or value_available
                 actual_text = ""
 
                 def capture_expected(value: str) -> bool:
@@ -260,7 +256,6 @@ class WechatMessageSender:
 
                 accepted = (
                     not expected_text
-                    or not value_available
                     or client._wait_for_input_value(control, capture_expected, 1.25)
                 )
                 if not accepted:
@@ -286,15 +281,13 @@ class WechatMessageSender:
                     )
                 if expected_text:
                     current_available, current_text = client._try_input_value(control)
-                    input_readable_seen = input_readable_seen or current_available
-                    if ((input_readable_seen and not current_available)
-                            or (current_available
-                                and client._normalize_input_text(current_text)
-                                != client._normalize_input_text(expected_text))):
+                    if (not current_available
+                            or client._normalize_input_text(current_text)
+                            != client._normalize_input_text(expected_text)):
                         reject_paste(control, current_text, current_available)
                         continue
-                    # ValuePattern 可能刚恢复；一旦已确认可读，也必须验证
-                    # 发送后输入清空。始终不可读时保留初次发送兼容路径。
+                    # 正文必须在提交前仍可读且匹配。ValuePattern 不可用
+                    # 不能证明粘贴成功，也不能授权发送遗留草稿。
                     value_available = current_available
                 if send_button is not None:
                     client._click_send_button(send_button)

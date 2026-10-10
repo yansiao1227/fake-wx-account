@@ -83,6 +83,8 @@ def input_client(monkeypatch, paste_values, *, send_button=True):
             state["selected"] = True
         elif key == ord("V"):
             state["pastes"] += 1
+            if not state.get("paste_succeeds", True):
+                return
             value = next(state["remaining"], "错误草稿")
             state["value"] = value if state["selected"] else state["value"] + value
             state["selected"] = False
@@ -275,8 +277,7 @@ def test_pattern_recovery_with_wrong_draft_never_submits(monkeypatch, send_butto
 @pytest.mark.parametrize("send_button", [True, False])
 def test_wrong_pattern_recovery_cannot_downgrade_later_unreadable_retry(monkeypatch, send_button):
     client, state = input_client(monkeypatch, ["错误草稿"] * 3, send_button=send_button)
-    # 仅第一次提交前曾可读，拒绝和清空后始终不可读；仍必须记住
-    # 此操作读到过错误草稿，不能退回“始终不可读”的兼容提交。
+    # 仅读到过一次错误草稿，后续重试均不可读，不能跳过正文核验。
     state["unavailable_pattern_reads"] = set(range(1, 100)) - {2}
 
     with track_send_attempt() as attempt:
@@ -288,32 +289,62 @@ def test_wrong_pattern_recovery_cannot_downgrade_later_unreadable_retry(monkeypa
 
 
 @pytest.mark.parametrize("send_button", [True, False])
-def test_pattern_recovery_with_correct_draft_checks_post_send_clear(monkeypatch, send_button):
+def test_pattern_recovery_with_correct_draft_checks_post_send_clear(monkeypatch, fast_sender_clock, send_button):
     client, state = input_client(monkeypatch, ["正确文本"], send_button=send_button)
-    state["unavailable_pattern_reads"] = {1}
+    # 初始检查及第一次等待均不可读；必须继续等待恢复，然后再次检查提交前正文。
+    state["unavailable_pattern_reads"] = {1, 2}
+    monkeypatch.setattr(client, "_wait_for_input_value", client._send_controller._wait_for_input_value)
 
-    client._paste_and_send("正确文本")
+    with track_send_attempt() as attempt:
+        client._paste_and_send("正确文本")
 
+    assert attempt.submitted is True
     assert state["submitted"] == ["正确文本"]
+    assert state["pastes"] == 1
     assert state["post_submit_value_reads"] > 0
 
 
 @pytest.mark.parametrize("send_button", [True, False])
-def test_always_unreadable_input_keeps_initial_send_compatibility(monkeypatch, send_button):
-    client, state = input_client(monkeypatch, ["正确文本"], send_button=send_button)
+def test_unreadable_failed_paste_never_submits_stale_draft(monkeypatch, send_button):
+    """Ctrl+V 无效且 ValuePattern 不可用时，不能把旧草稿当成回复提交。"""
+    client, state = input_client(monkeypatch, [], send_button=send_button)
+    state["value"] = "旧敏感草稿"
+    state["paste_succeeds"] = False
     state["unavailable_pattern_reads"] = "all"
+    error = None
 
-    client._paste_and_send("正确文本")
+    with track_send_attempt() as attempt:
+        try:
+            client._paste_and_send("正确文本")
+        except SendNotSubmitted as exc:
+            error = exc
 
-    assert state["submitted"] == ["正确文本"]
+    assert state["submitted"] == []
+    assert attempt.submitted is False
+    assert error is not None
 
 
 @pytest.mark.parametrize("send_button", [True, False])
-def test_previously_readable_pattern_loss_stays_rejected_across_retries(monkeypatch, send_button):
+def test_always_unreadable_input_rejects_even_successful_paste(monkeypatch, send_button):
     client, state = input_client(monkeypatch, ["正确文本"] * 3, send_button=send_button)
+    state["unavailable_pattern_reads"] = "all"
+
+    with track_send_attempt() as attempt:
+        with pytest.raises(SendNotSubmitted):
+            client._paste_and_send("正确文本")
+
+    assert attempt.submitted is False
+    assert state["submitted"] == []
+
+
+@pytest.mark.parametrize("send_button", [True, False])
+def test_previously_readable_pattern_loss_stays_rejected_across_retries(monkeypatch, fast_sender_clock, send_button):
+    client, state = input_client(monkeypatch, ["正确文本"] * 3, send_button=send_button)
+    monkeypatch.setattr(client, "_wait_for_input_value", client._send_controller._wait_for_input_value)
 
     def lose_pattern(minimum, maximum):
-        if minimum == "uia_paste_settle_ms_min":
+        last_settle = "uia_pre_send_settle_ms_min" if send_button else "uia_paste_settle_ms_min"
+        if minimum == last_settle:
             state["unavailable_pattern_reads"] = "all"
 
     monkeypatch.setattr(client, "_paced_wait", lose_pattern)
