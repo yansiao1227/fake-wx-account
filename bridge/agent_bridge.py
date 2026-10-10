@@ -475,6 +475,7 @@ class AgentBridge:
         cancel_event = None
         token_key = None
         steer_inbox = None
+        evolution_run_active = False
         from channel.wechat_desktop.pipeline.session_context import (
             current_run_messages,
             is_wechat_auto_reply,
@@ -568,6 +569,7 @@ class AgentBridge:
             try:
                 from agent.evolution.trigger import mark_run_active
                 mark_run_active(agent, True)
+                evolution_run_active = True
             except Exception:
                 pass
 
@@ -583,13 +585,6 @@ class AgentBridge:
                     steer_inbox=steer_inbox,
                 )
             finally:
-                # Clear the mid-run flag so idle scans can review this session.
-                try:
-                    from agent.evolution.trigger import mark_run_active
-                    mark_run_active(agent, False)
-                except Exception:
-                    pass
-
                 # Restore original tools
                 if context and context.get("is_scheduled_task"):
                     agent.tools = original_tools
@@ -725,6 +720,15 @@ class AgentBridge:
                 except Exception:
                     pass
             return Reply(ReplyType.ERROR, f"Agent error: {str(e)}")
+        finally:
+            # 会话原文替换、持久化与用户活动记录完成后，才允许空闲扫描。
+            # 最外层 finally 同时覆盖执行、整理和错误处理中的异常。
+            if evolution_run_active:
+                try:
+                    from agent.evolution.trigger import mark_run_active
+                    mark_run_active(agent, False)
+                except Exception:
+                    pass
     
     def _schedule_mcp_hot_reload(self, agent):
         """

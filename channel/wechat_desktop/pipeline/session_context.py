@@ -297,7 +297,8 @@ def compact_session_messages(
             user = _truncate(user, min(len(user), max(1, available // 2)))
             reply = _truncate(reply, available - len(user))
             if not user or not reply:
-                continue
+                # 无法表示当前轮次时停止，不能跳过它再注入更旧话题。
+                break
         if pointer:
             reply = reply + "\n" + pointer
         retained.append([
