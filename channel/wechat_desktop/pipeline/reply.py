@@ -25,17 +25,9 @@ class WechatDesktopReplyMixin:
             "text",
         ):
             return "skipped"
-        validation = self._driver.validate_reply_target(event)
-        if not validation.valid:
-            if validation.replacement_event is not None:
-                self._accept_replacement_event(validation.replacement_event)
-            self._store.audit(
-                "send_text",
-                target_name,
-                "stale_target",
-                self._content_hash(ATTACHMENT_REFERENCE_REQUIRED_REPLY),
-                detail=validation.reason,
-            )
+        if not self._validate_source_before_reply(
+            event, None, target_name, ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text"
+        ):
             return "skipped"
         send_target = (target_id or target_name)
         self._mark_lifecycle(item.source_event_ids, "send_started")
@@ -129,7 +121,7 @@ class WechatDesktopReplyMixin:
             item.event.task.deferred_materialization_events
             or []
         )
-        if deferred_events:
+        if deferred_events and not item.event.task.source_invalid:
             try:
                 # 延迟物化会打开图片查看器或定位文件，必须纳入独占回复周期。
                 self._driver.begin_reply_cycle(
@@ -145,11 +137,12 @@ class WechatDesktopReplyMixin:
                     if not notice_sent:
                         notice_sent = self._send_share_content_fetch_notice(item)
 
-                materialized = self._materialize_batch(
-                    deferred_events, before_share_fetch=before_share_fetch
-                )
-                materialized.task.preflight_attachment_notice_sent = notice_sent
-                item.event = materialized
+                if not item.event.task.source_invalid:
+                    materialized = self._materialize_batch(
+                        deferred_events, before_share_fetch=before_share_fetch
+                    )
+                    materialized.task.preflight_attachment_notice_sent = notice_sent
+                    item.event = materialized
             except Exception:
                 deferred_failed = True
                 logger.exception(
@@ -167,7 +160,9 @@ class WechatDesktopReplyMixin:
                 batch_id=item.batch_id,
             )
         try:
-            if deferred_failed:
+            if item.event.task.source_invalid:
+                terminal = "skipped"
+            elif deferred_failed:
                 terminal = "failed"
             elif item.expired:
                 terminal = item.terminal or "skipped"
@@ -183,6 +178,8 @@ class WechatDesktopReplyMixin:
                 "[WechatDesktop] queued message failed: %s", exc, exc_info=True
             )
         finally:
+            if item.event.task.source_invalid:
+                terminal = "skipped"
             terminal = self._store.delivery_outcome(item.source_event_ids, terminal)
             if terminal in {"failed", "timeout"}:
                 try:
@@ -200,6 +197,8 @@ class WechatDesktopReplyMixin:
                         "[WechatDesktop] final failure notice crashed: %s",
                         notice_exc,
                     )
+                if item.event.task.source_invalid:
+                    terminal = "skipped"
             if not reference_required:
                 self._best_effort("end_reply_cycle", self._driver.end_reply_cycle)
                 self._mark_lifecycle(item.source_event_ids, "agent_done")

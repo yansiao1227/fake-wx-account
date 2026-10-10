@@ -158,8 +158,13 @@ class WechatDatabaseSource:
                         reader.account_id, highwaters, startup_unread_bounds=unread_bounds)
                     self._boot_highwaters = dict(highwaters)
                     self._startup_unread_bounds = unread_bounds
-                elif any(stream_id not in checkpoints for stream_id in highwaters):
+                elif any(stream_id not in checkpoints or stream_id not in self._boot_highwaters
+                         for stream_id in highwaters):
                     checkpoints = ledger.initialize_source_account(reader.account_id, highwaters)
+                    # 运行时出现的新分片也有固定历史边界，初始化失败不得提前冻结。
+                    # 已有流的边界不能随轮询增长，否则后来到达的消息也会误作补账。
+                    for stream_id, high in highwaters.items():
+                        self._boot_highwaters.setdefault(stream_id, dict(high))
                 batch = reader.poll_batch(checkpoints, self._boot_highwaters)
                 self._pending_batch = batch
                 return self.status(**({"source_batch": batch} if batch else {})), (
@@ -195,6 +200,13 @@ class WechatDatabaseSource:
         """通道明确重新启动后重建读取器，并按持久游标补历史。"""
         with self._lifecycle_lock, self._lock:
             self._cleanup_retired_readers()
+            if self._closed.is_set() and self._cleanup_readers:
+                raise DatabaseReadError("snapshot_cleanup_failed", "数据库快照尚未清理完成，暂不能重新启动")
+            if self._closed.is_set() and self._closed_cleaned:
+                # 只有显式关闭完成后，才能为重新启动的通道认证新账号。
+                # 运行中的重登录/重试必须继续保留冻结身份，拒绝静默切号。
+                self._frozen_account_id = None
+                self._account_changed = False
             self._closed.clear()
             self._closed_cleaned = False
             self._last_status.update(db_read_healthy=False, db_read_stale=False, db_read_error_code="")

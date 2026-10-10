@@ -43,14 +43,22 @@ class DatabaseUiaTargetBinder:
             raise DatabaseReadError("account_identity_mismatch", "微信窗口账号与数据库绑定不一致")
 
     @staticmethod
-    def _database_target(reader, conversation):
+    def _titles_match(left, right, *, is_group):
+        if is_group:
+            return conversation_titles_match(left, right)
+        return bool(str(left or "").strip()) and str(left).strip() == str(right or "").strip()
+
+    @classmethod
+    def _database_target(cls, reader, conversation):
         key = str(conversation or "").strip()
         contact = reader.get_contact_by_conversation_id(key)
         if contact:
             return contact, None
         if key.startswith("db-session:"):
             return None, TargetResolution(TargetStatus.STALE, reason="数据库会话身份已失效或属于其他账号")
-        matches = reader.match_contacts(key)
+        matches = [item for item in reader.match_contacts(key)
+                   if item["username"] == key or cls._titles_match(
+                       item["display_name"], key, is_group=item["is_group"])]
         if len(matches) > 1:
             return None, TargetResolution(TargetStatus.AMBIGUOUS, reason="多个数据库联系人具有相同显示名")
         if not matches:
@@ -81,11 +89,13 @@ class DatabaseUiaTargetBinder:
                     return failure
                 self._verify_account(reader, gateway)
                 duplicates = [item for item in reader.match_contacts(contact["display_name"])
-                              if conversation_titles_match(item["display_name"], contact["display_name"])]
+                              if self._titles_match(item["display_name"], contact["display_name"],
+                                                    is_group=item["is_group"] and contact["is_group"])]
                 if len(duplicates) != 1:
                     return TargetResolution(TargetStatus.AMBIGUOUS, reason="数据库显示名无法唯一绑定微信界面")
                 matches = [row for row in gateway.list_conversations()
-                           if conversation_titles_match(row.conversation_title, contact["display_name"])]
+                           if self._titles_match(row.conversation_title, contact["display_name"],
+                                                 is_group=contact["is_group"])]
                 if len(matches) > 1:
                     return TargetResolution(TargetStatus.AMBIGUOUS, reason="微信界面存在多个同名会话")
                 if not matches:
@@ -98,11 +108,13 @@ class DatabaseUiaTargetBinder:
                 previous = self._bindings.get(cid)
                 if previous and previous != binding:
                     return TargetResolution(TargetStatus.STALE, reason="目标会话绑定已变化，需要重启后重新绑定")
+                target = ConversationTarget(cid, contact["display_name"], contact["is_group"])
+                gateway.verify_target(target, row)
                 gateway.bind_target(cid, row)
                 self._bindings[cid] = binding
                 self._identity_verification = "display_name"
                 return TargetResolution(TargetStatus.RESOLVED,
-                                        ConversationTarget(cid, contact["display_name"], contact["is_group"]),
+                                        target,
                                         "display_name_verified; native_identity_unavailable")
         except Exception as exc:
             return TargetResolution(TargetStatus.STALE, reason=getattr(exc, "code", "target_resolution_failed"))
@@ -123,8 +135,12 @@ class DatabaseUiaTargetBinder:
             reader.refresh()
             self._verify_account(reader, gateway)
             header = gateway.read_current_title()
+            if header.header_type not in {"private", "group"}:
+                raise DatabaseReadError("conversation_type_unverified", "当前会话类型无法确认")
+            is_group = header.header_type == "group"
             matches = [item for item in reader.match_contacts(header.title)
-                       if conversation_titles_match(item["display_name"], header.title)]
+                       if item["is_group"] == is_group and self._titles_match(
+                           item["display_name"], header.title, is_group=is_group)]
             if len(matches) != 1:
                 raise DatabaseReadError("conversation_ambiguous" if matches else "conversation_not_found",
                                         "当前会话标题无法唯一对应数据库联系人")

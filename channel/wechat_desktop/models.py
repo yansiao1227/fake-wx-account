@@ -137,6 +137,8 @@ class ReplyTaskMetadata:
 
     created_at: float = field(default_factory=time.monotonic)
     source_event_ids: list[str] = field(default_factory=list)
+    source_validation_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
+    source_invalid: bool = False
     batch_id: str = ""
     deferred_materialization_events: list[WechatDesktopEvent] = field(default_factory=list, repr=False)
     cache_only: bool = False

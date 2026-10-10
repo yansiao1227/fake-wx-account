@@ -26,7 +26,7 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def _text(value) -> str:
+def _text(value, *, strict=False) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
@@ -50,7 +50,9 @@ def _text(value) -> str:
                 raise DatabaseReadError("content_decode_failed", "数据库压缩正文解码失败") from exc
         try:
             return data.decode("utf-8").strip("\x00")
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as exc:
+            if strict:
+                raise DatabaseReadError("content_decode_failed", "数据库正文 UTF-8 解码失败") from exc
             return ""
     return str(value)
 
@@ -527,9 +529,17 @@ class WechatDatabaseReader:
         sender_num = _integer(row["real_sender_id"], -1)
         sender = self._sender_username(stream, sender_num)
         is_group = stream.talker.endswith("@chatroom")
-        content = _text(row["message_content"])
+        try:
+            content = _text(row["message_content"], strict=True)
+        except DatabaseReadError as exc:
+            # 某些快照的主字段是二进制占位，真实正文保存在压缩字段。
+            if exc.code != "content_decode_failed" or not row["compress_content"]:
+                raise
+            content = _text(row["compress_content"], strict=True)
+            if not content:
+                raise exc
         if not content:
-            content = _text(row["compress_content"])
+            content = _text(row["compress_content"], strict=True)
         # Older message snapshots prefix a group text body with "wxid:\n".
         if is_group and ":\n" in content and not content.lstrip().startswith("<"):
             prefix, body = content.split(":\n", 1)

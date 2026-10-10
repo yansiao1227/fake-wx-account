@@ -129,6 +129,12 @@ class WechatUiaDriver(WechatDesktopBackend):
                 *args,
             )
 
+    @staticmethod
+    def _header_matches_target(header, title: str) -> bool:
+        """人数后缀仅在头部明确为群聊时具有特殊含义。"""
+        from channel.wechat_desktop.conversation import conversation_header_matches_target
+        return conversation_header_matches_target(header, title)
+
     @property
     def reply_in_flight(self) -> bool:
         return self._reply_in_flight.is_set()
@@ -1098,12 +1104,9 @@ class WechatUiaDriver(WechatDesktopBackend):
                             )
                             continue
                         if active_reply_conversation:
-                            from channel.wechat_desktop.uia.operations import (
-                                conversation_titles_match,
-                            )
-
                             header = self._scan_uia(self.client.get_title)
-                            if not conversation_titles_match(header.title, name):
+                            if not self._header_matches_target(header, name):
+                                self._retry_conversations.add(row_key)
                                 self._trace(
                                     "02-skip",
                                     "conversation=%s reason=reply_monitor_not_active current=%s",
@@ -1120,7 +1123,7 @@ class WechatUiaDriver(WechatDesktopBackend):
                                 header.header_type,
                                 header.chat_number,
                             )
-                        elif not is_group:
+                        else:
                             located = self._scan_uia(
                                 self.client.locate_conversation,
                                 name, row.runtime_id, row.row_index
@@ -1136,6 +1139,14 @@ class WechatUiaDriver(WechatDesktopBackend):
                             if not located:
                                 continue
                             header = self._scan_uia(self.client.get_title)
+                            if not self._header_matches_target(header, name):
+                                self._retry_conversations.add(row_key)
+                                self._trace(
+                                    "02-skip",
+                                    "conversation=%s reason=header_unverified title=%s type=%s",
+                                    name, header.title or "<empty>", header.header_type,
+                                )
+                                continue
                             is_group = header.header_type == "group"
                             self._trace(
                                 "03-header",
@@ -1301,7 +1312,6 @@ class WechatUiaDriver(WechatDesktopBackend):
 
     def resolve_send_target(self, conversation: str) -> TargetResolution:
         """主动发送按真实聊天头部确认类型，不信任调用者或配置中的群类型。"""
-        from channel.wechat_desktop.conversation import conversation_titles_match
 
         try:
             # UI 租约先于状态锁，与接收扫描和最终发送保持相同锁顺序。
@@ -1314,10 +1324,10 @@ class WechatUiaDriver(WechatDesktopBackend):
                 if not self.client.locate_conversation(selector.title, selector.runtime_id, selector.row_index):
                     return TargetResolution(TargetStatus.STALE, reason="conversation is no longer visible")
                 header = self.client.get_title()
-                if not conversation_titles_match(header.title, selector.title):
-                    return TargetResolution(TargetStatus.STALE, reason="conversation header does not match target")
                 if header.header_type not in {"private", "group"}:
                     return TargetResolution(TargetStatus.STALE, reason="conversation type could not be verified")
+                if not self._header_matches_target(header, selector.title):
+                    return TargetResolution(TargetStatus.STALE, reason="conversation header does not match target")
                 return TargetResolution(TargetStatus.RESOLVED,
                                         ConversationTarget(identity, resolution.target.display_name,
                                                            header.header_type == "group"))
@@ -1343,17 +1353,26 @@ class WechatUiaDriver(WechatDesktopBackend):
     def _validate_reply_target_locked(
         self, event: WechatDesktopEvent
     ) -> ReplyTargetValidation:
+        if event.source_type not in {"private", "group"}:
+            return ReplyTargetValidation(False, "source conversation type could not be verified")
         if event.conversation_id not in self._conversation_selectors:
             return ReplyTargetValidation(
                 False, "conversation row is no longer visible"
             )
-        if not event.is_group:
-            # Strict private FIFO: a newer bubble must not invalidate the
-            # already-running reply. The stored UIA session selector is enough
-            # to verify the destination still exists.
-            return ReplyTargetValidation(True)
         selector = self._resolve_selector(event.conversation_id)
         title = selector.title
+        if not self.client.locate_conversation(title, selector.runtime_id, selector.row_index):
+            return ReplyTargetValidation(False, "conversation is no longer visible")
+        header = self.client.get_title()
+        if not self._header_matches_target(header, title):
+            return ReplyTargetValidation(False, "conversation header or type could not be verified")
+        if (header.header_type == "group") != event.is_group:
+            return ReplyTargetValidation(False, "conversation type changed")
+        if not event.is_group:
+            # Strict private FIFO: a newer bubble must not invalidate the
+            # already-running reply. Destination identity and type were
+            # verified above; private FIFO does not re-read newer bubbles.
+            return ReplyTargetValidation(True)
         messages = self.client.get_chat_history(
             title,
             self._message_limit(),

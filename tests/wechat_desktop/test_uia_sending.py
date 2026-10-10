@@ -538,6 +538,7 @@ def test_send_file_pacing_waits_outside_the_uia_section(monkeypatch, tmp_path):
 
     monkeypatch.setattr(client, "focus_window", lambda: None)
     monkeypatch.setattr(client, "locate_conversation", lambda *_args: True)
+    monkeypatch.setattr(client, "get_title", lambda: HeaderInfo("Alice", "private"))
     monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
     monkeypatch.setattr(

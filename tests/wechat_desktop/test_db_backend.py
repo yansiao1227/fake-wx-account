@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from channel.wechat_desktop.contracts import SendResult, SendStatus, TargetStatus
+from channel.wechat_desktop.conversation import conversation_header_matches_target
 from channel.wechat_desktop.hybrid import WechatDatabaseBackend
 from channel.wechat_desktop.db.errors import DatabaseReadError
 from channel.wechat_desktop.db.reader import WechatDatabaseReader
@@ -24,6 +25,7 @@ class Client:
     def __init__(self):
         self.pid = 42
         self.wxid = ""
+        self.header_type = "private"
         self.rows = [ConversationInfo("Synthetic", runtime_id="row-1", row_index=0)]
         self.ui_calls = []
         self.sent = []
@@ -42,7 +44,7 @@ class Client:
 
     def get_title(self):
         self.ui_calls.append("header")
-        return HeaderInfo("Synthetic", "private")
+        return HeaderInfo("Synthetic", self.header_type)
 
 
 class Gateway:
@@ -73,6 +75,11 @@ class Gateway:
 
     def bind_target(self, conversation_id, row):
         self.bindings[conversation_id] = row
+
+    def verify_target(self, target, row):
+        if not conversation_header_matches_target(self.client.get_title(), target.display_name,
+                                                  is_group=target.is_group):
+            raise SendNotSubmitted("conversation header or type does not match database target")
 
     def send_text(self, conversation, text, *, validate=None):
         if self.before_send:
@@ -291,7 +298,7 @@ def test_startup_unread_disabled_keeps_all_existing_messages_in_baseline(backend
     assert instance.observe_events()[1] == []
 
 
-def test_runtime_new_shard_first_message_is_live_and_not_baselined(backend, tmp_path):
+def test_runtime_new_shard_discovery_backfills_then_later_messages_are_live(backend, tmp_path):
     instance, reader, store, driver, talker = backend
     instance.observe_events()
     cache = PlainCache(tmp_path / "message_1.db")
@@ -302,9 +309,13 @@ def test_runtime_new_shard_first_message_is_live_and_not_baselined(backend, tmp_
     add_message(cache, talker, 1)
     reader.caches["message/message_1.db"] = cache
     observation, events = instance.observe_events()
-    assert len(events) == 1 and events[0].receipt_phase == "live"
+    assert len(events) == 1 and events[0].receipt_phase == "offline_backfill"
     assert observation["source_batch"].checkpoints[0].expected_cursor == 0
-    assert observation["source_batch"].checkpoints[0].baseline_high_water == 0
+    assert observation["source_batch"].checkpoints[0].baseline_high_water == 1
+    store.receive_source_batch(observation["source_batch"])
+    instance.acknowledge_events([observation["source_batch"].batch_id])
+    add_message(cache, talker, 2)
+    assert [event.receipt_phase for event in instance.observe_events()[1]] == ["live"]
 
 
 @pytest.mark.parametrize("change", ["recalled", "deleted", "outgoing", "changed"])
@@ -616,6 +627,7 @@ def test_legacy_uia_driver_injection_uses_public_gateway_binding(backend):
     _, reader, store, _, talker = backend
     client = FakeClient()
     client.rows = [ConversationInfo("Synthetic", runtime_id="synthetic-ui-row", row_index=0)]
+    client.headers["synthetic-ui-row"] = HeaderInfo("Synthetic", "private")
     driver = WechatUiaDriver({}, client=client, shell_hook=FakeHook())
     sent = []
     client.send_message = lambda who, text, **kwargs: sent.append((who, text, kwargs)) or {"success": True, "verified": True}

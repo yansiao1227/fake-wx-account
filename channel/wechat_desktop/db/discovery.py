@@ -41,7 +41,7 @@ def normalize_root(value: str) -> Path:
 def _current_database_paths(db_storage: Path, pattern: str) -> list[Path]:
     # 认证和读取必须使用同一目录范围，迁移遗留库不能证明当前登录身份。
     return sorted((path for path in db_storage.rglob(pattern)
-                   if "migrate" not in path.relative_to(db_storage).parts), key=str)
+                   if all(part.casefold() != "migrate" for part in path.relative_to(db_storage).parts)), key=str)
 
 
 def _contact_pages(db_storage: Path) -> list[bytes]:

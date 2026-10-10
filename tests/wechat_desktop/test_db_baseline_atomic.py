@@ -143,7 +143,7 @@ def test_empty_successful_account_remembers_baseline_and_backfills_after_restart
     reader.highwaters = {"new-stream": {"cursor": 3, "generation": "g"}}
     WechatDatabaseSource({}, reader=reader, checkpoint_store=store).observe_events()
     assert reader.checkpoints["new-stream"]["cursor"] == 0
-    assert reader.checkpoints["new-stream"]["baseline_high_water"] == 0
+    assert reader.checkpoints["new-stream"]["baseline_high_water"] == 3
     assert reader.boot_highwaters == reader.highwaters
 
 
@@ -163,7 +163,8 @@ def test_legacy_checkpoint_migration_preserves_history_and_backfills_new_stream(
             "new-stream": {"cursor": 4, "generation": "h"}})
         assert checkpoints["old-stream"]["cursor"] == 7
         assert checkpoints["old-stream"]["baseline_high_water"] == 5
-        assert checkpoints["new-stream"]["cursor"] == checkpoints["new-stream"]["baseline_high_water"] == 0
+        assert checkpoints["new-stream"]["cursor"] == 0
+        assert checkpoints["new-stream"]["baseline_high_water"] == 4
         assert ledger.list_conversation_history("conversation")[0]["content"] == "history"
     finally:
         ledger._get_connection().close()

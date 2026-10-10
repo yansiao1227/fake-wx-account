@@ -8,7 +8,10 @@ import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from channel.wechat_desktop.contracts import ConversationTarget
 
 
 class SendCancelled(RuntimeError):
@@ -20,6 +23,21 @@ class SendNotSubmitted(RuntimeError):
 
 
 _check: ContextVar[Callable[[], None] | None] = ContextVar("wechat_send_check", default=None)
+_target: ContextVar["ConversationTarget | None"] = ContextVar("wechat_send_target", default=None)
+
+
+@contextmanager
+def send_target_scope(target):
+    """每段的可信会话类型只在当前调用上下文内可见，结束或异常后恢复。"""
+    token = _target.set(target)
+    try:
+        yield
+    finally:
+        _target.reset(token)
+
+
+def current_send_target():
+    return _target.get()
 
 
 @dataclass

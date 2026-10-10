@@ -45,6 +45,7 @@ def store(tmp_path):
 def database_backend(tmp_path, store, *, group=False):
     reader, talker = make_reader(tmp_path, group=group)
     gateway = Gateway()
+    gateway.client.header_type = "group" if group else "private"
     backend = WechatDatabaseBackend({}, db_reader=reader, store=store, uia_gateway=gateway)
     return backend, reader, gateway, reader.conversation_id(talker)
 

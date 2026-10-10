@@ -39,4 +39,17 @@ def conversation_titles_match(left: str, right: str) -> bool:
     return strip_member_count_suffix(a) == strip_member_count_suffix(b)
 
 
-__all__ = ["strip_member_count_suffix", "conversation_titles_match"]
+def conversation_header_matches_target(header, title: str, *, is_group=None) -> bool:
+    """只有明确群类型的头部可忽略人数后缀，并复核可选的授权类型。"""
+    if header.header_type not in {"private", "group"}:
+        return False
+    observed_group = header.header_type == "group"
+    if is_group is not None and observed_group != is_group:
+        return False
+    if observed_group:
+        return conversation_titles_match(header.title, title)
+    expected = str(title or "").strip()
+    return bool(expected) and str(header.title or "").strip() == expected
+
+
+__all__ = ["strip_member_count_suffix", "conversation_titles_match", "conversation_header_matches_target"]

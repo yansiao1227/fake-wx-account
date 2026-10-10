@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from .helpers import PipelineStoreStub
 from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
-from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage
+from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage, ReplyTargetValidation
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from .helpers import _bare_wechat_channel
 
@@ -170,6 +170,7 @@ def test_agent_error_sends_one_final_failure_notice():
         reserve_send=lambda _units=1: True,
     )
     channel._driver = SimpleNamespace(
+        validate_reply_target=lambda event: ReplyTargetValidation(True),
         send_interim_text=lambda target, text: (
             sent.append((target, text))
             or {"success": True, "verified": True}
@@ -265,6 +266,7 @@ def test_tool_notice_callback_sends_and_tracks_conversation(has_event, send_fail
         return {"success": True, "verified": True}
 
     channel._driver = SimpleNamespace(
+        validate_reply_target=lambda event: ReplyTargetValidation(True),
         register_interim_text=lambda *args: registered.append(args),
         forget_interim_text=lambda *args: forgotten.append(args),
         send_interim_text=send,

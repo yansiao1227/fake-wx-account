@@ -59,7 +59,7 @@ def test_restart_new_shard_backfills_to_history_without_reply(tmp_path, store, s
     assert routed == []
     assert restarted.source.pending_batch is None
     assert store.get_source_checkpoint(initial_reader.account_id, new_stream)["cursor"] == 2
-    assert store.get_source_checkpoint(initial_reader.account_id, new_stream)["baseline_high_water"] == 0
+    assert store.get_source_checkpoint(initial_reader.account_id, new_stream)["baseline_high_water"] == 2
     history = store.list_conversation_history(first[0].conversation_id)
     assert len(history) == 4
     assert all(store.event_state(event.event_id)["reason"] == "offline_backfill" for event in events)

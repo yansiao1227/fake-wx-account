@@ -6,9 +6,12 @@ import threading
 from contextlib import contextmanager
 from typing import Callable, Optional
 
-from channel.wechat_desktop.contracts import SendResult, SendStatus
+from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus
+from channel.wechat_desktop.conversation import conversation_header_matches_target
 from channel.wechat_desktop.models import ConversationInfo, HeaderInfo, OwnerInfo
-from channel.wechat_desktop.send_control import SendCancelled, check_send_allowed, extend_send_scope
+from channel.wechat_desktop.send_control import (
+    SendCancelled, SendNotSubmitted, check_send_allowed, extend_send_scope, send_target_scope,
+)
 from channel.wechat_desktop.uia.client import WechatUiaClient
 from channel.wechat_desktop.uia.operations import (
     WechatConversationSelector,
@@ -142,10 +145,10 @@ class WechatUiaGateway:
         """在每个实际发送 UI 段中原子复核本次调用的账号和目标。"""
         with self.operation():
             validate = getattr(self._send_local, "validate", None)
-            if validate is not None:
-                validate()
+            target = validate() if validate is not None else None
             self._check_open()
-            yield
+            with send_target_scope(target if isinstance(target, ConversationTarget) else None):
+                yield
 
     @property
     def closed(self) -> bool:
@@ -195,6 +198,18 @@ class WechatUiaGateway:
     def read_current_title(self) -> HeaderInfo:
         with self.operation():
             return self.client.get_title()
+
+    def verify_target(self, target: ConversationTarget, row: ConversationInfo) -> None:
+        """按稳定行定位后复核真实会话类型，不能把群名后缀误认成私聊。"""
+        with self.operation():
+            if target.is_group is None:
+                raise SendNotSubmitted("conversation type could not be verified")
+            self.client.focus_window()
+            if not self.client.locate_conversation(row.conversation_title, row.runtime_id, row.row_index):
+                raise SendNotSubmitted("conversation is no longer visible")
+            header = self.client.get_title()
+            if not conversation_header_matches_target(header, target.display_name, is_group=target.is_group):
+                raise SendNotSubmitted("conversation header or type does not match database target")
 
     def bind_target(self, conversation_id: str, row: ConversationInfo) -> None:
         identity = str(conversation_id or "").strip()

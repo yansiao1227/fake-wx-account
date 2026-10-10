@@ -193,6 +193,19 @@ class WechatDesktopStore:
             if "dedupe_key" not in delivery_columns:
                 db.execute("ALTER TABLE deliveries ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dedupe ON deliveries(dedupe_key) WHERE dedupe_key != ''")
+            source_columns = {row["name"] for row in db.execute("PRAGMA table_info(source_records)")}
+            if "batch_id" not in source_columns:
+                db.execute("ALTER TABLE source_records ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''")
+            batch_columns = {row["name"] for row in db.execute("PRAGMA table_info(source_batches)")}
+            if "checkpoint_ranges" not in batch_columns:
+                db.execute("ALTER TABLE source_batches ADD COLUMN checkpoint_ranges TEXT NOT NULL DEFAULT ''")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_records_batch ON source_records(account_id,batch_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_records_event ON source_records(event_id) WHERE event_id != ''")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_records_received ON source_records(received_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_records_account_received ON source_records(account_id,received_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_batches_received ON source_batches(received_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_source_batches_legacy "
+                       "ON source_batches(account_id,received_at) WHERE checkpoint_ranges=''")
 
             # 建表与旧账号迁移同一事务完成；不能在以后每次启动时根据非空
             # checkpoint 再补标记，否则会把未完成的首次基线误认成老账号。
@@ -290,7 +303,7 @@ class WechatDesktopStore:
                                          (account_id,)).fetchone() is not None
                 now = time.time()
                 for stream_id, high in highwaters.items():
-                    high_water = int(high["cursor"]) if not initialized else 0
+                    high_water = int(high["cursor"])
                     cursor = int(bounds.get(stream_id, high_water + 1)) - 1 if not initialized else 0
                     db.execute(
                         "INSERT OR IGNORE INTO source_checkpoints VALUES (?,?,?,?,?,?)",
@@ -398,14 +411,25 @@ class WechatDesktopStore:
                 if previous_batch and previous_batch["source_signature"] != signature:
                     raise ValueError("source batch id was reused with different rows")
                 if not previous_batch:
+                    committed = {}
                     for checkpoint in batch.checkpoints:
                         existing = db.execute(
-                            "SELECT cursor FROM source_checkpoints WHERE account_id=? AND stream_id=?",
+                            "SELECT cursor,generation FROM source_checkpoints WHERE account_id=? AND stream_id=?",
                             (batch.account_id, checkpoint.stream_id),
                         ).fetchone()
-                        current_cursor = existing["cursor"] if existing else 0
-                        if current_cursor != checkpoint.expected_cursor:
+                        committed[checkpoint.stream_id] = dict(existing) if existing else {"cursor": 0, "generation": ""}
+                    if any(committed[item.stream_id]["cursor"] != item.expected_cursor for item in batch.checkpoints):
+                        # 保留期过后的批次签名可以删除，永久 checkpoint 仍然阻止
+                        # 旧扫描重放。整批都已覆盖才确认；重叠的新行必须重新扫描。
+                        if not all(
+                            committed[item.stream_id]["cursor"] >= item.cursor
+                            and (not item.generation or committed[item.stream_id]["generation"] == item.generation)
+                            for item in batch.checkpoints
+                        ):
                             raise ValueError("source cursor changed; rescan from committed checkpoint")
+                        receipts = self._duplicate_source_receipts(db, batch)
+                        db.execute("RELEASE receive_source_batch")
+                        return receipts
                     for record in batch.records:
                         existing = db.execute(
                             "SELECT source_message_id, event_id FROM source_records "
@@ -442,10 +466,11 @@ class WechatDesktopStore:
                                 db.execute("UPDATE events SET processed_at=? WHERE event_id=?", (time.time(), event_id))
                                 receipts[-1] = EventReceipt(receipt.observed_event_id, event_id, False, "skipped")
                         db.execute(
-                            "INSERT INTO source_records VALUES (?,?,?,?,?,?,?,?)",
+                            "INSERT INTO source_records(account_id,stream_id,local_id,source_message_id,"
+                            "event_id,filter_reason,receipt_phase,received_at,batch_id) VALUES (?,?,?,?,?,?,?,?,?)",
                             (batch.account_id, record.stream_id, record.local_id,
                              record.source_message_id, event_id, record.filter_reason,
-                             record.receipt_phase, time.time()),
+                             record.receipt_phase, time.time(), batch.batch_id),
                         )
                     for checkpoint in batch.checkpoints:
                         db.execute(
@@ -456,25 +481,45 @@ class WechatDesktopStore:
                              checkpoint.baseline_high_water, checkpoint.generation, time.time()),
                         )
                     db.execute(
-                        "INSERT INTO source_batches VALUES (?,?,?,?)",
-                        (batch.account_id, batch.batch_id, signature, time.time()),
+                        "INSERT INTO source_batches(account_id,batch_id,source_signature,received_at,checkpoint_ranges) "
+                        "VALUES (?,?,?,?,?)",
+                        (batch.account_id, batch.batch_id, signature, time.time(), json.dumps([
+                            {"stream_id": item.stream_id, "cursor": item.cursor,
+                             "expected_cursor": item.expected_cursor, "generation": item.generation}
+                            for item in batch.checkpoints
+                        ])),
                     )
                 else:
-                    for record in batch.records:
-                        if record.event is None:
-                            continue
-                        row = db.execute(
-                            "SELECT r.event_id,s.state FROM source_records r "
-                            "LEFT JOIN event_runs s ON s.event_id=r.event_id "
-                            "WHERE r.account_id=? AND r.stream_id=? AND r.local_id=?",
-                            (batch.account_id, record.stream_id, record.local_id),
-                        ).fetchone()
-                        receipts.append(EventReceipt(record.event.event_id, row["event_id"], False, row["state"] or "legacy"))
+                    receipts = self._duplicate_source_receipts(db, batch)
                 db.execute("RELEASE receive_source_batch")
             except Exception:
                 db.execute("ROLLBACK TO receive_source_batch")
                 db.execute("RELEASE receive_source_batch")
                 raise
+        return tuple(receipts)
+
+    @staticmethod
+    def _duplicate_source_receipts(db, batch: SourceBatch) -> tuple[EventReceipt, ...]:
+        """只返回拒绝执行的确认；来源行已过期时也不能重新登记事件。"""
+        receipts = []
+        for record in batch.records:
+            if record.event is None:
+                continue
+            row = db.execute(
+                "SELECT r.event_id,s.state FROM source_records r "
+                "LEFT JOIN event_runs s ON s.event_id=r.event_id "
+                "WHERE r.account_id=? AND r.stream_id=? AND r.local_id=?",
+                (batch.account_id, record.stream_id, record.local_id),
+            ).fetchone()
+            if row is None:
+                row = db.execute(
+                    "SELECT e.event_id,s.state FROM events e LEFT JOIN event_runs s ON s.event_id=e.event_id "
+                    "WHERE e.fingerprint=?", (record.event.fingerprint(),),
+                ).fetchone()
+            receipts.append(EventReceipt(
+                record.event.event_id, row["event_id"] if row else record.event.event_id,
+                False, (row["state"] or "legacy") if row else "expired",
+            ))
         return tuple(receipts)
 
     @staticmethod
@@ -888,7 +933,17 @@ class WechatDesktopStore:
     ):
         cutoff = time.time() - max(1, int(retention_days)) * 86400
         with self._lock, self._connect() as db:
-            db.execute("DELETE FROM events WHERE observed_at < ?", (cutoff,))
+            self._cleanup_source_ledger(db, cutoff)
+            terminal_states = tuple(sorted(EVENT_TERMINALS))
+            terminal_slots = ",".join("?" for _ in terminal_states)
+            # DB 活跃任务和仍受批次保护的事件保留原文；UIA 的原保留期不变。
+            db.execute(
+                "DELETE FROM events WHERE observed_at < ? AND NOT EXISTS "
+                "(SELECT 1 FROM source_records r WHERE r.event_id=events.event_id) "
+                "AND (source_message_id='' OR EXISTS (SELECT 1 FROM event_runs s "
+                f"WHERE s.event_id=events.event_id AND s.state IN ({terminal_slots})))",
+                (cutoff, *terminal_states),
+            )
             history_cutoff = time.time() - max(
                 1, int(history_retention_days)
             ) * 86400
@@ -912,3 +967,56 @@ class WechatDesktopStore:
                     # 保留登记，下一轮继续清理，避免永久遗留副本。
                     continue
                 db.execute("DELETE FROM managed_evidence WHERE path=?", (row["path"],))
+
+    @staticmethod
+    def _cleanup_source_ledger(db, cutoff: float):
+        """只回收已过期、永久游标覆盖且无活跃任务的来源确认。"""
+        terminal_states = tuple(sorted(EVENT_TERMINALS))
+        terminal_slots = ",".join("?" for _ in terminal_states)
+        db.execute(
+            "DELETE FROM source_batches WHERE received_at < ? AND checkpoint_ranges != '' "
+            "AND CASE WHEN json_valid(checkpoint_ranges) THEN json_type(checkpoint_ranges) END='array' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM json_each(source_batches.checkpoint_ranges) j "
+            "LEFT JOIN source_checkpoints c ON c.account_id=source_batches.account_id "
+            "AND c.stream_id=json_extract(CASE WHEN j.type='object' THEN j.value ELSE '{}' END,'$.stream_id') "
+            "WHERE c.cursor IS NULL OR c.cursor < json_extract(j.value,'$.cursor') "
+            "OR json_type(j.value,'$.cursor') IS NOT 'integer' "
+            "OR json_type(j.value,'$.expected_cursor') IS NOT 'integer' "
+            "OR json_type(j.value,'$.generation') IS NOT 'text' "
+            "OR (json_extract(j.value,'$.generation') != '' "
+            "AND c.generation != json_extract(j.value,'$.generation'))) "
+            "AND NOT EXISTS (SELECT 1 FROM source_records r LEFT JOIN event_runs s ON s.event_id=r.event_id "
+            "WHERE r.account_id=source_batches.account_id AND r.batch_id=source_batches.batch_id "
+            f"AND r.event_id != '' AND (s.state IS NULL OR s.state NOT IN ({terminal_slots})))",
+            (cutoff, *terminal_states),
+        )
+        # 旧批次仅有散列，无法恢复精确范围。用同账号该时间以前的全部
+        # 来源行证明覆盖，任一无游标或非终态记录都阻止回收旧批次。
+        db.execute(
+            "WITH unsafe_accounts AS (SELECT r.account_id,min(r.received_at) AS first_unsafe "
+            "FROM source_records r "
+            "LEFT JOIN source_checkpoints c ON c.account_id=r.account_id AND c.stream_id=r.stream_id "
+            "LEFT JOIN event_runs s ON s.event_id=r.event_id "
+            "WHERE r.received_at < ? AND (c.cursor IS NULL OR c.cursor < r.local_id "
+            f"OR (r.event_id != '' AND (s.state IS NULL OR s.state NOT IN ({terminal_slots})))) "
+            "GROUP BY r.account_id) "
+            "DELETE FROM source_batches WHERE received_at < ? AND checkpoint_ranges='' "
+            "AND EXISTS (SELECT 1 FROM source_records r WHERE r.account_id=source_batches.account_id "
+            "AND r.received_at <= source_batches.received_at) "
+            "AND NOT EXISTS (SELECT 1 FROM unsafe_accounts u WHERE u.account_id=source_batches.account_id "
+            "AND u.first_unsafe <= source_batches.received_at)",
+            (cutoff, *terminal_states, cutoff),
+        )
+        db.execute(
+            "DELETE FROM source_records WHERE received_at < ? "
+            "AND EXISTS (SELECT 1 FROM source_checkpoints c WHERE c.account_id=source_records.account_id "
+            "AND c.stream_id=source_records.stream_id AND c.cursor >= source_records.local_id) "
+            "AND (event_id='' OR EXISTS (SELECT 1 FROM event_runs s WHERE s.event_id=source_records.event_id "
+            f"AND s.state IN ({terminal_slots}))) "
+            "AND NOT EXISTS (SELECT 1 FROM source_batches b WHERE b.account_id=source_records.account_id "
+            "AND b.batch_id=source_records.batch_id) "
+            "AND NOT EXISTS (SELECT 1 FROM source_batches b WHERE b.account_id=source_records.account_id "
+            "AND b.checkpoint_ranges='' AND b.received_at >= source_records.received_at)",
+            (cutoff, *terminal_states),
+        )

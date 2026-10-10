@@ -10,10 +10,10 @@ from typing import Iterable, Optional
 from common.log import logger
 from channel.wechat_desktop.models import UiaChatMessage
 from channel.wechat_desktop.send_control import (
-    SendCancelled, SendNotSubmitted, check_send_allowed, mark_send_submitted,
+    SendCancelled, SendNotSubmitted, check_send_allowed, current_send_target, mark_send_submitted,
     send_lock, track_send_attempt,
 )
-from channel.wechat_desktop.uia.operations import conversation_titles_match
+from channel.wechat_desktop.conversation import conversation_header_matches_target
 
 from channel.wechat_desktop.uia.controls import INPUT_ID, _text, _encode_cf_hdrop
 
@@ -21,6 +21,16 @@ from channel.wechat_desktop.uia.controls import INPUT_ID, _text, _encode_cf_hdro
 class WechatMessageSender:
     def __init__(self, client):
         self.client = client
+
+    def _verify_active_target(self, who: str) -> None:
+        active = self.client.get_title()
+        target = current_send_target()
+        expected_group = target.is_group if target is not None else None
+        if target is not None and (expected_group is None or not conversation_header_matches_target(
+                active, target.display_name, is_group=expected_group)):
+            raise SendNotSubmitted("active conversation does not match authorized target")
+        if not conversation_header_matches_target(active, who, is_group=expected_group):
+            raise SendNotSubmitted("active conversation title or type could not be verified")
 
     @contextmanager
     def _clipboard(self, unicode_text: Optional[str] = None, files: Optional[Iterable[str]] = None):
@@ -362,11 +372,7 @@ class WechatMessageSender:
                             # Defense in depth: never paste into a detail pane that
                             # still shows a different chat title (failed session
                             # switch).
-                            active = client.get_title()
-                            if not conversation_titles_match(active.title, who):
-                                raise RuntimeError(
-                                    f"Active chat is {active.title!r}, expected {who!r}"
-                                )
+                            self._verify_active_target(who)
                             before = client.get_chat_history(limit=5)
                             with client._clipboard(unicode_text=chunk):
                                 try:
@@ -462,6 +468,7 @@ class WechatMessageSender:
                         client.focus_window()
                         if not client.locate_conversation(who, runtime_id, row_index):
                             raise RuntimeError(f"Conversation is not visible: {who}")
+                        self._verify_active_target(who)
                         before = client.get_chat_history(limit=5)
                         with client._clipboard(files=paths):
                             check_send_allowed()
