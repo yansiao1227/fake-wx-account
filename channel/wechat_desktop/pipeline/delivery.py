@@ -42,7 +42,9 @@ class DeliveryService:
             delivery_id = ""
             if self.store is not None:
                 digest = hashlib.sha256(f"{content_type}:{interim}:{content}".encode("utf-8")).hexdigest()
-                delivery_id, previous = self.store.claim_delivery(source_event_ids or [], target, digest)
+                delivery_id, previous = self.store.claim_delivery(
+                    source_event_ids or [], target, digest, kind="interim" if interim else "final"
+                )
                 if previous is not None:
                     return previous
             try:

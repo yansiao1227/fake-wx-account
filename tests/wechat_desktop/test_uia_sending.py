@@ -4,6 +4,7 @@ import pytest
 from contextlib import contextmanager
 from types import SimpleNamespace
 from channel.wechat_desktop.models import HeaderInfo, UiaChatMessage
+from channel.wechat_desktop.send_control import mark_send_submitted
 from channel.wechat_desktop.uia.client import WechatUiaClient
 from channel.wechat_desktop.uia.controls import _encode_cf_hdrop
 from channel.wechat_desktop.uia.driver import WechatUiaDriver
@@ -371,21 +372,12 @@ def test_send_message_splits_and_verifies_each_chunk(monkeypatch):
     }
 
 
-def test_send_message_retries_uncleared_input_with_enter_after_verification(
+def test_send_message_preserves_uncertain_click_without_enter_after_verification(
     monkeypatch,
 ):
     client = WechatUiaClient({})
     enter_retries = []
-    verification_results = iter(
-        [
-            {
-                "success": True,
-                "verified": False,
-                "message": "not visible yet",
-            },
-            {"success": True, "verified": True, "runtime_id": "sent-1"},
-        ]
-    )
+    verifications = []
 
     @contextmanager
     def fake_clipboard(unicode_text=None, files=None):
@@ -400,18 +392,16 @@ def test_send_message_retries_uncleared_input_with_enter_after_verification(
     )
     monkeypatch.setattr(client, "get_chat_history", lambda **_kwargs: [])
     monkeypatch.setattr(client, "_clipboard", fake_clipboard)
-    monkeypatch.setattr(
-        client,
-        "_paste_and_send",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            RuntimeError("WeChat Send button did not clear the reply input")
-        ),
-    )
-    monkeypatch.setattr(
-        client,
-        "_verify_send",
-        lambda *_args, **_kwargs: next(verification_results),
-    )
+    def submit_then_raise(**kwargs):
+        mark_send_submitted()
+        raise RuntimeError("WeChat Send button did not clear the reply input")
+
+    def verify(*args, **kwargs):
+        verifications.append(kwargs["text"])
+        return {"success": True, "verified": False, "message": "not visible yet"}
+
+    monkeypatch.setattr(client, "_paste_and_send", submit_then_raise)
+    monkeypatch.setattr(client, "_verify_send", verify)
     monkeypatch.setattr(
         client,
         "_send_existing_input_with_enter",
@@ -420,9 +410,14 @@ def test_send_message_retries_uncleared_input_with_enter_after_verification(
 
     result = client.send_message("Alice", "working", expedited=True)
 
-    assert enter_retries == ["working"]
-    assert result["success"] is True
-    assert result["verified"] is True
+    assert enter_retries == []
+    assert verifications == ["working"]
+    assert result["success"] is False
+    assert result["verified"] is False
+    assert result["status"] == "uncertain"
+    assert result["submitted_chunks"] == 1
+    assert result["verified_chunks"] == 0
+    assert result["retryable"] is False
 
 
 def test_expedited_send_skips_pacing_and_does_not_delay_next_reply(monkeypatch):

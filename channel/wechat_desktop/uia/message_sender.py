@@ -382,24 +382,14 @@ class WechatMessageSender:
                                 except RuntimeError as exc:
                                     if "did not clear the reply input" not in str(exc):
                                         raise
-                                    # The UIA ValuePattern can lag behind a
-                                    # successful click. Verify first so the
-                                    # fallback cannot send a duplicate, then
-                                    # reacquire the input before Enter.
+                                    # 输入值和气泡都可能晚于真实提交更新。此时
+                                    # 点击/Enter 已执行或可能执行，只允许验证，
+                                    # 不能再提交同一草稿；超时交给上层标记 uncertain。
                                     result = client._verify_send(
                                         who, before, text=chunk
                                     )
                                     if not result.get("verified"):
-                                        check_send_allowed()
-                                        if not client._send_existing_input_with_enter(
-                                            chunk
-                                        ):
-                                            raise
-                                        result = client._verify_send(
-                                            who, before, text=chunk
-                                        )
-                                        if not result.get("verified"):
-                                            raise exc
+                                        raise
                                 else:
                                     result = client._verify_send(
                                         who, before, text=chunk

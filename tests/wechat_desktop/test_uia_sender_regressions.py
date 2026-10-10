@@ -110,6 +110,119 @@ def input_client(monkeypatch, paste_values, *, send_button=True):
 
 
 @pytest.mark.parametrize("send_button", [True, False])
+def test_delayed_submission_never_replays_matching_uncleared_draft(monkeypatch, send_button):
+    """五秒后才出现气泡的已提交草稿，不能因三秒验证超时再按 Enter。"""
+    import win32api
+
+    client, state = input_client(monkeypatch, ["延迟发送文本"], send_button=send_button)
+    state["clear_input_on_submit"] = False
+    state["expose_bubble_on_submit"] = False
+    clock = [0.0]
+    queued = []
+
+    def advance(duration):
+        clock[0] += duration
+
+    monkeypatch.setattr(
+        "channel.wechat_desktop.uia.message_sender.time",
+        SimpleNamespace(time=lambda: clock[0], sleep=advance),
+    )
+    # 保留真实输入等待和发送验证，用虚拟时间覆盖 1.5 秒输入等待及 3 秒气泡等待。
+    monkeypatch.setattr(client, "_wait_for_input_value", client._send_controller._wait_for_input_value)
+    monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
+    monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
+
+    def queue_new_submissions(operation, *args, **kwargs):
+        before = len(state["submitted"])
+        operation(*args, **kwargs)
+        for index in range(before, len(state["submitted"])):
+            queued.append((clock[0] + 5.0, state["submitted"][index], str(index + 1)))
+
+    keyboard_event = win32api.keybd_event
+    monkeypatch.setattr(
+        win32api, "keybd_event",
+        lambda *args: queue_new_submissions(keyboard_event, *args),
+    )
+    if send_button:
+        with client._uia_root() as root:
+            button = next(item for item in root if item.Name == "发送")
+        click = button.Click
+        monkeypatch.setattr(button, "Click", lambda **kwargs: queue_new_submissions(click, **kwargs))
+
+    def delayed_history(**kwargs):
+        messages = [UiaChatMessage("Synthetic", text, runtime_id=runtime_id, direction="outgoing")
+                    for ready_at, text, runtime_id in queued if clock[0] >= ready_at]
+        if messages:
+            state["value"] = ""
+        return messages
+
+    monkeypatch.setattr(client, "get_chat_history", delayed_history)
+
+    result = client.send_message("Synthetic", "延迟发送文本", expedited=True)
+    # 所有已排队的 UI 提交都完成后，仍必须只有一个实际出站气泡。
+    clock[0] = max(ready_at for ready_at, _, _ in queued)
+    assert len(delayed_history()) == 1
+    assert state["submitted"] == ["延迟发送文本"]
+    assert result["status"] == "uncertain"
+    assert result["submitted_chunks"] == 1
+    assert result["verified_chunks"] == 0
+    assert result["retryable"] is False
+
+
+@pytest.mark.parametrize("send_button", [True, False])
+def test_visible_submission_with_stale_input_is_verified_without_replay(monkeypatch, fast_sender_clock, send_button):
+    client, state = input_client(monkeypatch, ["正确文本"], send_button=send_button)
+    state["clear_input_on_submit"] = False
+    monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
+    monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
+
+    result = client.send_message("Synthetic", "正确文本", expedited=True)
+
+    assert state["submitted"] == ["正确文本"]
+    assert result["success"] is True
+    assert result["verified"] is True
+    assert result["submitted_chunks"] == 1
+    assert result["verified_chunks"] == 1
+
+
+@pytest.mark.parametrize("send_button", [True, False])
+def test_submit_call_error_preserves_uncertain_result_without_replay(monkeypatch, send_button):
+    import win32api
+    import win32con
+
+    client, state = input_client(monkeypatch, ["正确文本"], send_button=send_button)
+    monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
+    monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
+    if send_button:
+        with client._uia_root() as root:
+            button = next(item for item in root if item.Name == "发送")
+        click = button.Click
+
+        def click_then_raise(**kwargs):
+            click(**kwargs)
+            raise RuntimeError("UIA click result is unavailable")
+
+        monkeypatch.setattr(button, "Click", click_then_raise)
+    else:
+        keyboard_event = win32api.keybd_event
+
+        def enter_then_raise(key, scan, flags, extra):
+            keyboard_event(key, scan, flags, extra)
+            if key == win32con.VK_RETURN and not flags:
+                raise RuntimeError("keyboard submission result is unavailable")
+
+        monkeypatch.setattr(win32api, "keybd_event", enter_then_raise)
+
+    result = client.send_message("Synthetic", "正确文本", expedited=True)
+
+    assert state["submitted"] == ["正确文本"]
+    assert result["status"] == "uncertain"
+    assert result["submitted_chunks"] == 1
+    assert result["verified_chunks"] == 0
+    assert result["retryable"] is False
+
+
+@pytest.mark.parametrize("send_button", [True, False])
 @pytest.mark.parametrize("incorrect", ["旧草稿", "完整文本的截断片段", "错误内容"])
 def test_readable_mismatched_draft_never_submits(monkeypatch, incorrect, send_button):
     client, state = input_client(monkeypatch, [incorrect] * 3, send_button=send_button)
@@ -245,17 +358,21 @@ def test_enter_fallback_sends_readable_matching_focused_draft(monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["unreadable", "changed"])
-def test_declined_real_enter_fallback_preserves_original_uncertain_click(monkeypatch, fast_sender_clock, failure):
+def test_uncertain_click_is_not_replayed_when_input_becomes_unreliable(monkeypatch, fast_sender_clock, failure):
     client, state = input_client(monkeypatch, ["正确文本"])
     state["clear_input_on_submit"] = False
     state["expose_bubble_on_submit"] = False
     if failure == "unreadable":
         state["unavailable_after_submit"] = True
     else:
-        def change_on_fallback_focus():
+        read_value = state["input_control"].GetValuePattern
+
+        def change_after_submission():
             if state["submitted"]:
                 state["value"] = "错误草稿"
-        monkeypatch.setattr(state["input_control"], "SetFocus", change_on_fallback_focus)
+            return read_value()
+
+        monkeypatch.setattr(state["input_control"], "GetValuePattern", change_after_submission)
     monkeypatch.setattr(client, "locate_conversation", lambda *args: True)
     monkeypatch.setattr(client, "_clipboard", lambda **kwargs: nullcontext())
 

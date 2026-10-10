@@ -98,6 +98,7 @@ class WechatDesktopStore:
                     event_ids TEXT NOT NULL,
                     target TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'final',
                     status TEXT NOT NULL,
                     result TEXT NOT NULL DEFAULT '{}',
                     updated_at REAL NOT NULL
@@ -190,6 +191,9 @@ class WechatDesktopStore:
                 "WHERE managed_evidence_path != ''"
             )
             delivery_columns = {row["name"] for row in db.execute("PRAGMA table_info(deliveries)")}
+            if "kind" not in delivery_columns:
+                # 旧账本无法区分通知和最终回复，按最终回复保守兼容，禁止重放。
+                db.execute("ALTER TABLE deliveries ADD COLUMN kind TEXT NOT NULL DEFAULT 'final'")
             if "dedupe_key" not in delivery_columns:
                 db.execute("ALTER TABLE deliveries ADD COLUMN dedupe_key TEXT NOT NULL DEFAULT ''")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_dedupe ON deliveries(dedupe_key) WHERE dedupe_key != ''")
@@ -613,16 +617,19 @@ class WechatDesktopStore:
             row = db.execute("SELECT * FROM event_runs WHERE event_id=?", (event_id,)).fetchone()
             return dict(row) if row else {}
 
-    def claim_delivery(self, event_ids: list[str], target: str, content_hash: str) -> tuple[str, SendResult | None]:
+    def claim_delivery(self, event_ids: list[str], target: str, content_hash: str, *,
+                       kind: str = "final") -> tuple[str, SendResult | None]:
         """同一入站任务的同一输出只提交一次，日志不完整也不自动重放。"""
+        if kind not in {"final", "interim"}:
+            raise ValueError(f"unknown delivery kind: {kind}")
         ids = json.dumps(sorted(set(event_ids)))
         key = hashlib.sha256(json.dumps([ids, target, content_hash]).encode()).hexdigest() if event_ids else ""
         delivery_id = uuid.uuid4().hex
         with self._lock, self._connect() as db:
             inserted = db.execute(
-                "INSERT OR IGNORE INTO deliveries(delivery_id,event_ids,target,content_hash,status,result,updated_at,dedupe_key) "
-                "VALUES (?,?,?,?, 'sending', '{}', ?, ?)",
-                (delivery_id, ids, target, content_hash, time.time(), key),
+                "INSERT OR IGNORE INTO deliveries(delivery_id,event_ids,target,content_hash,kind,status,result,updated_at,dedupe_key) "
+                "VALUES (?,?,?,?,?, 'sending', '{}', ?, ?)",
+                (delivery_id, ids, target, content_hash, kind, time.time(), key),
             )
             if inserted.rowcount:
                 return delivery_id, None
@@ -635,9 +642,12 @@ class WechatDesktopStore:
                        (result.status.value, json.dumps(result.to_dict(), ensure_ascii=False), time.time(), delivery_id))
 
     def delivery_outcome(self, event_ids: list[str], fallback: str) -> str:
-        """超时/退出时发送可能仍在另一线程，保守地保留不确定性。"""
+        """最终回复和活跃发送保留不确定性；结束的辅助通知不改写任务终态。"""
         with self._lock, self._connect() as db:
-            rows = db.execute("SELECT event_ids,status FROM deliveries WHERE status IN ('sending','unverified','partial','uncertain')").fetchall()
+            rows = db.execute(
+                "SELECT event_ids,status FROM deliveries WHERE status='sending' "
+                "OR (kind='final' AND status IN ('unverified','partial','uncertain'))"
+            ).fetchall()
         statuses = {row["status"] for row in rows if set(json.loads(row["event_ids"])).intersection(event_ids)}
         if statuses.intersection({"sending", "unverified", "uncertain"}):
             return "uncertain"
@@ -649,11 +659,14 @@ class WechatDesktopStore:
         with self._lock:
             with self._connect() as db:
                 rows = db.execute("SELECT event_id FROM event_runs WHERE state IN ('received','queued','running','sending')").fetchall()
-                db.execute("UPDATE deliveries SET status='uncertain',updated_at=? WHERE status='sending'", (time.time(),))
             for row in rows:
+                # 先收尾事件再归一化 sending，避免重启期间把未完成的辅助发送
+                # 误当已结束通知；中途退出也能在下次启动保留同样的保护。
                 state = self.delivery_outcome([row["event_id"]], "interrupted")
                 self.set_event_state([row["event_id"]], state, "restart_no_replay")
                 counts[state] = counts.get(state, 0) + 1
+            with self._connect() as db:
+                db.execute("UPDATE deliveries SET status='uncertain',updated_at=? WHERE status='sending'", (time.time(),))
         return counts
 
     def mark_event_processed(self, event_id: str, terminal: str = "skipped", reason: str = ""):
