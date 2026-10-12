@@ -16,7 +16,7 @@
     },
     "analyze-url": {
         "name": "analyze-url",
-        "description": "Analyze an HTTP or HTTPS URL, decide whether it points to a downloadable file or a web page, and route it appropriately. Use whenever the user provides a URL to open, read, inspect, summarize, or extract content from: download files into the workspace tmp directory and parse them with a suitable tool; fetch non-file web pages with web_fetch.",
+        "description": "Read HTTP or HTTPS links in the current request or its direct quote, including third-party shares. Use browser for dynamic web pages, web_fetch for static pages, and download files into the workspace tmp directory for suitable parsing.",
         "source": "project",
         "enabled": true,
         "category": "skill"
