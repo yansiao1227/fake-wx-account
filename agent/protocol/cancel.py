@@ -12,7 +12,7 @@ No project deps — importable from any layer without circular imports.
 from __future__ import annotations
 
 import threading
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 
 class AgentCancelledError(Exception):
@@ -24,11 +24,39 @@ class AgentCancelledError(Exception):
     """
 
 
+class CancelEvent(threading.Event):
+    """让取消状态变更与决策发布共用一把可重入锁。"""
+
+    def __init__(self):
+        super().__init__()
+        self._publication_lock = threading.RLock()
+
+    def set(self) -> None:
+        with self._publication_lock:
+            super().set()
+
+    def clear(self) -> None:
+        with self._publication_lock:
+            super().clear()
+
+    def publish_if_active(self, callback: Callable[[], None]) -> bool:
+        """取消先发生则拒绝发布，否则持锁完成回调后才允许取消。
+
+        回调可以在当前线程重入取消，但不能等待另一线程完成取消，
+        因为该线程须等本次发布结束后才能取得同一把锁。
+        """
+        with self._publication_lock:
+            if self.is_set():
+                return False
+            callback()
+            return True
+
+
 class _CancelEntry:
     __slots__ = ("event", "session_id")
 
     def __init__(self, session_id: Optional[str]):
-        self.event = threading.Event()
+        self.event = CancelEvent()
         self.session_id = session_id
 
 
@@ -44,13 +72,13 @@ class CancelTokenRegistry:
         # session_id -> set of request_ids currently in flight (usually 1).
         self._by_session: Dict[str, set] = {}
 
-    def register(self, request_id: str, session_id: Optional[str] = None) -> threading.Event:
+    def register(self, request_id: str, session_id: Optional[str] = None) -> CancelEvent:
         """Create (or return existing) cancel event for a request.
 
         Returns the threading.Event the caller should poll via ``is_set()``.
         """
         if not request_id:
-            return threading.Event()
+            return CancelEvent()
         with self._lock:
             entry = self._by_request.get(request_id)
             if entry is None:
@@ -60,7 +88,7 @@ class CancelTokenRegistry:
                     self._by_session.setdefault(session_id, set()).add(request_id)
             return entry.event
 
-    def get_event(self, request_id: str) -> Optional[threading.Event]:
+    def get_event(self, request_id: str) -> Optional[CancelEvent]:
         if not request_id:
             return None
         with self._lock:

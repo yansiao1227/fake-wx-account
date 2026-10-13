@@ -5,6 +5,7 @@ from .result import AgentResult, AgentAction, AgentActionType, ToolResult
 from .models import LLMModel, LLMRequest, ModelFactory
 from .cancel import (
     AgentCancelledError,
+    CancelEvent,
     CancelTokenRegistry,
     get_cancel_registry,
 )
@@ -30,6 +31,7 @@ __all__ = [
     'LLMRequest', 
     'ModelFactory',
     'AgentCancelledError',
+    'CancelEvent',
     'CancelTokenRegistry',
     'get_cancel_registry',
     'SteerInbox',

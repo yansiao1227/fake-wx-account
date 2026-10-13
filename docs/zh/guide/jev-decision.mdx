@@ -59,6 +59,15 @@ OpenAI 兼容 /v1 会自动移除，完整 TypeSafe 地址也可以直接使用�
 - 工具证据被截断、超过保留窗口或完成检查输入超过大小限制时，
   跳过独立完成判断，避免根据不完整片段误判遗漏。
 - 用户中途追加指令会使旧决策失效；取消、步数上限和失败保护仍按原流程处理。
+  决策采用、提示写入及同步事件发布，与取消和追加指令按同一提交顺序执行。
+  控制请求先成功时，旧决策不能再发布；通知已进入发布步骤时，随后到达的
+  控制请求在该步骤完成后生效。远程决策等待不持有提交锁。
+
+通过代码调用 Agent.run_stream 并传入 cancel_event 时，可使用
+agent.protocol.CancelEvent 或取消注册表返回的 token，保留 threading.Event
+的 is_set、set、clear 和 wait 接口。外部原生 threading.Event 继续支持主模型
+取消轮询，但因缺少共享提交接口，可选 Jev 决策会回退到原流程，日志原因是
+unsynchronized_cancel。
 
 route_min_probability 和 completion_min_probability 比较的是返回的
 选项概率或 Noul 概率，不是 Choice 的 confidence 字段。

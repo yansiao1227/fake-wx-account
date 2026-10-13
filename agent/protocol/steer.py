@@ -11,7 +11,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Deque, Dict, List, Optional, Set
+from typing import Callable, Deque, Dict, List, Optional, Set
 
 
 class SteerStatus(str, Enum):
@@ -38,7 +38,7 @@ class SteerInbox:
     def __init__(self, max_pending: int = 16, max_chars: int = 8000):
         self.max_pending = max(1, int(max_pending))
         self.max_chars = max(1, int(max_chars))
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._pending: Deque[str] = deque()
         self._accepting = True
 
@@ -58,6 +58,18 @@ class SteerInbox:
         """Check for new guidance without consuming it before a safe checkpoint."""
         with self._lock:
             return bool(self._pending)
+
+    def publish_if_empty(self, callback: Callable[[], None]) -> bool:
+        """Serialize a decision publication with submit(), without draining updates.
+
+        Callbacks may reenter the inbox on this thread. They must not wait for
+        another thread to submit, because that thread waits for publication.
+        """
+        with self._lock:
+            if self._pending or not self._accepting:
+                return False
+            callback()
+            return True
 
     def drain(self) -> List[str]:
         with self._lock:

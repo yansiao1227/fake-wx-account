@@ -10,6 +10,7 @@ from agent.decision import runtime
 from agent.decision.runtime import CompletionDecision, DecisionRun, RoutingDecision
 from agent.protocol.agent import Agent
 from agent.protocol.agent_stream import AgentStreamExecutor
+from agent.protocol.cancel import CancelEvent
 from agent.protocol.steer import SteerInbox
 from agent.tools.base_tool import BaseTool, ToolResult
 
@@ -209,7 +210,7 @@ def test_direct_tool_answer_checks_completion_without_extra_summary(verdict):
 
 
 def test_cancel_during_direct_tool_execution_prevents_ready_reply():
-    cancel = threading.Event()
+    cancel = CancelEvent()
     decision = ControlledDecision(completion=CompletionDecision("finalize", .98))
     model = ScriptedModel([tool_call()])
     instance, events, lookup = executor(model, decision, cancel_event=cancel)
@@ -230,7 +231,7 @@ def test_cancel_during_direct_tool_execution_prevents_ready_reply():
 
 
 def test_cancel_during_initial_route_wait_prevents_main_model_request():
-    cancel = threading.Event()
+    cancel = CancelEvent()
     decision = ControlledDecision()
     model = ScriptedModel([text("取消后不应开始的请求")])
     instance, events, lookup = executor(model, decision, cancel_event=cancel)
@@ -247,6 +248,23 @@ def test_cancel_during_initial_route_wait_prevents_main_model_request():
     assert decision.closed
     assert events[-1]["data"]["cancelled"] is True
     assert not any(event["type"] == "decision_route" for event in events)
+
+
+def test_plain_cancel_event_keeps_main_model_cancellation_with_jev_fallback():
+    cancel = threading.Event()
+    decision = ControlledDecision("tools", "旧目标建议")
+    model = ScriptedModel([text("取消后不应请求")])
+    instance, events, lookup = executor(model, decision, cancel_event=cancel)
+    cancel.set()
+
+    instance.run_stream("旧目标")
+
+    assert decision.closed
+    assert decision.route_resolves == []
+    assert model.requests == []
+    assert lookup.calls == []
+    assert not any(event["type"] == "decision_route" for event in events)
+    assert events[-1]["data"]["cancelled"] is True
 
 
 def test_steer_during_initial_route_wait_replaces_hint_before_model_request():
@@ -297,7 +315,7 @@ def test_steer_before_late_route_keeps_old_stream_buffered_until_safe_checkpoint
 
 @pytest.mark.parametrize("direct", [False, True])
 def test_cancel_during_completion_wait_prevents_final_publication(direct):
-    cancel = threading.Event()
+    cancel = CancelEvent()
     decision = ControlledDecision(completion=CompletionDecision("finalize", .98))
     turns = [[tool_call()]] if direct else [[tool_call()], [text("等待检查的草稿")]]
     model = ScriptedModel(*turns)
@@ -547,7 +565,7 @@ def test_completion_finalize_does_not_prevent_main_model_tool_call():
 
 
 def test_user_cancel_closes_decision_and_stream_without_route_restart():
-    cancel = threading.Event()
+    cancel = CancelEvent()
     decision = ControlledDecision(ready=False)
 
     def request_cancel():

@@ -147,6 +147,8 @@ class AgentStreamExecutor:
                 Checked at every safe point (turn boundary, before tool execution,
                 during LLM streaming). When set, raises AgentCancelledError which
                 run_stream catches to gracefully wind down.
+                CancelEvent also serializes cancellation with Jev publication;
+                plain external Events keep polling and skip optional Jev decisions.
             steer_inbox: Optional SteerInbox for explicit instructions sent to
                 this active run. Drained only at message-safe checkpoints.
         """
@@ -160,6 +162,17 @@ class AgentStreamExecutor:
         self.max_context_turns = max_context_turns
         self.cancel_event = cancel_event
         self.steer_inbox = steer_inbox
+        if (decision_run is not None and cancel_event is not None
+                and not callable(getattr(cancel_event, "publish_if_active", None))):
+            # An external Event cannot synchronize set() with publication via
+            # its public API. Keep normal cancellation, and skip optional Jev
+            # decisions rather than claim an atomic guarantee we cannot give.
+            try:
+                decision_run.close()
+            except Exception:
+                pass
+            decision_run = None
+            jev_logger.info("[Jev] run=- stage=route status=fallback reason=unsynchronized_cancel")
         self.decision_run = decision_run
         self._decision_base_prompt = system_prompt
         self._decision_route_resolved = decision_run is None
@@ -358,6 +371,31 @@ class AgentStreamExecutor:
                 self.messages.pop()
         self._discard_response_events()
 
+    def _publish_decision(self, callback: Callable[[], None]) -> bool:
+        """Commit state and its event together, in cancel -> steering lock order.
+
+        Remote waits stay outside these guards. Registry operations release
+        their own locks before entering the token/inbox, including callbacks
+        that reenter cancellation after detecting a withdrawn WeChat source.
+        """
+        self._check_cancelled()
+        published = False
+
+        def publish_unsteered():
+            nonlocal published
+            self._check_cancelled()
+            if self.steer_inbox is None:
+                callback()
+                published = True
+            else:
+                published = self.steer_inbox.publish_if_empty(callback)
+
+        if self.cancel_event is None:
+            publish_unsteered()
+        elif not self.cancel_event.publish_if_active(publish_unsteered):
+            self._check_cancelled()
+        return published
+
     def _apply_decision_route(self, wait_seconds=0):
         """Only the execution thread writes route/skill guidance into its prompt."""
         if self.decision_run is None or self._decision_route_resolved:
@@ -370,27 +408,28 @@ class AgentStreamExecutor:
             self._decision_route_resolved = True
             return None
         self._check_cancelled()
-        if self.steer_inbox is not None and self.steer_inbox.has_pending():
-            # Keep the old result unpublished; streaming must remain buffered
-            # until the existing safe checkpoint applies the new instruction.
-            return None
         if result is None:
             return None
-        self._decision_route_resolved = True
-        if result.routing_hint:
-            self.system_prompt += "\n\n" + result.routing_hint
-        jev_logger.info("[Jev] run=%s stage=route status=%s route=%s probability=%.3f adopted_hint=%s tools=%s skills=%s",
-                        self._decision_log_run_id(), "adopted" if result.routing_hint else "observed",
-                        result.route, result.confidence, bool(result.routing_hint),
-                        json.dumps(list(result.tool_names), ensure_ascii=False),
-                        json.dumps(list(result.skill_names), ensure_ascii=False))
-        self._emit_event("decision_route", {
-            "route": result.route,
-            "tools": list(result.tool_names),
-            "skills": list(result.skill_names),
-            "confidence": result.confidence,
-        })
-        return result
+
+        def publish():
+            self._decision_route_resolved = True
+            if result.routing_hint:
+                self.system_prompt += "\n\n" + result.routing_hint
+            jev_logger.info("[Jev] run=%s stage=route status=%s route=%s probability=%.3f adopted_hint=%s tools=%s skills=%s",
+                            self._decision_log_run_id(), "adopted" if result.routing_hint else "observed",
+                            result.route, result.confidence, bool(result.routing_hint),
+                            json.dumps(list(result.tool_names), ensure_ascii=False),
+                            json.dumps(list(result.skill_names), ensure_ascii=False))
+            self._emit_event("decision_route", {
+                "route": result.route,
+                "tools": list(result.tool_names),
+                "skills": list(result.skill_names),
+                "confidence": result.confidence,
+            })
+
+        # A rejected old result leaves streaming buffered for the existing safe
+        # checkpoint to discard its draft and apply the new instruction.
+        return result if self._publish_decision(publish) else None
 
     def _decision_log_run_id(self):
         version = getattr(self.decision_run, "version", "")
@@ -441,37 +480,37 @@ class AgentStreamExecutor:
                                self._decision_log_run_id(), type(exc).__name__)
             return False
         self._check_cancelled()
-        if self.steer_inbox is not None and self.steer_inbox.has_pending():
-            return False
         if result is None:
             jev_logger.info("[Jev] run=%s stage=completion status=fallback reason=not_ready",
                             self._decision_log_run_id())
             return False
-        jev_logger.info("[Jev] run=%s stage=completion status=%s action=%s probability=%.3f adopted_continue=%s",
-                        self._decision_log_run_id(), "adopted" if result.action == "continue" else "observed",
-                        result.action, result.confidence, result.action == "continue")
-        self._emit_event("decision_completion", {
-            "action": result.action, "confidence": result.confidence,
-        })
-        if result.action != "continue":
-            return False
-        self._decision_corrections += 1
-        # The last text-only assistant message is an uncommitted draft. Removing
-        # it cannot break tool_use/tool_result pairs from preceding batches.
-        if self.messages and self.messages[-1].get("role") == "assistant":
-            blocks = self.messages[-1].get("content", [])
-            if isinstance(blocks, list) and not any(
-                b.get("type") == "tool_use" for b in blocks if isinstance(b, dict)
-            ):
-                self.messages.pop()
-        self.system_prompt += (
-            "\n\n[内部完成复核：不要向用户复述]\n"
-            "独立证据检查发现仍可能缺少关键步骤或结果支持。"
-            "请重新对照用户目标和本轮工具结果，补充必要工具或验证；"
-            "如果无法可靠完成，明确说明缺失的信息，禁止把工具成功当作任务完成。"
-            "只有存在新信息需求时才继续调用工具，避免重复已经完成的动作。"
-        )
-        return True
+
+        def publish():
+            if result.action == "continue":
+                self._decision_corrections += 1
+                # Preserve all tool pairs; only the trailing text draft is uncommitted.
+                if self.messages and self.messages[-1].get("role") == "assistant":
+                    blocks = self.messages[-1].get("content", [])
+                    if isinstance(blocks, list) and not any(
+                        b.get("type") == "tool_use" for b in blocks if isinstance(b, dict)
+                    ):
+                        self.messages.pop()
+                self.system_prompt += (
+                    "\n\n[内部完成复核：不要向用户复述]\n"
+                    "独立证据检查发现仍可能缺少关键步骤或结果支持。"
+                    "请重新对照用户目标和本轮工具结果，补充必要工具或验证；"
+                    "如果无法可靠完成，明确说明缺失的信息，禁止把工具成功当作任务完成。"
+                    "只有存在新信息需求时才继续调用工具，避免重复已经完成的动作。"
+                )
+            jev_logger.info("[Jev] run=%s stage=completion status=%s action=%s probability=%.3f adopted_continue=%s",
+                            self._decision_log_run_id(), "adopted" if result.action == "continue" else "observed",
+                            result.action, result.confidence, result.action == "continue")
+            self._emit_event("decision_completion", {
+                "action": result.action, "confidence": result.confidence,
+            })
+
+        # Complete every state write before callbacks can reenter submit/cancel.
+        return self._publish_decision(publish) and result.action == "continue"
 
     def _queue_files_from_tool_result(self, tool_name: str, result_data) -> None:
         """Queue file_to_send payloads from an explicit send result or auto-detect.
