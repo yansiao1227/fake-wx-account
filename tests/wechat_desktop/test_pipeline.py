@@ -5,6 +5,7 @@ import time
 import queue
 from dataclasses import replace
 from types import SimpleNamespace
+import pytest
 from .helpers import PipelineStoreStub
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.models import (
@@ -571,8 +572,10 @@ def test_reply_consumer_dispatches_enqueue_time_context_snapshot():
     ]
 
 
-def test_share_materialization_leaves_network_read_and_notice_to_agent():
+@pytest.mark.parametrize("reference_type", ["share_card", "image", "file"])
+def test_attachment_materialization_does_not_predict_tool_or_skill_notices(reference_type):
     channel = _bare_wechat_channel()
+    channel.config = {"agent_tool_notice_enabled": True, "agent_preflight_notice_enabled": True}
     channel._stop_event = threading.Event()
     channel._reply_queue = WechatReplyQueue()
     event = WechatDesktopEvent(
@@ -583,7 +586,7 @@ def test_share_materialization_leaves_network_read_and_notice_to_agent():
         "Alice",
         "text",
         "讲了什么",
-        reference={"content_type": "share_card", "content": "分享标题"},
+        reference={"content_type": reference_type, "content": "分享标题"},
     )
     event.task.deferred_materialization_events = [event]
     assert channel._reply_queue.enqueue(event)
@@ -597,10 +600,10 @@ def test_share_materialization_leaves_network_read_and_notice_to_agent():
     notices = []
     channel._service = SimpleNamespace(update_status=lambda **_kwargs: None)
     channel._store = PipelineStoreStub(
-        mark_event_processed=lambda _event_id: None,
+        mark_event_processed=lambda *_args: None,
         audit=lambda *_args, **_kwargs: None,
     )
-    channel._driver = SimpleNamespace()
+    channel._driver = SimpleNamespace(validate_reply_target=lambda _event: ReplyTargetValidation(True))
     channel._mark_lifecycle = lambda *_args, **_kwargs: None
     channel._finish_lifecycle = lambda *_args, **_kwargs: None
     channel._send_deferred_attachment_notice = (
@@ -615,7 +618,7 @@ def test_share_materialization_leaves_network_read_and_notice_to_agent():
 
     channel._consume_reply_queue()
 
-    assert notices == ["微信内置浏览器"]
+    assert notices == []
     assert event.task.preflight_attachment_notice_sent is False
     assert event.reference["fetch_status"] == "link_available"
 

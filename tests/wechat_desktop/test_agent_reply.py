@@ -6,10 +6,10 @@ import queue
 import pytest
 from types import SimpleNamespace
 from .helpers import PipelineStoreStub
+from bridge.context import Context
 from bridge.reply import Reply, ReplyType
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage, ReplyTargetValidation
-from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus
 from .helpers import _bare_wechat_channel
 
@@ -144,6 +144,42 @@ def test_group_reference_session_metadata_keeps_sender_and_attachment_pointer():
     assert metadata["wechat_desktop_is_reference"] is True
     assert metadata["wechat_desktop_input_artifact_paths"] == [attachment]
     assert attachment in captured["content"]
+
+
+def test_dispatch_legacy_preflight_flags_do_not_send_or_suppress_jev_plan():
+    channel = _bare_wechat_channel()
+    channel.config = {
+        "agent_tool_notice_enabled": True,
+        "agent_preflight_notice_enabled": True,
+        "jev_decision_notice_enabled": True,
+    }
+    channel._trace = lambda *_args, **_kwargs: None
+    channel._compose_context = lambda ctype, content, **kwargs: Context(ctype, content, kwargs)
+    channel._send_agent_tool_notice = lambda *_args: pytest.fail("旧 preflight 不应发送提示")
+    produced = []
+    notices = []
+    channel.produce = produced.append
+    channel._send_jev_decision_notice = lambda _context, data: notices.append(data) or True
+    event = WechatDesktopEvent(
+        "message", "session", "Alice", "alice", "Alice", "text", "分析引用图片",
+        reference={"content_type": "image", "file_path": "synthetic.png"},
+    )
+    event.task.preflight_attachment_notice_sent = True
+
+    assert AgentReplyCoordinator(channel).dispatch(event)
+    assert len(produced) == 1
+    assert notices == []
+    plan = {"route": "tools", "tools": ["vision"], "skills": []}
+    produced[0]["on_event"]({"type": "decision_route", "data": plan})
+    assert notices == [plan]
+
+
+def test_legacy_attachment_notice_is_silent_even_when_enabled():
+    channel = SimpleNamespace(
+        config={"agent_tool_notice_enabled": True},
+        _send_agent_tool_notice=lambda *_args: pytest.fail("附件预测通知已移除"),
+    )
+    assert AgentReplyCoordinator(channel).send_attachment_notice(None) is False
 
 
 @pytest.mark.parametrize("reference", [
@@ -324,7 +360,7 @@ def test_agent_error_sends_one_final_failure_notice():
     assert any(args[0] == "agent_failure_notice" for args, _ in audits)
 
 
-def test_agent_callback_notifies_first_visible_tool_and_skips_bash():
+def test_agent_callback_notifies_jev_plan_and_keeps_tool_lifecycle():
     channel = _bare_wechat_channel()
     event = WechatDesktopEvent(
         "message", "uia-session:a", "Alice", "a", "Alice", "text", "hello"
@@ -334,15 +370,15 @@ def test_agent_callback_notifies_first_visible_tool_and_skips_bash():
     downstream = []
     channel.config = {
         "agent_tool_notice_enabled": True,
-        "agent_tool_notice_once_per_reply": True,
-        "agent_tool_notice_silent_tools": DEFAULT_CONFIG["agent_tool_notice_silent_tools"],
+        "jev_decision_notice_enabled": True,
     }
     channel._mark_lifecycle = lambda ids, stage, **_kwargs: lifecycle.append((ids, stage))
-    channel._send_agent_tool_notice = lambda _context, data: sent.append(data) or True
+    channel._send_agent_tool_notice = lambda *_args: pytest.fail("主 Agent 不应发送工具通知")
+    channel._send_jev_decision_notice = lambda _context, data: sent.append(data) or True
     context = {
-        "on_event": lambda payload: downstream.append(payload["data"]["tool_name"]),
+        "on_event": downstream.append,
         "wechat_desktop_source_event_ids": [event.event_id],
-        "wechat_desktop_agent_notice_sent": False,
+        "wechat_desktop_agent_notice_sent": True,
     }
     on_event = AgentReplyCoordinator(channel).make_event_callback(context)
 
@@ -350,24 +386,59 @@ def test_agent_callback_notifies_first_visible_tool_and_skips_bash():
     on_event({"type": "tool_execution_start", "data": {"tool_name": "ls", "tool_call_id": "2"}})
     on_event({"type": "tool_execution_start", "data": {"tool_name": "web_search", "tool_call_id": "3"}})
     on_event({"type": "tool_execution_start", "data": {"tool_name": "vision", "tool_call_id": "4"}})
+    plan = {"route": "tools", "tools": ["read", "bash", "web_search"], "skills": ["pdf-reader", "xlsx"]}
+    on_event({"type": "decision_route", "data": plan})
+    on_event({"type": "decision_route", "data": plan})
 
-    assert [item["tool_name"] for item in sent] == ["web_search"]
-    assert downstream == ["bash", "ls", "web_search", "vision"]
-    assert lifecycle[0][1] == "first_tool"
+    assert sent == [plan]
+    assert len(downstream) == 6
+    assert lifecycle == [([event.event_id], "first_tool")] * 4
+
+
+@pytest.mark.parametrize("data", [
+    {"route": "direct", "tools": ["web_search"], "skills": []},
+    {"route": "uncertain", "tools": ["read"], "skills": ["xlsx"]},
+    {"route": "tools", "tools": [], "skills": []},
+    {"route": "tools", "tools": [None, "  "], "skills": []},
+])
+def test_agent_callback_skips_unselected_jev_plan(data):
+    sent = []
+    forwarded = []
+    channel = SimpleNamespace(
+        config={"jev_decision_notice_enabled": True},
+        _send_jev_decision_notice=lambda *_args: sent.append(True),
+    )
+    callback = AgentReplyCoordinator(channel).make_event_callback({"on_event": forwarded.append})
+    payload = {"type": "decision_route", "data": data}
+    callback(payload)
+    assert sent == []
+    assert forwarded == [payload]
+
+
+def test_disabled_jev_notice_still_forwards_decision():
+    channel = SimpleNamespace(
+        config={"jev_decision_notice_enabled": False},
+        _send_jev_decision_notice=lambda *_args: pytest.fail("通知已关闭"),
+    )
+    forwarded = []
+    callback = AgentReplyCoordinator(channel).make_event_callback({"on_event": forwarded.append})
+    payload = {"type": "decision_route", "data": {"route": "tools", "tools": ["read"], "skills": []}}
+    callback(payload)
+    assert forwarded == [payload]
 
 
 @pytest.mark.parametrize("has_event", [True, False])
 @pytest.mark.parametrize("send_fails", [False, True])
-def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fails, caplog):
+@pytest.mark.parametrize("verified", [False, True])
+def test_jev_notice_callback_sends_once_and_persists_success(has_event, send_fails, verified, caplog):
     channel = _bare_wechat_channel()
     event = WechatDesktopEvent(
         "message", "uia-session:a", "Alice", "a", "Alice", "text", "hello"
     )
     channel.config = {
         "shadow_mode": False,
-        "agent_tool_notice_enabled": True,
-        "agent_tool_notice_once_per_reply": True,
-        "agent_tool_notice_templates": ["正在调用 {tool_name}"],
+        "jev_decision_notice_enabled": True,
+        "jev_decision_notice_templates": ["Jev 计划使用工具：{tools}；技能：{skills}"],
     }
     channel._reply_queue = WechatReplyQueue()
     channel._reply_queue.enqueue(event)
@@ -378,7 +449,7 @@ def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fa
         sent.append((target, text))
         if send_fails:
             raise RuntimeError("injected notice failure")
-        return {"success": True, "verified": True}
+        return {"success": True, "verified": verified}
 
     channel._driver = SimpleNamespace(
         resolve_send_target=lambda identity: TargetResolution(
@@ -406,18 +477,24 @@ def test_tool_notice_callback_sends_once_and_persists_success(has_event, send_fa
         "on_event": downstream.append,
     }
     callback = AgentReplyCoordinator(channel).make_event_callback(context)
-    payload = {"type": "tool_execution_start", "data": {
-        "tool_name": "web_search", "tool_call_id": "search-1",
+    payload = {"type": "decision_route", "data": {
+        "route": "tools", "tools": ["read", "bash", "web_search", "read"],
+        "skills": ["pdf-reader", "xlsx", "pdf-reader"], "confidence": 0.99,
     }}
     callback(payload)
     callback(payload)
 
-    expected = [(event.conversation_id, "正在调用 web_search")] if has_event else []
+    expected = [(event.conversation_id, "Jev 计划使用工具：read、bash、web_search；技能：pdf-reader、xlsx")] if has_event else []
     assert sent == expected
     assert len(history) == (1 if has_event and not send_fails else 0)
     assert len(audits) == (0 if has_event and send_fails else 1)
     assert downstream == [payload, payload]
+    if has_event and not send_fails:
+        assert audits[0][0] == "jev_decision_notice"
+        assert audits[0][2] == ("success" if verified else "unverified")
+        assert history[0]["content"] == expected[0][1]
+        assert not item.done.is_set()
     assert "name 'conversation_id' is not defined" not in caplog.text
     if not send_fails:
-        assert "Agent tool notice failed" not in caplog.text
+        assert "decision notice failed" not in caplog.text
     channel._reply_queue.finish(item, "completed")

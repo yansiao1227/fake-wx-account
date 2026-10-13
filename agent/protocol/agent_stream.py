@@ -12,7 +12,7 @@ from agent.protocol.cancel import AgentCancelledError
 from agent.protocol.models import LLMRequest, LLMModel
 from agent.protocol.message_utils import sanitize_claude_messages, compress_turn_to_text_only
 from agent.tools.base_tool import BaseTool, ToolResult
-from common.log import logger
+from common.log import logger, jev_logger
 from common.i18n import t as _t
 from models.model_api_retry import (
     ModelApiRetriesExhausted,
@@ -40,6 +40,10 @@ MAX_STORED_REASONING_CHARS = 4 * 1024  # 4 KB
 
 # Marker inserted between head and tail when reasoning is truncated.
 _REASONING_TRUNCATE_MARKER = "\n\n... [reasoning truncated, {omitted} chars omitted] ...\n\n"
+
+
+class _DecisionReplan(Exception):
+    """Discard an uncommitted draft to apply a run-local routing recommendation."""
 
 
 def _completion_gate_prompt() -> str:
@@ -125,6 +129,7 @@ class AgentStreamExecutor:
             max_context_turns: int = 30,
             cancel_event=None,
             steer_inbox=None,
+            decision_run=None,
     ):
         """
         Initialize stream executor
@@ -142,6 +147,8 @@ class AgentStreamExecutor:
                 Checked at every safe point (turn boundary, before tool execution,
                 during LLM streaming). When set, raises AgentCancelledError which
                 run_stream catches to gracefully wind down.
+                CancelEvent also serializes cancellation with Jev publication;
+                plain external Events keep polling and skip optional Jev decisions.
             steer_inbox: Optional SteerInbox for explicit instructions sent to
                 this active run. Drained only at message-safe checkpoints.
         """
@@ -155,6 +162,27 @@ class AgentStreamExecutor:
         self.max_context_turns = max_context_turns
         self.cancel_event = cancel_event
         self.steer_inbox = steer_inbox
+        if (decision_run is not None and cancel_event is not None
+                and not callable(getattr(cancel_event, "publish_if_active", None))):
+            # An external Event cannot synchronize set() with publication via
+            # its public API. Keep normal cancellation, and skip optional Jev
+            # decisions rather than claim an atomic guarantee we cannot give.
+            try:
+                decision_run.close()
+            except Exception:
+                pass
+            decision_run = None
+            jev_logger.info("[Jev] run=- stage=route status=fallback reason=unsynchronized_cancel")
+        self.decision_run = decision_run
+        self._decision_base_prompt = system_prompt
+        self._decision_route_resolved = decision_run is None
+        self._decision_evidence = []
+        self._decision_evidence_complete = True
+        self._decision_completion_active = False
+        self._decision_corrections = 0
+        self._response_events = []
+        self._defer_response_events = False
+        self._user_goal = ""
 
         # Message history - use provided messages or create new list
         self.messages = messages if messages is not None else []
@@ -200,6 +228,14 @@ class AgentStreamExecutor:
         """Append guidance, closing any tool_use blocks that will be skipped."""
         if not updates:
             return
+        if content_blocks is None:
+            self._discard_unpublished_assistant(pending_tool_calls)
+        # A decision made for the previous input must not override a new user steer.
+        if self.decision_run is not None:
+            self.decision_run.invalidate()
+            self.decision_run = None
+            self._decision_route_resolved = True
+            self.system_prompt = self._decision_base_prompt
         blocks = content_blocks if content_blocks is not None else []
         for tool_call in pending_tool_calls or []:
             blocks.append({
@@ -300,6 +336,11 @@ class AgentStreamExecutor:
 
     def _emit_event(self, event_type: str, data: dict = None):
         """Emit event"""
+        if self._defer_response_events and event_type in {
+            "message_start", "message_update", "message_end", "reasoning_update",
+        }:
+            self._response_events.append((event_type, data))
+            return
         if self.on_event:
             try:
                 self.on_event({
@@ -309,6 +350,167 @@ class AgentStreamExecutor:
                 })
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
+
+    def _flush_response_events(self):
+        events, self._response_events = self._response_events, []
+        self._defer_response_events = False
+        for event_type, data in events:
+            self._emit_event(event_type, data)
+
+    def _discard_response_events(self):
+        self._response_events.clear()
+        self._defer_response_events = False
+
+    def _discard_unpublished_assistant(self, tool_calls):
+        if (self._defer_response_events and not tool_calls and self.messages
+                and self.messages[-1].get("role") == "assistant"):
+            blocks = self.messages[-1].get("content", [])
+            if isinstance(blocks, list) and not any(
+                block.get("type") == "tool_use" for block in blocks if isinstance(block, dict)
+            ):
+                self.messages.pop()
+        self._discard_response_events()
+
+    def _publish_decision(self, callback: Callable[[], None]) -> bool:
+        """Commit state and its event together, in cancel -> steering lock order.
+
+        Remote waits stay outside these guards. Registry operations release
+        their own locks before entering the token/inbox, including callbacks
+        that reenter cancellation after detecting a withdrawn WeChat source.
+        """
+        self._check_cancelled()
+        published = False
+
+        def publish_unsteered():
+            nonlocal published
+            self._check_cancelled()
+            if self.steer_inbox is None:
+                callback()
+                published = True
+            else:
+                published = self.steer_inbox.publish_if_empty(callback)
+
+        if self.cancel_event is None:
+            publish_unsteered()
+        elif not self.cancel_event.publish_if_active(publish_unsteered):
+            self._check_cancelled()
+        return published
+
+    def _apply_decision_route(self, wait_seconds=0):
+        """Only the execution thread writes route/skill guidance into its prompt."""
+        if self.decision_run is None or self._decision_route_resolved:
+            return None
+        try:
+            result = self.decision_run.resolve(wait_seconds=wait_seconds)
+        except Exception as exc:
+            jev_logger.warning("[Jev] run=%s stage=route status=fallback reason=resolve_failed error_type=%s",
+                               self._decision_log_run_id(), type(exc).__name__)
+            self._decision_route_resolved = True
+            return None
+        self._check_cancelled()
+        if result is None:
+            return None
+
+        def publish():
+            self._decision_route_resolved = True
+            if result.routing_hint:
+                self.system_prompt += "\n\n" + result.routing_hint
+            jev_logger.info("[Jev] run=%s stage=route status=%s route=%s probability=%.3f adopted_hint=%s tools=%s skills=%s",
+                            self._decision_log_run_id(), "adopted" if result.routing_hint else "observed",
+                            result.route, result.confidence, bool(result.routing_hint),
+                            json.dumps(list(result.tool_names), ensure_ascii=False),
+                            json.dumps(list(result.skill_names), ensure_ascii=False))
+            self._emit_event("decision_route", {
+                "route": result.route,
+                "tools": list(result.tool_names),
+                "skills": list(result.skill_names),
+                "confidence": result.confidence,
+            })
+
+        # A rejected old result leaves streaming buffered for the existing safe
+        # checkpoint to discard its draft and apply the new instruction.
+        return result if self._publish_decision(publish) else None
+
+    def _decision_log_run_id(self):
+        version = getattr(self.decision_run, "version", "")
+        return version[:8] if isinstance(version, str) and version else "-"
+
+    def _log_decision_replan(self, turn):
+        jev_logger.info("[Jev] run=%s stage=route status=replan turn=%s reason=tool_hint",
+                        self._decision_log_run_id(), turn)
+
+    def _check_decision_during_stream(self, has_tool_calls, allow_replan=True):
+        result = self._apply_decision_route()
+        if (result is not None and result.route == "tools"
+                and result.routing_hint and not has_tool_calls and allow_replan):
+            # No tool action/history has been committed yet. A single restart
+            # makes the recommendation available to the next provider request.
+            raise _DecisionReplan()
+        if (self._decision_route_resolved and not self._decision_evidence
+                and self._defer_response_events):
+            self._flush_response_events()
+
+    def _start_completion_decision(self):
+        self._decision_completion_active = False
+        if (self.decision_run is None or not self._decision_evidence
+                or self._decision_corrections >= 1
+                or (self.cancel_event is not None and self.cancel_event.is_set())):
+            return
+        try:
+            # Partial evidence cannot reliably veto a finish. An empty batch
+            # also invalidates a previous check instead of reusing its verdict.
+            evidence = list(self._decision_evidence) if self._decision_evidence_complete else []
+            self._decision_completion_active = bool(
+                self.decision_run.start_completion(self._user_goal, evidence)
+            )
+        except Exception as exc:
+            jev_logger.warning("[Jev] run=%s stage=completion status=fallback reason=start_failed error_type=%s",
+                               self._decision_log_run_id(), type(exc).__name__)
+
+    def _completion_needs_continue(self):
+        """A Jev verdict may veto one premature finish, never force a finish."""
+        if (self.decision_run is None or self._decision_corrections >= 1
+                or not self._decision_completion_active):
+            return False
+        try:
+            wait = getattr(self.decision_run, "completion_wait_seconds", 0.4)
+            result = self.decision_run.resolve_completion(wait_seconds=wait)
+        except Exception as exc:
+            jev_logger.warning("[Jev] run=%s stage=completion status=fallback reason=resolve_failed error_type=%s",
+                               self._decision_log_run_id(), type(exc).__name__)
+            return False
+        self._check_cancelled()
+        if result is None:
+            jev_logger.info("[Jev] run=%s stage=completion status=fallback reason=not_ready",
+                            self._decision_log_run_id())
+            return False
+
+        def publish():
+            if result.action == "continue":
+                self._decision_corrections += 1
+                # Preserve all tool pairs; only the trailing text draft is uncommitted.
+                if self.messages and self.messages[-1].get("role") == "assistant":
+                    blocks = self.messages[-1].get("content", [])
+                    if isinstance(blocks, list) and not any(
+                        b.get("type") == "tool_use" for b in blocks if isinstance(b, dict)
+                    ):
+                        self.messages.pop()
+                self.system_prompt += (
+                    "\n\n[内部完成复核：不要向用户复述]\n"
+                    "独立证据检查发现仍可能缺少关键步骤或结果支持。"
+                    "请重新对照用户目标和本轮工具结果，补充必要工具或验证；"
+                    "如果无法可靠完成，明确说明缺失的信息，禁止把工具成功当作任务完成。"
+                    "只有存在新信息需求时才继续调用工具，避免重复已经完成的动作。"
+                )
+            jev_logger.info("[Jev] run=%s stage=completion status=%s action=%s probability=%.3f adopted_continue=%s",
+                            self._decision_log_run_id(), "adopted" if result.action == "continue" else "observed",
+                            result.action, result.confidence, result.action == "continue")
+            self._emit_event("decision_completion", {
+                "action": result.action, "confidence": result.confidence,
+            })
+
+        # Complete every state write before callbacks can reenter submit/cancel.
+        return self._publish_decision(publish) and result.action == "continue"
 
     def _queue_files_from_tool_result(self, tool_name: str, result_data) -> None:
         """Queue file_to_send payloads from an explicit send result or auto-detect.
@@ -489,6 +691,7 @@ class AgentStreamExecutor:
         Returns:
             Final response text
         """
+        self._user_goal = user_message
         # Log user message with model info. Truncate very long messages (e.g.
         # injected transcripts / large prompts) so logs stay readable.
         thinking_enabled = self._is_thinking_enabled()
@@ -529,6 +732,7 @@ class AgentStreamExecutor:
 
         final_response = ""
         turn = 0
+        completed = False
 
         cancelled = False
         try:
@@ -541,12 +745,39 @@ class AgentStreamExecutor:
                 if steering_updates:
                     self._append_steering(steering_updates)
 
+                wait = (getattr(self.decision_run, "route_wait_seconds", 0)
+                        if turn == 0 else 0)
+                self._apply_decision_route(wait_seconds=wait)
+                # Routing can wait for a remote result. A cancel or steer that
+                # arrives during that wait must precede the main model request.
+                self._check_cancelled()
+                steering_updates = self._drain_steering()
+                if steering_updates:
+                    self._append_steering(steering_updates)
+                self._defer_response_events = self.decision_run is not None and (
+                    not self._decision_route_resolved
+                    or (self._decision_completion_active
+                        and self._decision_corrections < 1
+                        and getattr(self.decision_run, "completion_enabled", False))
+                )
+
                 turn += 1
                 logger.info(f"[Agent] Turn {turn}")
                 self._emit_event("turn_start", {"turn": turn})
 
                 # Call LLM (enable retry_on_empty for better reliability)
-                assistant_msg, tool_calls = self._call_llm_stream(retry_on_empty=True)
+                try:
+                    assistant_msg, tool_calls = self._call_llm_stream(retry_on_empty=True)
+                except _DecisionReplan:
+                    self._discard_response_events()
+                    self._log_decision_replan(turn)
+                    self._emit_event("turn_end", {
+                        "turn": turn, "has_tool_calls": False, "decision_replan": True,
+                    })
+                    # Routing resolves once per run; restarting an uncommitted
+                    # provider request does not consume a tool decision step.
+                    turn -= 1
+                    continue
                 final_response = assistant_msg
 
                 # A steer that arrived while the model was streaming takes
@@ -555,6 +786,7 @@ class AgentStreamExecutor:
                 # synthetic result before asking the model to reconsider.
                 steering_updates = self._drain_steering()
                 if steering_updates:
+                    self._discard_unpublished_assistant(tool_calls)
                     self._append_steering(
                         steering_updates,
                         pending_tool_calls=tool_calls,
@@ -633,6 +865,7 @@ class AgentStreamExecutor:
                     if not tool_calls:
                         steering_updates = self._drain_steering()
                         if steering_updates:
+                            self._discard_unpublished_assistant(tool_calls)
                             self._append_steering(steering_updates)
                             self._emit_event("turn_end", {
                                 "turn": turn,
@@ -640,19 +873,54 @@ class AgentStreamExecutor:
                                 "steered": True,
                             })
                             continue
+                        # A late route can still replace a draft before it is
+                        # published, even when the provider returned one chunk.
+                        route = self._apply_decision_route(
+                            wait_seconds=getattr(self.decision_run, "route_wait_seconds", 0),
+                        )
+                        if (route is not None and route.route == "tools"
+                                and route.routing_hint):
+                            if self.messages and self.messages[-1].get("role") == "assistant":
+                                self.messages.pop()
+                            self._discard_response_events()
+                            final_response = ""
+                            self._log_decision_replan(turn)
+                            self._emit_event("turn_end", {
+                                "turn": turn, "has_tool_calls": False, "decision_replan": True,
+                            })
+                            turn -= 1
+                            continue
+                        completion_continue = self._completion_needs_continue()
+                        # Completion resolution may wait while cancellation arrives.
+                        self._check_cancelled()
+                        if completion_continue:
+                            self._discard_response_events()
+                            final_response = ""
+                            self._emit_event("turn_end", {
+                                "turn": turn, "has_tool_calls": False, "completion_replan": True,
+                            })
+                            continue
                         if not self._close_or_apply_final_steering():
+                            self._discard_unpublished_assistant(tool_calls)
                             self._emit_event("turn_end", {
                                 "turn": turn,
                                 "has_tool_calls": False,
                                 "steered": True,
                             })
                             continue
+                        self._flush_response_events()
                         logger.debug(f"✅ Done (no tool calls)")
                         self._emit_event("turn_end", {
                             "turn": turn,
                             "has_tool_calls": False
                         })
+                        completed = True
                         break
+
+                # Already planned calls retain their authority. Jev hints do not
+                # turn into a user steer or duplicate tool execution.
+                self._apply_decision_route()
+                self._flush_response_events()
 
                 # Log tool calls with arguments (truncate long values like base64)
                 tool_calls_str = []
@@ -768,13 +1036,23 @@ class AgentStreamExecutor:
                             tool_result_block["is_error"] = True
                         
                         tool_result_blocks.append(tool_result_block)
+                        if self.decision_run is not None:
+                            if len(result_content) > 12000 or len(self._decision_evidence) >= 8:
+                                self._decision_evidence_complete = False
+                            self._decision_evidence.append({
+                                "tool": tool_call["name"],
+                                "status": result.get("status"),
+                                "content": result_content[:12000],
+                            })
+                            # Keep a bounded run-local evidence window.
+                            self._decision_evidence = self._decision_evidence[-8:]
                 
                 finally:
                     # CRITICAL: Always add tool_result to maintain message history integrity
                     # Even if tool execution fails, we must add error results to match tool_use
                     if tool_result_blocks:
-                        # Optional ready-made final answer from a tool: skip the
-                        # completion-gate prompt and the extra cowagent summarization turn.
+                        # A ready-made reply may skip the main model's summary,
+                        # but its evidence still needs the independent completion check.
                         direct_final_answer = self._extract_direct_final_answer(
                             tool_calls, tool_results
                         )
@@ -791,6 +1069,7 @@ class AgentStreamExecutor:
                             "role": "user",
                             "content": history_blocks,
                         })
+                        self._start_completion_decision()
 
                         if not direct_final_answer:
                             # Detect potential infinite loop: same tool called multiple times with success
@@ -837,6 +1116,42 @@ class AgentStreamExecutor:
                         })
 
                 if direct_final_answer:
+                    # A tool can run long enough for cancellation or a new user
+                    # instruction to arrive. Apply these before reviewing or
+                    # committing its ready-made reply.
+                    self._check_cancelled()
+                    steering_updates = self._drain_steering()
+                    if steering_updates:
+                        self._append_steering(steering_updates)
+                        final_response = ""
+                        self._emit_event("turn_end", {
+                            "turn": turn,
+                            "has_tool_calls": True,
+                            "tool_count": len(tool_calls),
+                            "steered": True,
+                        })
+                        continue
+                    completion_continue = self._completion_needs_continue()
+                    self._check_cancelled()
+                    if completion_continue:
+                        self._discard_response_events()
+                        final_response = ""
+                        self._emit_event("turn_end", {
+                            "turn": turn,
+                            "has_tool_calls": True,
+                            "tool_count": len(tool_calls),
+                            "completion_replan": True,
+                        })
+                        continue
+                    if not self._close_or_apply_final_steering():
+                        final_response = ""
+                        self._emit_event("turn_end", {
+                            "turn": turn,
+                            "has_tool_calls": True,
+                            "tool_count": len(tool_calls),
+                            "steered": True,
+                        })
+                        continue
                     self.messages.append({
                         "role": "assistant",
                         "content": [{
@@ -856,6 +1171,7 @@ class AgentStreamExecutor:
                         "tool_count": len(tool_calls),
                         "direct_final_answer": True,
                     })
+                    completed = True
                     break
 
                 self._emit_event("turn_end", {
@@ -864,7 +1180,8 @@ class AgentStreamExecutor:
                     "tool_count": len(tool_calls)
                 })
 
-            if turn >= self.max_turns:
+            if turn >= self.max_turns and not completed:
+                self._flush_response_events()
                 logger.warning(f"⚠️  Reached max decision step limit: {self.max_turns}")
                 self._drain_and_close_steering()
                 
@@ -914,6 +1231,13 @@ class AgentStreamExecutor:
             # User-initiated stop: wind down message history cleanly so the
             # next turn is unaffected; channels emit a "cancelled" UI event.
             cancelled = True
+            if self._defer_response_events:
+                # A buffered final draft has not been accepted or published.
+                # Do not expose it through history or agent_end after cancellation.
+                self._discard_unpublished_assistant(None)
+                final_response = ""
+            else:
+                self._discard_response_events()
             logger.info(f"[Agent] 🛑 Cancelled by user (turn {turn})")
             self._handle_cancelled(final_response)
             if not final_response or not final_response.strip():
@@ -925,6 +1249,9 @@ class AgentStreamExecutor:
             raise
 
         finally:
+            self._discard_response_events()
+            if self.decision_run is not None:
+                self.decision_run.close()
             if self.steer_inbox is not None:
                 self.steer_inbox.close()
             final_response = final_response.strip() if final_response else final_response
@@ -1167,6 +1494,10 @@ class AgentStreamExecutor:
                 if isinstance(chunk, dict) and chunk.get("choices"):
                     choice = chunk["choices"][0]
                     delta = choice.get("delta", {})
+                    self._check_decision_during_stream(
+                        bool(tool_calls_buffer) or bool(delta.get("tool_calls")),
+                        allow_replan=retry_on_empty,
+                    )
                     
                     # Capture finish_reason if present
                     finish_reason = choice.get("finish_reason")
@@ -1217,7 +1548,7 @@ class AgentStreamExecutor:
                     elif isinstance(choice, dict) and choice.get("_gemini_raw_parts"):
                         gemini_raw_parts = choice["_gemini_raw_parts"]
 
-        except AgentCancelledError:
+        except (AgentCancelledError, _DecisionReplan):
             # Must propagate untouched; never treat as a retryable error.
             raise
 
@@ -1328,6 +1659,14 @@ class AgentStreamExecutor:
                 else:
                     logger.error(f"❌ LLM call error (non-retryable): {e}", exc_info=True)
                 raise ModelApiRetriesExhausted(error_str, retry_count) from e
+
+        finally:
+            close = getattr(locals().get("stream"), "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
 
         # Parse tool calls
         tool_calls = []

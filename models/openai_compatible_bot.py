@@ -220,6 +220,7 @@ class OpenAICompatibleBot:
         params = dict(request_params)
         params.pop("stream", None)
         timeout = params.pop("request_timeout", None) or params.pop("timeout", None)
+        stream = None
         try:
             client = self._get_http_client()
             stream = client.chat_completions(
@@ -248,6 +249,13 @@ class OpenAICompatibleBot:
                 "message": str(e),
                 "status_code": 500,
             }
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
     
     def _convert_tools_to_openai_format(self, tools):
         """

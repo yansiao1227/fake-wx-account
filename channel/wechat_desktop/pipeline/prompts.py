@@ -9,6 +9,7 @@ import json
 import random
 import re
 from pathlib import Path
+from string import Formatter
 from urllib.parse import urlsplit
 
 from channel.wechat_desktop.models import WechatDesktopEvent
@@ -383,6 +384,52 @@ def _format_agent_notice(templates: list[str], kind: str, name: str) -> str:
     # 旧的自定义工具模板可能没有占位符；工具通知仍必须写出正在执行的具体工具名。
     if kind == "tool" and name.casefold() not in notice.casefold():
         notice = f"{notice.rstrip()} 当前工具：`{name}`。"
+    return notice
+
+
+def _normalize_jev_notice_names(values) -> list[str]:
+    """清理 Jev 选择的名称并按原顺序去重，完整保留工具和技能清单。"""
+    if not isinstance(values, (list, tuple)):
+        return []
+    names = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        name = re.sub(r"[\s`]+", " ", value).strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _format_jev_decision_notice(templates, tools, skills) -> str:
+    """渲染 Jev 计划；自定义模板也必须展示完整工具和技能清单。"""
+    tools = _normalize_jev_notice_names(tools)
+    skills = _normalize_jev_notice_names(skills)
+    values = {
+        "tools": "、".join(tools) or "无",
+        "skills": "、".join(skills) or "无",
+        "tool_count": len(tools),
+        "skill_count": len(skills),
+    }
+    summary = (
+        "Jev 计划使用工具：{tools}；技能：{skills}"
+    ).format(**values)
+    candidates = [str(item).strip() for item in templates or [] if str(item).strip()]
+    if not candidates:
+        return summary
+    template = random.choice(candidates)
+    try:
+        fields = {
+            name for _, name, spec, conversion in Formatter().parse(template)
+            if name and not spec and not conversion
+        }
+        notice = template.format(**values).strip()
+    except (KeyError, ValueError, IndexError, AttributeError):
+        return summary
+    if not {"tools", "skills"} <= fields:
+        notice = f"{notice} {summary}".strip()
     return notice
 
 

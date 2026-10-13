@@ -3,7 +3,7 @@ import os
 import time
 import threading
 
-from common.log import logger
+from common.log import logger, jev_logger
 from agent.protocol.models import LLMRequest, LLMModel
 from agent.protocol.agent_stream import AgentStreamExecutor
 from agent.protocol.result import AgentAction, AgentActionType, ToolResult, AgentResult
@@ -426,9 +426,6 @@ class Agent:
         if not self.model:
             raise ValueError("No model available for agent")
 
-        # Get full system prompt with skills
-        full_system_prompt = self.get_full_system_prompt(skill_filter=skill_filter)
-
         # Create a copy of messages for this execution to avoid concurrent modification
         # Record the original length to track which messages are new
         with self.messages_lock:
@@ -438,29 +435,54 @@ class Agent:
         # Get max_context_turns from config
         from config import conf
         max_context_turns = conf().get("agent_max_context_turns", 20)
-        
-        # Create stream executor with copied message history
-        executor = AgentStreamExecutor(
-            agent=self,
-            model=self.model,
-            system_prompt=full_system_prompt,
-            tools=self.tools,
-            max_turns=self.max_steps,
-            on_event=on_event,
-            messages=messages_copy,  # Pass copied message history
-            max_context_turns=max_context_turns,
-            cancel_event=cancel_event,
-            steer_inbox=steer_inbox,
-        )
 
-        # Execute
+        # Route independently while workspace prompts and context are prepared.
+        # The background task owns immutable snapshots, never conversation history.
+        decision_run = None
+        settings = conf().get("agent_decision", {})
+        if isinstance(settings, dict) and settings.get("enabled", False):
+            try:
+                # 技能快照必须来自本轮磁盘配置，不能预读上轮缓存的旧正文
+                # 或已删除、禁用的技能；其余上下文准备仍与 Jev 并行。
+                if self.skill_manager:
+                    self.skill_manager.refresh_skills()
+                from agent.decision.runtime import DecisionRun
+                decision_run = DecisionRun.start(
+                    user_message, self.tools, self.skill_manager, messages_copy,
+                    settings, skill_filter=skill_filter,
+                )
+            except Exception as exc:
+                jev_logger.warning("[Jev] run=- stage=route status=fallback reason=start_failed error_type=%s",
+                                   type(exc).__name__)
+
         try:
+            full_system_prompt = self.get_full_system_prompt(skill_filter=skill_filter)
+        except Exception:
+            if decision_run is not None:
+                decision_run.close()
+            raise
+
+        executor = None
+        try:
+            executor = AgentStreamExecutor(
+                agent=self,
+                model=self.model,
+                system_prompt=full_system_prompt,
+                tools=self.tools,
+                max_turns=self.max_steps,
+                on_event=on_event,
+                messages=messages_copy,
+                max_context_turns=max_context_turns,
+                cancel_event=cancel_event,
+                steer_inbox=steer_inbox,
+                decision_run=decision_run,
+            )
             response = executor.run_stream(user_message)
         except Exception:
             # If executor cleared its messages (context overflow / message format error),
             # sync that back to the Agent's own message list so the next request
             # starts fresh instead of hitting the same overflow forever.
-            if len(executor.messages) == 0:
+            if executor is not None and len(executor.messages) == 0:
                 with self.messages_lock:
                     self.messages.clear()
                     logger.info("[Agent] Cleared Agent message history after executor recovery")
@@ -469,7 +491,8 @@ class Agent:
             # BrowserTool/BrowseService owns its lifecycle.  Do not close it
             # at the end of every reply: the service keeps the browser alive
             # across turns and releases it after its configured idle timeout.
-            pass
+            if decision_run is not None:
+                decision_run.close()
 
         # Sync executor's messages back to agent (thread-safe).
         # If the executor trimmed context, its message list is shorter than

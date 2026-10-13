@@ -317,6 +317,7 @@
                 "pages": [
                   "zh/guide/quick-start",
                   "zh/guide/wechat-desktop-service",
+                  "zh/guide/jev-decision",
                   "zh/guide/desktop",
                   "zh/guide/manual-install",
                   "zh/guide/upgrade"

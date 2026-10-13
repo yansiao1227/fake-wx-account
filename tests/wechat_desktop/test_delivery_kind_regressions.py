@@ -39,18 +39,21 @@ def test_finished_progress_preserves_failure_notice(store, monkeypatch, terminal
     assert [notice["reason"] for notice in notices] == ["reply_timeout" if terminal == "timeout" else "reply_failed"]
 
 
-def test_tool_progress_and_timeout_notice_are_persisted_as_interim(tmp_path, store, monkeypatch):
+def test_jev_progress_and_timeout_notice_are_persisted_as_interim(tmp_path, store, monkeypatch):
     _, _, _, channel, context = _reply_setup(tmp_path, store)
     message = context["msg"].event
-    channel.config.update(agent_tool_notice_enabled=True,
-                          agent_tool_notice_templates=["正在调用 {tool_name}"],
+    channel.config.update(jev_decision_notice_enabled=True,
+                          jev_decision_notice_templates=["Jev 计划使用工具：{tools}；技能：{skills}"],
                           agent_failure_notice_templates=["合成失败提示"])
     channel._reply_queue.enqueue(message)
     item = channel._reply_queue.get()
     context["wechat_desktop_queue_token"] = item.token
     sent = []
     channel._driver.send_interim_text = lambda *args, **kwargs: sent.append((args, kwargs)) or SendResult(SendStatus.UNVERIFIED)
-    channel._dispatch_message = lambda *args: channel._send_agent_tool_notice(context, {"tool_name": "web_search"})
+    channel._dispatch_message = lambda *args: channel._send_jev_decision_notice(context, {
+        "route": "tools", "tools": ["web_search", "web_fetch"],
+        "skills": ["search"], "confidence": .99,
+    })
 
     def timeout(self, current):
         channel._reply_queue.expire(current.token)

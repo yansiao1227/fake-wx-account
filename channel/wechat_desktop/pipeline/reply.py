@@ -130,14 +130,22 @@ class WechatDesktopReplyMixin:
         )
         if deferred_events and not item.event.task.source_invalid:
             try:
-                # 附件组件在实际 UI 操作段取得租约，避免与发送争抢窗口。
-                # 分享卡片打开内置浏览器时不发进度提示：发送会和浏览器
-                # 小窗抢同一个微信窗口，实际经常发不出去。
-                notice_sent = self._send_deferred_attachment_notice(item)
-
-                if not item.event.task.source_invalid:
+                # 附件组件在实际 UI 操作段取得租约；进度统一由 Jev 决策事件发送。
+                # 批次来源仍须在物化前复核，不能依赖已移除的附件预发通知附带校验。
+                context = {
+                    "wechat_desktop_queue_token": item.token,
+                    "wechat_desktop_source_event_ids": list(item.source_event_ids),
+                    # 候选历史尚未交给 Agent；此处只复核原始批次。
+                    # 投递时再筛选上文，并为实际使用的来源建立发送校验。
+                    "wechat_desktop_context_source_events": [],
+                }
+                sources_valid = self._validate_source_before_reply(
+                    item.event, context, item.event.conversation_name, "", "text",
+                    action_type="attachment_materialization",
+                )
+                if sources_valid and not item.event.task.source_invalid:
                     materialized = self._materialize_batch(deferred_events)
-                    materialized.task.preflight_attachment_notice_sent = notice_sent
+                    materialized.task.preflight_attachment_notice_sent = False
                     item.event = materialized
             except Exception:
                 deferred_failed = True
@@ -219,6 +227,9 @@ class WechatDesktopReplyMixin:
 
     def _send_agent_tool_notice(self, context: Context, data: dict) -> bool:
         return AgentReplyCoordinator(self).send_tool_notice(context, data)
+
+    def _send_jev_decision_notice(self, context: Context, data: dict) -> bool:
+        return AgentReplyCoordinator(self).send_decision_notice(context, data)
 
     def _compose_context(self, ctype: ContextType, content, **kwargs):
         return AgentReplyCoordinator(self).compose_context(ctype, content, **kwargs)

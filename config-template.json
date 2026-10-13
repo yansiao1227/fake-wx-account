@@ -40,6 +40,18 @@
   "agent_max_context_tokens": 50000,
   "agent_max_context_turns": 20,
   "agent_max_steps": 20,
+  "agent_decision": {
+    "enabled": false,
+    "model": "jev-1.13",
+    "request_timeout": 3.0,
+    "route_wait_seconds": 0.15,
+    "route_min_probability": 0.85,
+    "skill_min_probability": 0.85,
+    "max_skill_chars": 16000,
+    "completion_enabled": true,
+    "completion_wait_seconds": 0.4,
+    "completion_min_probability": 0.95
+  },
   "enable_thinking": false,
   "reasoning_effort": "high",
   "knowledge": true,

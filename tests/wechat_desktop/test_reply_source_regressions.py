@@ -33,20 +33,23 @@ def _capture_submission(channel):
     channel._deliver = lambda *args, **kwargs: sent.append((args, kwargs)) or SendResult(SendStatus.SENT)
     channel._mark_lifecycle = lambda ids, stage, **kwargs: stages.append(stage)
     channel.config.update(agent_failure_notice_templates=["合成失败提示"],
-                          agent_tool_notice_templates=["正在调用 {tool_name}"],
-                          agent_tool_notice_enabled=True)
+                          jev_decision_notice_templates=["Jev 计划使用工具：{tools}；skill：{skills}"],
+                          jev_decision_notice_enabled=True)
     return sent, stages
 
 
 def _invoke(channel, context, output):
     if output == "failure":
         return channel._send_agent_failure_notice(context=context)
-    if output == "tool":
-        return AgentReplyCoordinator(channel).send_tool_notice(context, {"tool_name": "web_search"})
+    if output == "jev":
+        return AgentReplyCoordinator(channel).send_decision_notice(context, {
+            "route": "tools", "tools": ["web_search", "web_fetch"],
+            "skills": ["search"], "confidence": .99,
+        })
     channel._send_reply_impl(Reply(output, "合成回复"), context)
 
 
-@pytest.mark.parametrize("output", ["failure", "tool"])
+@pytest.mark.parametrize("output", ["failure", "jev"])
 @pytest.mark.parametrize("change", ["delete", "replace", "generation"])
 def test_notices_revalidate_native_source_before_any_submission(tmp_path, store, output, change):
     _, talker, cache, channel, context = _reply_setup(tmp_path, store)
@@ -61,10 +64,10 @@ def test_notices_revalidate_native_source_before_any_submission(tmp_path, store,
         "SELECT count(*) FROM conversation_history WHERE direction='outgoing'").fetchone()[0] == 0
     audit = store._get_connection().execute(
         "SELECT action_type,result FROM audit ORDER BY id DESC LIMIT 1").fetchone()
-    assert tuple(audit) == ("agent_failure_notice" if output == "failure" else "agent_tool_notice", "stale_target")
+    assert tuple(audit) == ("agent_failure_notice" if output == "failure" else "jev_decision_notice", "stale_target")
 
 
-@pytest.mark.parametrize("output", ["failure", "tool"])
+@pytest.mark.parametrize("output", ["failure", "jev"])
 def test_valid_source_notice_still_submits(tmp_path, store, output):
     _, _, _, channel, context = _reply_setup(tmp_path, store)
     sent, _ = _capture_submission(channel)
@@ -76,7 +79,7 @@ def test_valid_source_notice_still_submits(tmp_path, store, output):
         "SELECT count(*) FROM conversation_history WHERE direction='outgoing'").fetchone()[0] == 1
 
 
-@pytest.mark.parametrize("output", [ReplyType.TEXT, ReplyType.IMAGE, ReplyType.ERROR, "failure", "tool"])
+@pytest.mark.parametrize("output", [ReplyType.TEXT, ReplyType.IMAGE, ReplyType.ERROR, "failure", "jev"])
 @pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("change", ["delete", "replace"])
 def test_aggregate_reply_revalidates_earlier_source(tmp_path, store, output, deferred, change):
@@ -126,7 +129,7 @@ def test_deferred_source_snapshots_survive_materialization_mutation(tmp_path, st
     assert not checked[0].task.deferred_materialization_events
 
 
-def test_tool_callback_on_withdrawn_source_finishes_queue_as_skipped(tmp_path, store, monkeypatch):
+def test_jev_callback_on_withdrawn_source_finishes_queue_as_skipped(tmp_path, store, monkeypatch):
     import agent.protocol
 
     _, talker, cache, channel, context = _reply_setup(tmp_path, store)
@@ -141,7 +144,9 @@ def test_tool_callback_on_withdrawn_source_finishes_queue_as_skipped(tmp_path, s
     callback = AgentReplyCoordinator(channel).make_event_callback(context)
     _invalidate(cache, talker, "delete")
 
-    callback({"type": "tool_execution_start", "data": {"tool_name": "web_search", "tool_call_id": "search-1"}})
+    callback({"type": "decision_route", "data": {
+        "route": "tools", "tools": ["web_search"], "skills": ["search"], "confidence": .99,
+    }})
 
     assert item.done.is_set() and item.terminal == "skipped"
     assert cancelled == [event.event_id]
@@ -179,7 +184,7 @@ def test_event_only_failure_notice_preserves_skipped_worker_terminal(tmp_path, s
     assert tuple(audit) == ("reply_queue", "skipped")
 
 
-def test_deferred_preflight_revalidates_all_sources_before_materialization(tmp_path, store):
+def test_deferred_materialization_revalidates_all_sources_before_loading(tmp_path, store):
     _, talker, cache, channel, context = _reply_setup(tmp_path, store)
     first = context["msg"].event
     add_message(cache, talker, 2)
@@ -202,6 +207,33 @@ def test_deferred_preflight_revalidates_all_sources_before_materialization(tmp_p
     assert item.done.is_set() and item.terminal == "skipped"
     assert sent == []
     assert "send_started" not in stages
+
+
+@pytest.mark.parametrize("change", ["delete", "replace"])
+def test_deferred_reference_ignores_withdrawn_unused_prior_history(tmp_path, store, change):
+    _, talker, cache, channel, _ = _reply_setup(tmp_path, store)
+    add_message(cache, talker, 2, content="current question", created=1001)
+    observation, events = channel._driver.observe_events()
+    store.receive_source_batch(observation["source_batch"])
+    channel._driver.acknowledge_events([observation["source_batch"].batch_id])
+    event = events[0]
+    assert [source.source_local_id for source in event.task.context_source_events] == [1]
+    event.reference = {"content_type": "image", "file_path": "synthetic.png", "resolved": False}
+    channel._reply_queue.enqueue(channel._prepare_deferred_materialization([event]))
+    item = channel._reply_queue.get()
+    materialized, dispatched = [], []
+    channel._driver.materialize_event = lambda source: materialized.append(source.event_id) or (source, 0)
+    channel._preserve_event_evidence = lambda source: None
+    channel._dispatch_message = lambda source, token: dispatched.append(source.event_id) or False
+    _capture_submission(channel)
+    _invalidate(cache, talker, change, local_id=1)
+
+    result = channel._process_reply_item(item)
+
+    assert result == "skipped"  # 测试替身未投递 Agent，但物化和投递入口均须执行。
+    assert materialized == dispatched == [event.event_id]
+    assert not event.task.source_invalid
+    assert event.task.context_source_events == []
 
 
 def _dispatch_with_prior_history(tmp_path, store, budget):

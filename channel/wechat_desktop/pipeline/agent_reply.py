@@ -10,9 +10,10 @@ from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.pipeline.prompts import (
     DEFAULT_BOT_MENTION_ALIASES,
     _format_agent_notice,
+    _format_jev_decision_notice,
     _is_user_visible_tool_notice,
     _link_reading_instruction,
-    _preflight_tool_notice_data,
+    _normalize_jev_notice_names,
     _render_event_context,
     _reply_requirements,
     _strip_group_bot_mentions,
@@ -54,29 +55,8 @@ class AgentReplyCoordinator:
         return "timeout"
 
     def send_attachment_notice(self, item: ReplyQueueItem) -> bool:
-        """引用附件解析前尽早发送工具进度通知，降低用户等待的不确定感。"""
-        channel = self.channel
-        event = item.event
-        notice_data = _preflight_tool_notice_data(event)
-        if not notice_data or not bool(
-            channel.config.get("agent_tool_notice_enabled", True)
-        ):
-            return False
-        context = {
-            "msg": WechatDesktopMessage(event),
-            "receiver": event.conversation_id or event.conversation_name,
-            "isgroup": event.is_group,
-            "wechat_desktop_queue_token": item.token,
-            "wechat_desktop_source_type": event.source_type,
-            "wechat_desktop_source_event_ids": list(item.source_event_ids),
-        }
-        try:
-            return channel._send_agent_tool_notice(context, notice_data)
-        except Exception as exc:
-            logger.warning(
-                "[WechatDesktop] early attachment notice failed: %s", exc
-            )
-            return False
+        """旧附件通知入口兼容保留；进度统一由 Jev 决策事件发出。"""
+        return False
 
     def build_image_prompt(self, event: WechatDesktopEvent) -> str:
         """把本地图片路径转换为明确要求调用 vision 的文字提示。"""
@@ -283,28 +263,7 @@ class AgentReplyCoordinator:
             context["wechat_desktop_batch_id"] = str(
                 event.task.batch_id or event.event_id
             )
-            context["wechat_desktop_agent_notice_sent"] = bool(
-                event.task.preflight_attachment_notice_sent
-            )
-            # 附件物化阶段的进度通知可以提前发；Agent 侧等到真正开始
-            # 调用用户可理解的工具后再发，避免猜错下一步工具。
-            if bool(channel.config.get("agent_preflight_notice_enabled", False)):
-                notice_data = _preflight_tool_notice_data(event)
-                if (
-                    notice_data
-                    and not context["wechat_desktop_agent_notice_sent"]
-                    and bool(channel.config.get("agent_tool_notice_enabled", True))
-                    and channel._is_user_visible_tool_notice(notice_data)
-                ):
-                    try:
-                        context["wechat_desktop_agent_notice_sent"] = (
-                            channel._send_agent_tool_notice(context, notice_data)
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "[WechatDesktop] Agent preflight notice failed: %s",
-                            exc,
-                        )
+            context["wechat_desktop_jev_notice_sent"] = False
             context["on_event"] = channel._make_agent_event_callback(context)
             if event.task.source_invalid:
                 return False
@@ -318,16 +277,15 @@ class AgentReplyCoordinator:
         return False
 
     def make_event_callback(self, context: Context):
-        """包装 Agent 流事件，记录首次工具调用并按配置发送一次进度通知。"""
+        """保留工具生命周期事件，仅由 Jev 决策发送一次完整计划通知。"""
         channel = self.channel
         downstream = context.get("on_event")
         lock = threading.Lock()
-        seen_tool_calls: set[str] = set()
-        notice_sent = bool(context.get("wechat_desktop_agent_notice_sent", False))
+        notice_attempted = bool(context.get("wechat_desktop_jev_notice_sent", False))
 
         def on_event(event: dict):
             """处理通道关心的流事件后，保持原回调链继续向下传递。"""
-            nonlocal notice_sent
+            nonlocal notice_attempted
             try:
                 if event.get("type") == "tool_execution_start":
                     channel._mark_lifecycle(
@@ -335,28 +293,27 @@ class AgentReplyCoordinator:
                         "first_tool",
                     )
                 if (
-                    event.get("type") == "tool_execution_start"
-                    and bool(channel.config.get("agent_tool_notice_enabled", True))
+                    event.get("type") == "decision_route"
+                    and bool(channel.config.get("jev_decision_notice_enabled", True))
                 ):
                     data = event.get("data", {})
-                    if channel._is_user_visible_tool_notice(data):
-                        tool_call_id = str(
-                            data.get("tool_call_id") or data.get("tool_name") or "tool"
+                    if (
+                        isinstance(data, dict)
+                        and data.get("route") == "tools"
+                        and (
+                            _normalize_jev_notice_names(data.get("tools"))
+                            or _normalize_jev_notice_names(data.get("skills"))
                         )
+                    ):
                         with lock:
-                            once = bool(
-                                channel.config.get("agent_tool_notice_once_per_reply", True)
-                            )
-                            if tool_call_id not in seen_tool_calls and not (
-                                once and notice_sent
-                            ):
-                                seen_tool_calls.add(tool_call_id)
-                                notice_sent = channel._send_agent_tool_notice(
-                                    context, data
-                                ) or notice_sent
+                            if not notice_attempted:
+                                notice_attempted = True
+                                context["wechat_desktop_jev_notice_sent"] = (
+                                    channel._send_jev_decision_notice(context, data)
+                                )
             except Exception as exc:
                 logger.warning(
-                    "[WechatDesktop] Agent tool notice failed: %s", exc
+                    "[WechatDesktop][Jev] decision notice failed: %s", exc
                 )
             finally:
                 if downstream:
@@ -372,11 +329,55 @@ class AgentReplyCoordinator:
         )
 
     def send_tool_notice(self, context: Context, data: dict) -> bool:
-        """向当前微信会话发送工具/技能进度，并登记为不参与回复识别的临时文本。
+        """兼容旧通知调用；生产流程只触发 send_decision_notice。"""
+        channel = self.channel
+        if not channel._is_user_visible_tool_notice(data):
+            return False
+        kind, name = _tool_notice_subject(data)
+        name = re.sub(r"[\r\n`]+", " ", name).strip()[:80] or kind
+        template_key = str(data.get("notice_template_key") or "").strip()
+        if not template_key:
+            template_key = (
+                "agent_skill_notice_templates"
+                if kind == "skill"
+                else "agent_tool_notice_templates"
+            )
+        templates = [
+            str(item)
+            for item in channel.config.get(template_key, [])
+            if str(item).strip()
+        ]
+        return self._send_progress_notice(
+            context, _format_agent_notice(templates, kind, name),
+            action_type="agent_tool_notice", detail=f"{kind}={name}",
+            trace_phase="10-tool-notice",
+        )
 
-        发送前再次检查队列令牌、暂停状态、影子模式、黑名单和底层工具过滤，
-        防止过期 Agent 周期、只观察模式或 bash/read 一类内部动作产生额外消息。
-        """
+    def send_decision_notice(self, context: Context, data: dict) -> bool:
+        """发送 Jev 全部工具/技能的选择计划，数量按清理去重后的清单统计。"""
+        channel = self.channel
+        if not bool(channel.config.get("jev_decision_notice_enabled", True)):
+            return False
+        if not isinstance(data, dict) or data.get("route") != "tools":
+            return False
+        tools = _normalize_jev_notice_names(data.get("tools"))
+        skills = _normalize_jev_notice_names(data.get("skills"))
+        if not tools and not skills:
+            return False
+        notice = _format_jev_decision_notice(
+            channel.config.get("jev_decision_notice_templates", []), tools, skills,
+        )
+        return self._send_progress_notice(
+            context, notice, action_type="jev_decision_notice",
+            detail=f"tool_count={len(tools)} skill_count={len(skills)} tools={tools} skills={skills}",
+            trace_phase="10-jev-notice",
+        )
+
+    def _send_progress_notice(
+        self, context: Context, notice: str, *, action_type: str,
+        detail: str, trace_phase: str,
+    ) -> bool:
+        """通知共享目标授权、来源校验和临时发送保护，不结束回复周期。"""
         channel = self.channel
         msg = context.get("msg")
         event = getattr(msg, "event", None)
@@ -408,27 +409,8 @@ class AgentReplyCoordinator:
             or channel._policy.is_blocked(target_name, is_group)
         ):
             return False
-        if not channel._is_user_visible_tool_notice(data):
-            return False
-
-        kind, name = _tool_notice_subject(data)
-        name = re.sub(r"[\r\n`]+", " ", name).strip()[:80] or kind
-        template_key = str(data.get("notice_template_key") or "").strip()
-        if not template_key:
-            template_key = (
-                "agent_skill_notice_templates"
-                if kind == "skill"
-                else "agent_tool_notice_templates"
-            )
-        templates = [
-            str(item)
-            for item in channel.config.get(template_key, [])
-            if str(item).strip()
-        ]
-        notice = _format_agent_notice(templates, kind, name)
-
         if not channel._validate_source_before_reply(
-            event, context, target_name, notice, "text", action_type="agent_tool_notice"
+            event, context, target_name, notice, "text", action_type=action_type
         ):
             return False
 
@@ -451,18 +433,17 @@ class AgentReplyCoordinator:
             ),
         )
         channel._store.audit(
-            "agent_tool_notice",
+            action_type,
             target_name,
             "success" if result.get("verified") else "unverified",
             channel._content_hash(notice),
-            detail=f"{kind}={name}",
+            detail=detail,
         )
         channel._trace(
-            "10-tool-notice",
-            "target=%s kind=%s name=%s verified=%s",
+            trace_phase,
+            "target=%s detail=%s verified=%s",
             target_name,
-            kind,
-            name,
+            detail,
             bool(result.get("verified")),
         )
         return True
