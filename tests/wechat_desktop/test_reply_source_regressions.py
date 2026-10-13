@@ -209,6 +209,33 @@ def test_deferred_materialization_revalidates_all_sources_before_loading(tmp_pat
     assert "send_started" not in stages
 
 
+@pytest.mark.parametrize("change", ["delete", "replace"])
+def test_deferred_reference_ignores_withdrawn_unused_prior_history(tmp_path, store, change):
+    _, talker, cache, channel, _ = _reply_setup(tmp_path, store)
+    add_message(cache, talker, 2, content="current question", created=1001)
+    observation, events = channel._driver.observe_events()
+    store.receive_source_batch(observation["source_batch"])
+    channel._driver.acknowledge_events([observation["source_batch"].batch_id])
+    event = events[0]
+    assert [source.source_local_id for source in event.task.context_source_events] == [1]
+    event.reference = {"content_type": "image", "file_path": "synthetic.png", "resolved": False}
+    channel._reply_queue.enqueue(channel._prepare_deferred_materialization([event]))
+    item = channel._reply_queue.get()
+    materialized, dispatched = [], []
+    channel._driver.materialize_event = lambda source: materialized.append(source.event_id) or (source, 0)
+    channel._preserve_event_evidence = lambda source: None
+    channel._dispatch_message = lambda source, token: dispatched.append(source.event_id) or False
+    _capture_submission(channel)
+    _invalidate(cache, talker, change, local_id=1)
+
+    result = channel._process_reply_item(item)
+
+    assert result == "skipped"  # 测试替身未投递 Agent，但物化和投递入口均须执行。
+    assert materialized == dispatched == [event.event_id]
+    assert not event.task.source_invalid
+    assert event.task.context_source_events == []
+
+
 def _dispatch_with_prior_history(tmp_path, store, budget):
     _, talker, cache, channel, _ = _reply_setup(tmp_path, store)
     add_message(cache, talker, 2, content="selected prior", created=1001)

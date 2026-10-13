@@ -135,6 +135,9 @@ class WechatDesktopReplyMixin:
                 context = {
                     "wechat_desktop_queue_token": item.token,
                     "wechat_desktop_source_event_ids": list(item.source_event_ids),
+                    # 候选历史尚未交给 Agent；此处只复核原始批次。
+                    # 投递时再筛选上文，并为实际使用的来源建立发送校验。
+                    "wechat_desktop_context_source_events": [],
                 }
                 sources_valid = self._validate_source_before_reply(
                     item.event, context, item.event.conversation_name, "", "text",

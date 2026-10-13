@@ -54,6 +54,11 @@ class SteerInbox:
             self._pending.append(text)
         return SteerResult(SteerStatus.ACCEPTED)
 
+    def has_pending(self) -> bool:
+        """Check for new guidance without consuming it before a safe checkpoint."""
+        with self._lock:
+            return bool(self._pending)
+
     def drain(self) -> List[str]:
         with self._lock:
             items = list(self._pending)

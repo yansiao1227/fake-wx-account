@@ -54,13 +54,35 @@ def test_gateway_endpoint_normalization(base, expected):
 
 
 @pytest.mark.parametrize("base", [
+    "http://localhost:3000/v1", "http://LOCALHOST/v1", "http://127.0.0.1:8080/v1",
+    "http://127.0.0.2/v1", "http://[::1]:8080/v1",
+])
+def test_explicit_loopback_http_endpoint_is_allowed(base):
+    assert JevClient(base, "test-token").endpoint.endswith("/typesafe/v1/systemone")
+
+
+@pytest.mark.parametrize("base", [
     "", "gateway.invalid", "file:///private", "https://user:secret@gateway.invalid",
     "https://gateway.invalid?api_key=secret", "https://gateway.invalid#fragment",
+    "http://gateway.invalid/v1", "http://192.168.1.1/v1", "http://0.0.0.0/v1",
+    "http://[::]/v1", "http://localhost.gateway.invalid/v1", "http://127.0.0.1.gateway.invalid/v1",
+    "http://127.1/v1", "http://2130706433/v1", "http://[::1%25adapter]/v1",
+    "https://:443/v1", "https://gateway.invalid:wrong/v1", "https://gateway.invalid:65536/v1",
+    "https://gateway.invalid:0/v1", "https://[::1/v1", "https://gate\tway.invalid/v1",
 ])
 def test_invalid_endpoint_is_rejected_without_exposing_url(base):
     with pytest.raises(JevError) as caught:
         JevClient(base, "test-token")
     assert str(caught.value) == "Jev configuration"
+
+
+def test_remote_http_configuration_does_not_trigger_requests(monkeypatch):
+    def forbidden_request(*args, **kwargs):
+        pytest.fail("非本机 HTTP 配置不应发出请求")
+    monkeypatch.setattr(jev_module.requests, "post", forbidden_request)
+    assert JevClient.from_config({"api_base": "http://gateway.invalid", "api_key": "test-token"}) is None
+    configure(monkeypatch, {"bot_type": "custom", "custom_api_base": "http://gateway.invalid/v1", "custom_api_key": "shared-token"})
+    assert JevClient.from_config() is None
 
 
 def test_selected_provider_credentials_are_kept_together(monkeypatch):
@@ -210,6 +232,26 @@ def test_http_errors_do_not_parse_or_expose_response_body(monkeypatch, caplog):
     assert caught.value.status_code == 401
     assert "secret-token" not in caplog.text
     assert "private-state" not in caplog.text
+
+
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_redirects_do_not_forward_credentials_or_state(monkeypatch, status_code):
+    calls = []
+    def post(url, **kwargs):
+        calls.append((url, kwargs))
+        assert kwargs["allow_redirects"] is False
+        return SimpleNamespace(
+            status_code=status_code,
+            headers={"Location": "http://different.invalid/private"},
+            json=lambda: pytest.fail("重定向响应不应解析正文"),
+        )
+    monkeypatch.setattr(jev_module.requests, "post", post)
+    with pytest.raises(JevError) as caught:
+        JevClient("https://gateway.invalid", "test-token").evaluate("private-state", questions())
+    assert caught.value.category == "http"
+    assert caught.value.status_code == status_code
+    assert len(calls) == 1
+    assert calls[0][0] == "https://gateway.invalid/typesafe/v1/systemone"
 
 
 def test_decode_errors_are_sanitized(monkeypatch):

@@ -369,6 +369,11 @@ class AgentStreamExecutor:
                                self._decision_log_run_id(), type(exc).__name__)
             self._decision_route_resolved = True
             return None
+        self._check_cancelled()
+        if self.steer_inbox is not None and self.steer_inbox.has_pending():
+            # Keep the old result unpublished; streaming must remain buffered
+            # until the existing safe checkpoint applies the new instruction.
+            return None
         if result is None:
             return None
         self._decision_route_resolved = True
@@ -409,7 +414,8 @@ class AgentStreamExecutor:
     def _start_completion_decision(self):
         self._decision_completion_active = False
         if (self.decision_run is None or not self._decision_evidence
-                or self._decision_corrections >= 1):
+                or self._decision_corrections >= 1
+                or (self.cancel_event is not None and self.cancel_event.is_set())):
             return
         try:
             # Partial evidence cannot reliably veto a finish. An empty batch
@@ -433,6 +439,9 @@ class AgentStreamExecutor:
         except Exception as exc:
             jev_logger.warning("[Jev] run=%s stage=completion status=fallback reason=resolve_failed error_type=%s",
                                self._decision_log_run_id(), type(exc).__name__)
+            return False
+        self._check_cancelled()
+        if self.steer_inbox is not None and self.steer_inbox.has_pending():
             return False
         if result is None:
             jev_logger.info("[Jev] run=%s stage=completion status=fallback reason=not_ready",
@@ -684,6 +693,7 @@ class AgentStreamExecutor:
 
         final_response = ""
         turn = 0
+        completed = False
 
         cancelled = False
         try:
@@ -699,6 +709,12 @@ class AgentStreamExecutor:
                 wait = (getattr(self.decision_run, "route_wait_seconds", 0)
                         if turn == 0 else 0)
                 self._apply_decision_route(wait_seconds=wait)
+                # Routing can wait for a remote result. A cancel or steer that
+                # arrives during that wait must precede the main model request.
+                self._check_cancelled()
+                steering_updates = self._drain_steering()
+                if steering_updates:
+                    self._append_steering(steering_updates)
                 self._defer_response_events = self.decision_run is not None and (
                     not self._decision_route_resolved
                     or (self._decision_completion_active
@@ -835,7 +851,10 @@ class AgentStreamExecutor:
                             })
                             turn -= 1
                             continue
-                        if turn < self.max_turns and self._completion_needs_continue():
+                        completion_continue = self._completion_needs_continue()
+                        # Completion resolution may wait while cancellation arrives.
+                        self._check_cancelled()
+                        if completion_continue:
                             self._discard_response_events()
                             final_response = ""
                             self._emit_event("turn_end", {
@@ -856,6 +875,7 @@ class AgentStreamExecutor:
                             "turn": turn,
                             "has_tool_calls": False
                         })
+                        completed = True
                         break
 
                 # Already planned calls retain their authority. Jev hints do not
@@ -992,8 +1012,8 @@ class AgentStreamExecutor:
                     # CRITICAL: Always add tool_result to maintain message history integrity
                     # Even if tool execution fails, we must add error results to match tool_use
                     if tool_result_blocks:
-                        # Optional ready-made final answer from a tool: skip the
-                        # completion-gate prompt and the extra cowagent summarization turn.
+                        # A ready-made reply may skip the main model's summary,
+                        # but its evidence still needs the independent completion check.
                         direct_final_answer = self._extract_direct_final_answer(
                             tool_calls, tool_results
                         )
@@ -1010,8 +1030,7 @@ class AgentStreamExecutor:
                             "role": "user",
                             "content": history_blocks,
                         })
-                        if not direct_final_answer:
-                            self._start_completion_decision()
+                        self._start_completion_decision()
 
                         if not direct_final_answer:
                             # Detect potential infinite loop: same tool called multiple times with success
@@ -1058,6 +1077,42 @@ class AgentStreamExecutor:
                         })
 
                 if direct_final_answer:
+                    # A tool can run long enough for cancellation or a new user
+                    # instruction to arrive. Apply these before reviewing or
+                    # committing its ready-made reply.
+                    self._check_cancelled()
+                    steering_updates = self._drain_steering()
+                    if steering_updates:
+                        self._append_steering(steering_updates)
+                        final_response = ""
+                        self._emit_event("turn_end", {
+                            "turn": turn,
+                            "has_tool_calls": True,
+                            "tool_count": len(tool_calls),
+                            "steered": True,
+                        })
+                        continue
+                    completion_continue = self._completion_needs_continue()
+                    self._check_cancelled()
+                    if completion_continue:
+                        self._discard_response_events()
+                        final_response = ""
+                        self._emit_event("turn_end", {
+                            "turn": turn,
+                            "has_tool_calls": True,
+                            "tool_count": len(tool_calls),
+                            "completion_replan": True,
+                        })
+                        continue
+                    if not self._close_or_apply_final_steering():
+                        final_response = ""
+                        self._emit_event("turn_end", {
+                            "turn": turn,
+                            "has_tool_calls": True,
+                            "tool_count": len(tool_calls),
+                            "steered": True,
+                        })
+                        continue
                     self.messages.append({
                         "role": "assistant",
                         "content": [{
@@ -1077,6 +1132,7 @@ class AgentStreamExecutor:
                         "tool_count": len(tool_calls),
                         "direct_final_answer": True,
                     })
+                    completed = True
                     break
 
                 self._emit_event("turn_end", {
@@ -1085,7 +1141,7 @@ class AgentStreamExecutor:
                     "tool_count": len(tool_calls)
                 })
 
-            if turn >= self.max_turns:
+            if turn >= self.max_turns and not completed:
                 self._flush_response_events()
                 logger.warning(f"⚠️  Reached max decision step limit: {self.max_turns}")
                 self._drain_and_close_steering()
@@ -1136,7 +1192,13 @@ class AgentStreamExecutor:
             # User-initiated stop: wind down message history cleanly so the
             # next turn is unaffected; channels emit a "cancelled" UI event.
             cancelled = True
-            self._discard_response_events()
+            if self._defer_response_events:
+                # A buffered final draft has not been accepted or published.
+                # Do not expose it through history or agent_end after cancellation.
+                self._discard_unpublished_assistant(None)
+                final_response = ""
+            else:
+                self._discard_response_events()
             logger.info(f"[Agent] 🛑 Cancelled by user (turn {turn})")
             self._handle_cancelled(final_response)
             if not final_response or not final_response.strip():

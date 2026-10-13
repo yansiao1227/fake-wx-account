@@ -157,6 +157,246 @@ def assert_tool_chain(messages, expected_ids):
     assert uses == results == expected_ids
 
 
+def direct_answer(value):
+    return ToolResult.success({
+        "direct_final_answer": True,
+        "final_answer_text": value,
+    })
+
+
+def test_direct_tool_answer_obeys_completion_continue_once():
+    decision = ControlledDecision(completion=CompletionDecision("continue", .98))
+    model = ScriptedModel([tool_call()], [tool_call("call_2", "补充验证")])
+    instance, events, lookup = executor(model, decision)
+
+    def execute(params):
+        lookup.calls.append(copy.deepcopy(params))
+        return direct_answer("遗漏验证的现成答复" if len(lookup.calls) == 1 else "验证后的现成答复")
+
+    lookup.execute = execute
+    assert instance.run_stream("查询并验证") == "验证后的现成答复"
+    assert len(model.requests) == 2
+    assert len(decision.completion_starts) == decision.completion_resolves == 1
+    assert decision.completion_starts[0] == ("查询并验证", [{
+        "tool": "lookup", "status": "success",
+        "content": json.dumps({
+            "direct_final_answer": True,
+            "final_answer_text": "遗漏验证的现成答复",
+        }, ensure_ascii=False),
+    }])
+    assert "内部完成复核" in model.requests[1].system
+    assert "遗漏验证的现成答复" not in history_text(instance.messages)
+    assert "遗漏验证的现成答复" not in streamed_text(events)
+    assert sum(bool(event["data"].get("completion_replan")) for event in events) == 1
+    assert_tool_chain(instance.messages, ["call_1", "call_2"])
+    assert decision.closed
+
+
+@pytest.mark.parametrize("verdict", ["finalize", "uncertain", None])
+def test_direct_tool_answer_checks_completion_without_extra_summary(verdict):
+    completion = CompletionDecision(verdict, .98) if verdict else None
+    decision = ControlledDecision(completion=completion)
+    # A missing result represents a started check that has not completed yet.
+    decision.completion_enabled = True
+    model = ScriptedModel([tool_call()])
+    instance, events, lookup = executor(model, decision)
+    lookup.execute = lambda params: direct_answer("工具现成答复")
+    assert instance.run_stream("查询") == "工具现成答复"
+    assert len(model.requests) == 1
+    assert len(decision.completion_starts) == decision.completion_resolves == 1
+    assert_tool_chain(instance.messages, ["call_1"])
+    assert history_text(instance.messages).endswith("工具现成答复")
+
+
+def test_cancel_during_direct_tool_execution_prevents_ready_reply():
+    cancel = threading.Event()
+    decision = ControlledDecision(completion=CompletionDecision("finalize", .98))
+    model = ScriptedModel([tool_call()])
+    instance, events, lookup = executor(model, decision, cancel_event=cancel)
+
+    def execute(params):
+        cancel.set()
+        return direct_answer("已取消任务的现成答复")
+
+    lookup.execute = execute
+    response = instance.run_stream("查询")
+    assert "已取消任务的现成答复" not in response
+    assert "已取消任务的现成答复" not in history_text(instance.messages)
+    assert decision.completion_resolves == 0
+    assert decision.closed
+    assert len(model.requests) == 1
+    assert events[-1]["data"]["cancelled"] is True
+    assert_tool_chain(instance.messages, ["call_1"])
+
+
+def test_cancel_during_initial_route_wait_prevents_main_model_request():
+    cancel = threading.Event()
+    decision = ControlledDecision()
+    model = ScriptedModel([text("取消后不应开始的请求")])
+    instance, events, lookup = executor(model, decision, cancel_event=cancel)
+
+    def resolve(wait_seconds=0):
+        cancel.set()
+        return decision.result
+
+    decision.resolve = resolve
+    instance.run_stream("查询")
+    assert model.requests == []
+    assert streamed_text(events) == ""
+    assert lookup.calls == []
+    assert decision.closed
+    assert events[-1]["data"]["cancelled"] is True
+    assert not any(event["type"] == "decision_route" for event in events)
+
+
+def test_steer_during_initial_route_wait_replaces_hint_before_model_request():
+    inbox = SteerInbox()
+    decision = ControlledDecision("tools", "旧目标的技能建议")
+    model = ScriptedModel([text("新目标答复")])
+    instance, events, lookup = executor(model, decision, steer_inbox=inbox)
+
+    def resolve(wait_seconds=0):
+        assert inbox.submit("新的目标").accepted
+        return decision.result
+
+    decision.resolve = resolve
+    assert instance.run_stream("旧目标") == "新目标答复"
+    assert decision.invalidated
+    assert len(model.requests) == 1
+    assert "旧目标的技能建议" not in model.requests[0].system
+    assert "新的目标" in json.dumps(model.requests[0].messages, ensure_ascii=False)
+    assert lookup.calls == []
+    assert not any(event["type"] == "decision_route" for event in events)
+
+
+def test_steer_before_late_route_keeps_old_stream_buffered_until_safe_checkpoint():
+    inbox = SteerInbox()
+    decision = ControlledDecision("tools", "旧目标的技能建议", ready=False)
+
+    def redirect():
+        assert inbox.submit("新的目标").accepted
+        decision.ready = True
+        return text("旧目标流的剩余草稿")
+
+    model = ScriptedModel(
+        [text("旧目标流的开始草稿"), redirect],
+        [text("新目标答复")],
+    )
+    instance, events, lookup = executor(model, decision, steer_inbox=inbox)
+
+    assert instance.run_stream("旧目标") == "新目标答复"
+
+    assert streamed_text(events) == "新目标答复"
+    assert "旧目标流" not in history_text(instance.messages)
+    assert not any(event["type"] == "decision_route" for event in events)
+    assert "旧目标的技能建议" not in model.requests[1].system
+    assert "新的目标" in history_text(instance.messages)
+    assert decision.invalidated
+    assert lookup.calls == []
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_cancel_during_completion_wait_prevents_final_publication(direct):
+    cancel = threading.Event()
+    decision = ControlledDecision(completion=CompletionDecision("finalize", .98))
+    turns = [[tool_call()]] if direct else [[tool_call()], [text("等待检查的草稿")]]
+    model = ScriptedModel(*turns)
+    instance, events, lookup = executor(model, decision, cancel_event=cancel)
+    if direct:
+        lookup.execute = lambda params: direct_answer("等待检查的草稿")
+
+    def resolve(wait_seconds=0):
+        cancel.set()
+        return decision.completion
+
+    decision.resolve_completion = resolve
+    response = instance.run_stream("查询")
+    assert streamed_text(events) == ""
+    assert "等待检查的草稿" not in response
+    assert "等待检查的草稿" not in history_text(instance.messages)
+    assert not any(event["data"].get("direct_final_answer") for event in events)
+    assert events[-1]["data"]["cancelled"] is True
+    assert decision.closed
+    assert_tool_chain(instance.messages, ["call_1"])
+    assert not any(event["type"] == "decision_completion" for event in events)
+
+
+def test_steer_during_direct_tool_execution_invalidates_completion():
+    inbox = SteerInbox()
+    decision = ControlledDecision("tools", "旧任务的技能建议",
+                                  completion=CompletionDecision("continue", .98))
+    model = ScriptedModel([tool_call()], [text("新目标答复")])
+    instance, events, lookup = executor(model, decision, steer_inbox=inbox)
+
+    def execute(params):
+        assert inbox.submit("新的目标").accepted
+        return direct_answer("旧目标现成答复")
+
+    lookup.execute = execute
+    assert instance.run_stream("旧目标") == "新目标答复"
+    assert decision.invalidated
+    assert decision.completion_resolves == 0
+    assert "旧目标现成答复" not in history_text(instance.messages)
+    assert "旧任务的技能建议" not in model.requests[1].system
+    assert "新的目标" in history_text(instance.messages)
+    assert inbox.submit("完成后的指令").accepted is False
+    assert_tool_chain(instance.messages, ["call_1"])
+
+
+@pytest.mark.parametrize("verdict", ["continue", "finalize"])
+def test_steer_during_direct_completion_wait_discards_previous_goal(verdict):
+    inbox = SteerInbox()
+    decision = ControlledDecision("tools", "旧任务的技能建议",
+                                  completion=CompletionDecision(verdict, .98))
+    model = ScriptedModel([tool_call()], [text("追加指令后的答复")])
+    instance, events, lookup = executor(model, decision, steer_inbox=inbox)
+    lookup.execute = lambda params: direct_answer("旧目标现成答复")
+
+    def resolve(wait_seconds=0):
+        assert inbox.submit("新的目标").accepted
+        return decision.completion
+
+    decision.resolve_completion = resolve
+    assert instance.run_stream("旧目标") == "追加指令后的答复"
+    assert decision.invalidated
+    assert "旧目标现成答复" not in history_text(instance.messages)
+    assert "旧任务的技能建议" not in model.requests[1].system
+    assert "内部完成复核" not in model.requests[1].system
+    assert not any(event["data"].get("direct_final_answer") for event in events)
+    assert_tool_chain(instance.messages, ["call_1"])
+    assert not any(event["type"] == "decision_completion" for event in events)
+    assert instance._decision_corrections == 0
+
+
+@pytest.mark.parametrize("direct", [False, True])
+def test_finish_at_last_allowed_step_does_not_overwrite_reply_with_summary(direct):
+    model = ScriptedModel([tool_call()] if direct else [text("最后一步的答复")])
+    instance, events, lookup = executor(model)
+    instance.max_turns = 1
+    if direct:
+        lookup.execute = lambda params: direct_answer("最后一步的答复")
+    assert instance.run_stream("查询") == "最后一步的答复"
+    assert len(model.requests) == 1
+    assert events[-1]["data"]["final_response"] == "最后一步的答复"
+    if direct:
+        assert_tool_chain(instance.messages, ["call_1"])
+
+
+def test_direct_completion_continue_at_step_limit_requests_progress_summary():
+    decision = ControlledDecision(completion=CompletionDecision("continue", .98))
+    model = ScriptedModel([tool_call()], [text("步数已用尽，仍缺少验证")])
+    instance, events, lookup = executor(model, decision)
+    instance.max_turns = 1
+    lookup.execute = lambda params: direct_answer("遗漏验证的现成答复")
+    assert instance.run_stream("查询并验证") == "步数已用尽，仍缺少验证"
+    assert decision.completion_resolves == 1
+    assert len(model.requests) == 2
+    assert "内部完成复核" in model.requests[1].system
+    assert "遗漏验证的现成答复" not in history_text(instance.messages)
+    assert not any(event["data"].get("direct_final_answer") for event in events)
+    assert_tool_chain(instance.messages, ["call_1"])
+
+
 def test_agent_starts_decision_before_context_and_passes_run_filter(monkeypatch):
     import config
 

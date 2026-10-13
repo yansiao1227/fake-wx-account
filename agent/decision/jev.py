@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import os
 from collections.abc import Mapping
@@ -43,17 +44,35 @@ def _key(value: Any) -> str:
 
 
 def _endpoint(api_base: str) -> str:
-    """保留网关前缀；移除 OpenAI 兼容 /v1，避免拼接重复。"""
-    parsed = urlsplit(_text(api_base))
+    """仅允许 HTTPS 或本机 HTTP；保留网关前缀并移除兼容 /v1。"""
+    api_base = _text(api_base)
+    # urlsplit 会默默移除换行和制表符，避免带控制字符的配置被改写后发送。
+    if any(ord(char) < 32 or ord(char) == 127 for char in api_base):
+        raise JevError("configuration")
+    try:
+        parsed = urlsplit(api_base)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        raise JevError("configuration") from None
     if (
         parsed.scheme not in {"https", "http"}
-        or not parsed.netloc
+        or not hostname
+        or port == 0
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
     ):
         raise JevError("configuration")
+    if parsed.scheme == "http" and hostname != "localhost":
+        try:
+            # 不解析 DNS：只有明确的回环 IP 可以使用明文连接。
+            local_address = ipaddress.ip_address(hostname)
+        except ValueError:
+            raise JevError("configuration") from None
+        if not local_address.is_loopback or "%" in hostname:
+            raise JevError("configuration")
     path = parsed.path.rstrip("/")
     if path.endswith(_ENDPOINT):
         pass

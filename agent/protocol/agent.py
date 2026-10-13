@@ -442,6 +442,10 @@ class Agent:
         settings = conf().get("agent_decision", {})
         if isinstance(settings, dict) and settings.get("enabled", False):
             try:
+                # 技能快照必须来自本轮磁盘配置，不能预读上轮缓存的旧正文
+                # 或已删除、禁用的技能；其余上下文准备仍与 Jev 并行。
+                if self.skill_manager:
+                    self.skill_manager.refresh_skills()
                 from agent.decision.runtime import DecisionRun
                 decision_run = DecisionRun.start(
                     user_message, self.tools, self.skill_manager, messages_copy,
