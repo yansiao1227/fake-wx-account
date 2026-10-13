@@ -109,24 +109,35 @@ _VIDEO_CANVAS_JS = """(v, args) => {
 }"""
 
 _VIDEO_RESTORE_JS = """(v, args) => new Promise(resolve => {
-    let finished = false, timer;
-    const finish = () => {
-        if (finished) return; finished = true; clearTimeout(timer);
-        v.removeEventListener('seeked', finish);
-        if (!v.isConnected || location.href !== args.url || v.currentSrc !== args.currentSrc ||
-            v.getAttribute('src') !== args.srcAttribute || !Number.isFinite(v.duration) ||
-            Math.abs(v.duration - args.duration) > args.durationTolerance) {
-            resolve(false); return;
+    let restoring = false, finished = false, timer;
+    const sameSource = () => v.isConnected && location.href === args.url &&
+        v.currentSrc === args.currentSrc && v.getAttribute('src') === args.srcAttribute &&
+        Number.isFinite(v.duration) && Math.abs(v.duration - args.duration) <= args.durationTolerance;
+    const finish = value => {
+        if (finished) return;
+        finished = true; clearTimeout(timer);
+        v.removeEventListener('seeked', restore); resolve(value);
+    };
+    const restore = async () => {
+        if (restoring || finished) return;
+        restoring = true; v.removeEventListener('seeked', restore);
+        try {
+            if (!sameSource()) { finish(false); return; }
+            v.muted = args.muted;
+            if (args.paused) v.pause();
+            else await v.play();
+            finish(sameSource() && Math.abs(v.currentTime - args.currentTime) <= 0.25 &&
+                !v.seeking && v.paused === args.paused && v.muted === args.muted);
+        } catch (_) {
+            finish(false);
         }
-        v.muted = args.muted;
-        if (args.paused) v.pause();
-        else { try { const p = v.play(); if (p) p.catch(() => {}); } catch (_) {} }
-        resolve(Math.abs(v.currentTime - args.currentTime) <= 0.25 && !v.seeking);
     };
     v.pause(); v.muted = true;
-    timer = setTimeout(finish, args.timeout);
-    v.addEventListener('seeked', finish);
-    try { v.currentTime = args.currentTime; if (!v.seeking) finish(); } catch (_) { finish(); }
+    // Bound both seeking and the asynchronous play() result with one timer.
+    timer = setTimeout(() => { restore(); finish(false); }, args.timeout);
+    v.addEventListener('seeked', restore);
+    try { v.currentTime = args.currentTime; if (!v.seeking) restore(); }
+    catch (_) { restore(); finish(false); }
 })"""
 
 try:
@@ -1421,7 +1432,7 @@ class BrowserService:
                     result["reading_status"] = "unavailable"
                     result["error"] = "视频页面或来源发生变化，未返回画面；勿循环重试"
                 if result.get("restored") is False:
-                    limitation += "；未能确认播放位置恢复"
+                    limitation += "；未能确认播放位置和播放状态恢复"
             if video is not None:
                 try:
                     video.dispose()

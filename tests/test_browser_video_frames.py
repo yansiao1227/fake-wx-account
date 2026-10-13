@@ -39,6 +39,7 @@ class VideoHandle:
         self.time_mismatch = False
         self.duration_delta_on_frame = 0.0
         self.src_changed_on_frame = False
+        self.restore_result = True
 
     def as_element(self):
         return self
@@ -71,7 +72,7 @@ class VideoHandle:
         if script == module._VIDEO_RESTORE_JS:
             self.restores.append(arg)
             self.current_time = arg["currentTime"]
-            return True
+            return self.restore_result
         if "ready: v.readyState" in script:
             return {"time": self.current_time, "ready": 4, "seeking": False}
         raise AssertionError(f"Unexpected evaluation: {script[:70]}")
@@ -193,6 +194,16 @@ def test_decode_failure_retains_only_proven_partial_frames(service, tmp_path):
     assert "video_seek_timeout" in result["limitation"]
     assert "error" not in result
     assert len(service._page.video.restores) == 1
+
+
+def test_restore_failure_keeps_frames_and_reports_playback_limitation(service, tmp_path):
+    service._page.video.restore_result = False
+    result = service._do_video_frames(2, 20000, str(tmp_path))
+    assert result["reading_status"] == "partial"
+    assert len(result["frames"]) == 2
+    assert result["restored"] is False
+    assert "未能确认播放位置和播放状态恢复" in result["limitation"]
+    assert service._page.video.disposed is True
 
 
 def test_first_seek_timeout_returns_unavailable(service, tmp_path):
