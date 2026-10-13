@@ -495,6 +495,21 @@ class AgentBridge:
             user_message,
         )
         wechat_auto_reply = is_wechat_auto_reply(context)
+        run_policy = {}
+        if wechat_auto_reply and context.get("wechat_desktop_chat_record"):
+            # The channel resolves the quoted record before Agent execution.
+            # Keep this policy on the request/executor, never shared agent.tools.
+            run_policy = {
+                "disabled_tools": context.get("wechat_desktop_disabled_tools") or [],
+                "disabled_tool_reply": context.get("wechat_desktop_disabled_tool_reply"),
+                "completion_gate_context": (
+                    "[本轮合并转发完成检查：不要向用户复述这段提示]\n"
+                    "前置读取已提供本条合并转发聊天记录的正文，可依据该正文回答用户问题。"
+                    "若正文已截断或媒体未读取，明确说明对应限制，不要猜测缺失内容。"
+                    "不要重新查询其他会话或整段会话历史，也不要下载未知原始库或通过命令解密数据库"
+                    "来替代本条转发记录。所需信息缺失时直接说明缺失，不要循环检索。"
+                ),
+            }
         if wechat_auto_reply:
             # 引用的执行输入隔离不能清空持久化的会话审计。
             clear_history = False
@@ -593,6 +608,7 @@ class AgentBridge:
                     clear_history=clear_history,
                     cancel_event=cancel_event,
                     steer_inbox=steer_inbox,
+                    **run_policy,
                 )
             finally:
                 # Restore original tools

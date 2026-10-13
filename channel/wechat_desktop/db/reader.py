@@ -13,16 +13,24 @@ import threading
 import time
 import uuid
 from contextlib import ExitStack
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from xml.etree import ElementTree
 
 from channel.wechat_desktop.contracts import ConversationTarget
+from channel.wechat_desktop.db.chat_records import (
+    ChatRecordBudget, app_node, empty_chat_record, parse_chat_record,
+)
 from channel.wechat_desktop.db.errors import DatabaseReadError
+from channel.wechat_desktop.db.file_materialization import (
+    ReferenceFileSnapshot, file_path_transition_matches,
+)
 from channel.wechat_desktop.db.types import SourceBatch, SourceCheckpoint, SourceRecord
 from channel.wechat_desktop.models import (
     ReplyTaskMetadata, WechatDesktopEvent, WechatHistoryMessage, WechatHistoryReadResult,
 )
+from channel.wechat_desktop.references import chat_record_ready, is_chat_record_title
 
 
 def _quote(identifier: str) -> str:
@@ -499,15 +507,8 @@ class WechatDatabaseReader:
                 49: "app_message", 50: "voip", 10000: "system", 11000: "sticker"}.get(
                     _integer(row["local_type"]) & 0xFFFFFFFF, "unsupported")
 
-    @staticmethod
-    def _app_node(content):
-        if not content.lstrip().startswith("<"):
-            return None
-        try:
-            root = ElementTree.fromstring(content)
-        except ElementTree.ParseError:
-            return None
-        return root if root.tag == "appmsg" else root.find(".//appmsg")
+    def _app_node(self, content, *, budget=None):
+        return app_node(content, budget or ChatRecordBudget.from_config(self.config))
 
     @staticmethod
     def _share_metadata(app):
@@ -516,26 +517,48 @@ class WechatDatabaseReader:
                 "description": app.findtext("des") or "",
                 "platform": app.findtext("appname") or app.findtext("sourcedisplayname") or ""}
 
-    def _parse_reference(self, quoted):
+    def _parse_reference(self, quoted, *, budget=None):
+        budget = budget or ChatRecordBudget.from_config(self.config)
         content = quoted.findtext("content") or ""
-        kind = self._message_kind({"local_type": quoted.findtext("type")})
-        app = self._app_node(content) if kind == "app_message" else None
-        metadata = {}
+        native_type = _integer(quoted.findtext("type"))
+        native_app_type = native_type >> 32
+        kind = self._message_kind({"local_type": native_type})
+        app = self._app_node(content, budget=budget) if kind == "app_message" else None
+        metadata = {"native_app_type": native_app_type} if kind == "app_message" and native_app_type else {}
         if app is not None:
-            kind = {57: "text", 5: "share_card", 6: "file"}.get(
-                _integer(app.findtext("type")), "app_message")
+            subtype = _integer(app.findtext("type"))
+            metadata["native_app_type"] = subtype
+            # type 4 是视频分享卡片；和网页分享一样仅提供原生 URL，媒体正文另行读取。
+            kind = {57: "text", 4: "share_card", 5: "share_card", 6: "file", 19: "chat_record"}.get(subtype, "app_message")
             content = app.findtext("title") or ("" if kind == "text" else f"[{kind}]")
             if kind == "share_card":
-                metadata = self._share_metadata(app)
+                metadata.update(self._share_metadata(app))
+            elif kind == "chat_record":
+                metadata["chat_record"] = parse_chat_record(app, budget)
+                content = metadata["chat_record"]["title"]
+        elif (kind == "app_message" and native_app_type in {0, 19} and
+              is_chat_record_title(content)):
+            kind = "chat_record"
+            metadata["chat_record"] = empty_chat_record(content, budget=budget)
+            content = metadata["chat_record"]["title"]
+        elif kind == "app_message" and native_app_type == 19:
+            kind, content = "chat_record", "[聊天记录]"
+            metadata["chat_record"] = empty_chat_record(content, status="invalid" if budget.invalid else "unavailable",
+                                                       truncated=budget.truncated, budget=budget)
+        elif kind == "app_message" and content.lstrip().startswith("<"):
+            # 不猜失效/不支持 XML 的应用子类型，也不把原 XML 留给 Agent 重试解析。
+            content = "[应用消息正文不可用]"
+            metadata["native_xml_status"] = "invalid" if budget.invalid else "unavailable"
         elif kind in {"image", "voice", "video", "sticker", "location"}:
             content = {"image": "[图片]", "voice": "[语音]", "video": "[视频]",
                        "sticker": "[动画表情]", "location": "[位置]"}[kind]
-        resolved = kind == "text" and bool(content.strip())
+        resolved = (kind == "text" and bool(content.strip()) or
+                    kind == "chat_record" and chat_record_ready(metadata.get("chat_record")))
         return {"sender_name": quoted.findtext("displayname") or "",
                 "sender_id": quoted.findtext("chatusr") or quoted.findtext("fromusr") or "",
                 "content": content, "content_type": kind,
                 "source_message_id": quoted.findtext("svrid") or "", "depth": 1,
-                "native_type": _integer(quoted.findtext("type")) & 0xFFFFFFFF,
+                "native_type": native_type & 0xFFFFFFFF,
                 "resolved": resolved, "degraded": not resolved, "strategy": "database", **metadata}
 
     @staticmethod
@@ -623,18 +646,32 @@ class WechatDatabaseReader:
         reference.setdefault("preview_content", reference.get("content", ""))
         kind = origin.content_type
         reference["content_type"] = kind
+        if origin.attachment_status == "native_xml_unavailable":
+            reference["content"] = origin.content
+            reference["native_xml_status"] = "unavailable"
+            reference.update(resolved=False, degraded=True)
+        else:
+            reference.pop("native_xml_status", None)
+            if event.attachment_status == "native_xml_unavailable":
+                event.attachment_status = ""
         if kind == "text":
             reference["content"] = origin.content
             reference.update(resolved=bool(origin.content.strip()), degraded=not bool(origin.content.strip()))
         elif (kind == "file" and not origin.content.lstrip().startswith("<") and
-              reference.get("content") in {None, "", "[file]", "[app_message]"}):
+              reference.get("content") in {None, "", "[file]", "[app_message]", "[应用消息正文不可用]"}):
             reference["content"] = origin.content
         elif kind == "share_card":
             for key, value in origin.share_card.items():
                 if value and not reference.get(key):
                     reference[key] = value
-            if reference.get("content") in {None, "", "[share_card]", "[app_message]"}:
+            if reference.get("content") in {None, "", "[share_card]", "[app_message]", "[应用消息正文不可用]"}:
                 reference["content"] = origin.share_card.get("title") or reference.get("content", "")
+        elif kind == "chat_record":
+            reference["content"] = origin.content
+            reference["chat_record"] = deepcopy(origin.chat_record)
+            reference["native_app_type"] = 19
+            resolved = chat_record_ready(origin.chat_record)
+            reference.update(resolved=resolved, degraded=not resolved)
         if not reference.get("sender_name"):
             reference["sender_name"] = origin.sender_name
         reference.update(
@@ -820,7 +857,7 @@ class WechatDatabaseReader:
                             "content_signature": previous.content_signature,
                             "source": "wechat_database",
                     }
-                    evidence = replace(previous, content="", history=[], reference={}, share_card={},
+                    evidence = replace(previous, content="", history=[], reference={}, share_card={}, chat_record={},
                                        task=ReplyTaskMetadata())
                     for target in eligible:
                         windows[target.source_message_id].append((order, item, evidence))
@@ -911,18 +948,34 @@ class WechatDatabaseReader:
         if direction == "outgoing" and not include_filtered:
             return SourceRecord(stream.stream_id, local_id, source_id, filter_reason="outgoing_message", receipt_phase=phase)
         content_signature = self._native_payload_signature(row, native_content, sender, direction)
-        reference, share_card = {}, {}
+        reference, share_card, chat_record = {}, {}, {}
+        attachment_status = ""
         if kind == "app_message":
-            app = self._app_node(content)
+            budget = ChatRecordBudget.from_config(self.config)
+            app = self._app_node(content, budget=budget)
             if app is not None:
                 subtype = _integer(app.findtext("type"))
                 content = app.findtext("title") or content
-                kind = {57: "text", 5: "share_card", 6: "file"}.get(subtype, "app_message")
+                kind = {57: "text", 4: "share_card", 5: "share_card", 6: "file", 19: "chat_record"}.get(subtype, "app_message")
                 if kind == "share_card":
                     share_card = self._share_metadata(app)
-                quoted = app.find("refermsg")
+                elif kind == "chat_record":
+                    chat_record = parse_chat_record(app, budget)
+                    content = chat_record["title"]
+                quoted = app.find("refermsg") if subtype == 57 else None
                 if quoted is not None:
-                    reference = self._parse_reference(quoted)
+                    reference = self._parse_reference(quoted, budget=budget)
+            elif ((_integer(row["local_type"]) >> 32) == 19 or
+                  (_integer(row["local_type"]) >> 32) == 0 and is_chat_record_title(content)):
+                kind = "chat_record"
+                content = content if is_chat_record_title(content) else "[聊天记录]"
+                chat_record = empty_chat_record(content, status="invalid" if budget.invalid else "unavailable",
+                                                truncated=budget.truncated, budget=budget)
+                content = chat_record["title"]
+            elif content.lstrip().startswith("<"):
+                # 签名已由完整 native_content 生成；显示正文不再暴露失效原 XML。
+                content = "[应用消息正文不可用]"
+                attachment_status = "native_xml_unavailable"
         at_users = set()
         for raw in (row["source"], row["packed_info_data"]):
             # msgsource may be wrapped in a binary protobuf field. Inspect only its XML island.
@@ -947,6 +1000,7 @@ class WechatDatabaseReader:
             content=content or f"[{kind}]", direction=direction, is_group=is_group,
             is_at=is_group and (self.owner_wxid in at_users or "notify@all" in at_users),
             source_type="group" if is_group else "private", reference=reference, share_card=share_card,
+            chat_record=chat_record, attachment_status=attachment_status,
             message_stable_id=source_id, target_key=source_id, event_id="db-message:" + source_id,
             content_signature=content_signature,
             account_id=self.account_id, source_stream_id=stream.stream_id, source_message_id=source_id,
@@ -1017,6 +1071,133 @@ class WechatDatabaseReader:
             self._backlog = backlog
             self._idle_poll_signature = signature if not records else None
             return SourceBatch(self.account_id, uuid.uuid4().hex, tuple(records), tuple(advances)) if records else None
+
+    @staticmethod
+    def _file_event_proof(event):
+        return tuple(getattr(event, key) for key in (
+            "account_id", "conversation_id", "source_stream_id", "source_local_id",
+            "source_message_id", "content_signature", "sender_id", "direction",
+            "source_type", "is_group", "content_type", "native_timestamp", "content",
+        ))
+
+    @staticmethod
+    def _file_reference_proof(event):
+        return tuple(event.reference.get(key) for key in (
+            "source_account_id", "source_stream_id", "source_local_id",
+            "source_native_message_id", "source_generation", "content_signature",
+            "source_sender_id", "source_direction", "source_content_type",
+            "native_timestamp", "source_message_id", "sender_id", "native_type",
+            "content_type", "content", "title", "preview_content", "native_app_type", "url",
+        ))
+
+    @staticmethod
+    def _file_stream_proof(stream):
+        return (stream.stream_id, stream.database, stream.table, stream.talker,
+                stream.generation, tuple(sorted(stream.columns.items())))
+
+    def _reference_file_rows(self, event):
+        """调用者持有锁；读取所有原生列，未知列的变化也不能放行。"""
+        current_stream = self._streams.get(event.source_stream_id)
+        if current_stream is None or event.reference.get("content_type") != "file":
+            raise DatabaseReadError("reference_file_snapshot_unavailable", "没有可信的引用文件来源")
+        with ExitStack() as stack:
+            databases = {item.database for item in self._streams.values()
+                         if item.talker == current_stream.talker}
+            connections = {database: stack.enter_context(self.caches[database].read())
+                           for database in sorted(databases)}
+            candidate = self._reference_origin(event, connections, {})
+            if candidate is None:
+                raise DatabaseReadError("reference_source_unavailable", "引用文件来源不可用")
+            origin_stream, origin = candidate
+            connection = connections[origin_stream.database]
+            connection.row_factory = sqlite3.Row
+            origin_row = connection.execute(
+                f"SELECT * FROM {_quote(origin_stream.table)} WHERE local_id=? LIMIT 1",
+                (origin.source_local_id,)).fetchone()
+            connection = connections[current_stream.database]
+            connection.row_factory = sqlite3.Row
+            event_row = connection.execute(
+                f"SELECT * FROM {_quote(current_stream.table)} WHERE local_id=? LIMIT 1",
+                (event.source_local_id,)).fetchone()
+            if origin_row is None or event_row is None:
+                raise DatabaseReadError("reference_source_unavailable", "引用文件来源不可用")
+            origin_row, event_row = dict(origin_row), dict(event_row)
+            # 不从提取后的同名标题推断类型，必须是原生 type 49 / appmsg 6。
+            type_column = _column(origin_stream.columns, "local_type", "type")
+            message_column = _column(origin_stream.columns, "message_content", "content")
+            compressed_column = _column(origin_stream.columns, "compress_content")
+            try:
+                content = _text(origin_row.get(message_column), strict=True)
+            except DatabaseReadError:
+                content = _text(origin_row.get(compressed_column), strict=True)
+            if not content:
+                content = _text(origin_row.get(compressed_column), strict=True)
+            app = self._app_node(content)
+            packed_column = _column(origin_stream.columns, "packed_info_data", "packed_info")
+            if (origin.content_type != "file" or _integer(origin_row.get(type_column)) & 0xFFFFFFFF != 49 or
+                    app is None or _integer(app.findtext("type")) != 6 or not packed_column):
+                raise DatabaseReadError("reference_file_snapshot_unavailable", "没有可信的引用文件来源")
+            filename = app.findtext("title") or ""
+            if not filename:
+                raise DatabaseReadError("reference_file_snapshot_unavailable", "引用文件缺少原生文件名")
+            return current_stream, origin_stream, event_row, origin_row, origin, packed_column, filename
+
+    def snapshot_reference_file(self, event):
+        """在已验证原卡片 SaveAs 前取得一次性的原生内存凭据。"""
+        with self._lock:
+            valid, reason = self.validate_native_event(event)
+            if not valid:
+                raise DatabaseReadError(reason, "引用文件来源已变化，暂停处理")
+            own, origin, own_row, origin_row, _, packed_column, filename = self._reference_file_rows(event)
+            return ReferenceFileSnapshot(
+                self, event, self._file_event_proof(event), self._file_reference_proof(event),
+                self._file_stream_proof(own), self._file_stream_proof(origin),
+                own_row, origin_row, packed_column, filename,
+            )
+
+    def accept_reference_file_materialization(self, event, before_snapshot, saved_path):
+        """接受本次 SaveAs 的唯一原生路径变化，然后恢复完整来源校验。
+
+        UIA 必须把已验证原卡片实际另存为返回的路径交给此方法。凭据只可
+        用一次，不能用于其他事件，也不允许通过文件名缓存补造许可。
+        """
+        with self._lock:
+            if (not isinstance(before_snapshot, ReferenceFileSnapshot) or
+                    before_snapshot.owner is not self or before_snapshot.event is not event):
+                return False, "reference_file_materialization_identity_mismatch"
+            if before_snapshot.consumed:
+                return False, "reference_file_materialization_consumed"
+            before_snapshot.consumed = True
+            if (self._file_event_proof(event) != before_snapshot.event_proof or
+                    self._file_reference_proof(event) != before_snapshot.reference_proof):
+                return False, "reference_file_materialization_identity_mismatch"
+            valid, reason = self.validate_native_event(event)
+            if not valid and reason != "reference_source_changed":
+                return False, reason
+            try:
+                own, origin, own_row, origin_row, current, packed_column, filename = self._reference_file_rows(event)
+            except DatabaseReadError as exc:
+                return False, exc.code
+            if (self._file_stream_proof(own) != before_snapshot.event_stream or
+                    self._file_stream_proof(origin) != before_snapshot.origin_stream or
+                    packed_column != before_snapshot.packed_column or filename != before_snapshot.filename):
+                return False, "reference_file_materialization_identity_mismatch"
+            if own_row != before_snapshot.event_row:
+                return False, "source_message_changed"
+            if (origin_row.keys() != before_snapshot.origin_row.keys() or
+                    any(value != before_snapshot.origin_row[key] for key, value in origin_row.items()
+                        if key != packed_column)):
+                return False, "reference_source_changed"
+            if not file_path_transition_matches(before_snapshot.origin_row[packed_column],
+                                                origin_row[packed_column], saved_path, filename):
+                return False, "reference_file_materialization_invalid"
+            # 用复制事件再次执行原有完整校验；成功后仅替换这个引用的摘要。
+            updated_reference = {**event.reference, "content_signature": current.content_signature}
+            valid, reason = self.validate_native_event(replace(event, reference=updated_reference))
+            if not valid:
+                return False, reason
+            event.reference["content_signature"] = current.content_signature
+            return True, ""
 
     def validate_native_event(self, event, checkpoint=None):
         """复核原生行，撤回、删除或替换的消息不能继续沿用旧回复任务。"""

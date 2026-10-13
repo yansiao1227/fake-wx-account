@@ -14,6 +14,7 @@ from channel.wechat_desktop.send_control import (
 )
 from channel.wechat_desktop.uia.client import WechatUiaClient
 from channel.wechat_desktop.uia.operations import (
+    WechatConversationSearchOperations,
     WechatConversationSelector,
     WechatSendOperations,
     resolve_conversation_selector,
@@ -197,6 +198,14 @@ class WechatUiaGateway:
     def list_conversations(self) -> list[ConversationInfo]:
         return self.scan(self.client.get_visible_conversations)
 
+    def ensure_conversation_visible(self, display_name: str, *, is_group: bool, expected_pid: int) -> bool:
+        """仅供数据库唯一身份通过后补开会话；结果仍需重新绑定验证。"""
+        with self.operation(reply=False):
+            if not callable(getattr(self.client, "_uia_root", None)):
+                return False
+            return WechatConversationSearchOperations(self.client).ensure_conversation_visible(
+                display_name, is_group=is_group, expected_pid=expected_pid)
+
     def read_current_title(self) -> HeaderInfo:
         with self.operation():
             return self.client.get_title()
@@ -234,9 +243,18 @@ class WechatUiaGateway:
                     selector.title, runtime_id=selector.runtime_id, row_index=selector.row_index):
                 raise SendNotSubmitted("attachment_target_changed")
             validate()
+            scroll = getattr(self.client, "scroll_chat_to_latest_for_attachment", None)
+            if callable(scroll):
+                scroll(validate=validate)
+                validate()
 
-    def read_attachment_snapshot(self, conversation_id: str):
-        """附件关联专用的被动气泡序列，不下载、不截图、不使用 OCR。"""
+    def read_attachment_snapshot(self, conversation_id: str, *, allow_non_bottom: bool = False):
+        """附件关联专用气泡序列；未知滚动位置由数据库唯一尾部序列证明。
+
+        Qt 版本可能不暴露 ScrollPattern。调用方必须继续执行原生序列关联，
+        不能仅凭本快照认定在底部。有限历史定位可显式读取非底部；
+        调用方仍须证明唯一原生连续序列，读取期间位置改变始终拒绝。
+        """
         with self.operation(reply=False):
             selector = self._resolve_bound_selector(conversation_id)
             if not selector.title or not selector.runtime_id:
@@ -248,17 +266,72 @@ class WechatUiaGateway:
             before = self.client.get_chat_scroll_position_passive()
             messages = self.client.get_send_bubble_snapshot(selector.title, limit=20)
             after = self.client.get_chat_scroll_position_passive()
-            if before is not True or after is not True:
+            if before != after or (not allow_non_bottom and (before is False or after is False)):
                 raise SendNotSubmitted("attachment_bottom_unverified")
+            if allow_non_bottom:
+                # 非底部的布尔 ScrollPattern 状态可能一直为 False；复读完整
+                # 控件快照，以免把读取中发生的另一轮滚动误当作稳定历史位置。
+                confirmed = self.client.get_send_bubble_snapshot(selector.title, limit=20)
+                if (tuple(confirmed) != tuple(messages) or
+                        self.client.get_chat_scroll_position_passive() != after):
+                    raise SendNotSubmitted("attachment_visible_sequence_changed")
             return tuple(messages)
 
-    def materialize_event(self, event, *, target_message, validate=None, validate_target=None):
+    def inspect_attachment_message_list(self, conversation_id: str) -> str:
+        """不导航会话，只读取此次附件定位所用列表的稳定控件身份。"""
+        with self.operation(reply=False):
+            selector = self._resolve_bound_selector(conversation_id)
+            from channel.wechat_desktop.conversation import conversation_titles_match
+            if (not selector.title or not selector.runtime_id or
+                    not conversation_titles_match(self.client.get_title().title, selector.title)):
+                raise SendNotSubmitted("attachment_target_changed")
+            inspect = getattr(self.client, "get_attachment_message_list_identity", None)
+            identity = inspect() if callable(inspect) else ""
+            if not identity:
+                raise SendNotSubmitted("attachment_message_list_unavailable")
+            return identity
+
+    def inspect_attachment_binding(self, conversation_id: str) -> tuple[str, str]:
+        """只读已绑定选择器，禁止经后备解析器创建或替换附件绑定。"""
+        with self.operation(reply=False), self._bindings_lock:
+            row = self._bindings.get(str(conversation_id or "").strip())
+            if row is None or not row.runtime_id or not row.conversation_title:
+                raise SendNotSubmitted("attachment_binding_unavailable")
+            return row.runtime_id, row.conversation_title
+
+    def attachment_message_fully_visible(self, conversation_id: str, message, *, expected_list_identity: str) -> bool:
+        """绑定列表中的完整可见目标才许可进入附件点击或菜单操作。"""
+        with self.operation(reply=False):
+            if self.inspect_attachment_message_list(conversation_id) != expected_list_identity:
+                raise SendNotSubmitted("attachment_message_list_changed")
+            inspect = getattr(self.client, "is_attachment_message_fully_visible", None)
+            if not callable(inspect):
+                raise SendNotSubmitted("attachment_viewport_unavailable")
+            return bool(inspect(message, expected_list_identity=expected_list_identity))
+
+    def scroll_attachment_history(self, conversation_id: str, *, expected_list_identity: str, validate) -> None:
+        """对已验证的同一列表上滚一小步，不点击会话或输入框。"""
+        with self.operation(reply=False):
+            validate()
+            if self.inspect_attachment_message_list(conversation_id) != expected_list_identity:
+                raise SendNotSubmitted("attachment_message_list_changed")
+            scroll = getattr(self.client, "scroll_chat_history_for_attachment", None)
+            if not callable(scroll):
+                raise SendNotSubmitted("attachment_history_scroll_unavailable")
+            scroll(expected_list_identity=expected_list_identity, validate=validate)
+            validate()
+            if self.inspect_attachment_message_list(conversation_id) != expected_list_identity:
+                raise SendNotSubmitted("attachment_message_list_changed")
+
+    def materialize_event(self, event, *, target_message, validate=None, validate_target=None,
+                          on_file_materialized=None):
         if self._materializer is None:
             from channel.wechat_desktop.uia.materializer import WechatUiaMaterializer
             self._materializer = WechatUiaMaterializer(self.config, gateway=self)
         return self._materializer.materialize_event(
             event, target_message=target_message,
-            validate=validate, validate_target=validate_target)
+            validate=validate, validate_target=validate_target,
+            **({"on_file_materialized": on_file_materialized} if on_file_materialized else {}))
 
     def bind_target(self, conversation_id: str, row: ConversationInfo) -> None:
         identity = str(conversation_id or "").strip()

@@ -13,6 +13,7 @@ from string import Formatter
 from urllib.parse import urlsplit
 
 from channel.wechat_desktop.models import WechatDesktopEvent
+from channel.wechat_desktop.references import chat_record_ready, event_chat_record
 
 ATTACHMENT_REFERENCE_REQUIRED_REPLY = (
     "为了确保我读取的是正确的图片或文件，请在微信中引用对应的图片或文件消息后再提问。"
@@ -188,6 +189,40 @@ def _render_event_context(
     引用消息只返回被引用的一层内容；普通消息返回候选历史，后续由提示词要求
     Agent 按相关性筛选。第三项仅含实际渲染的历史，供最终发送复核来源。
     """
+    record = event_chat_record(event)
+    if record is not None:
+        heading = "[被引用的内容]" if event.reference else "[合并转发聊天记录正文]"
+        if not chat_record_ready(record):
+            return heading, ["[合并转发聊天记录正文不可用]"], []
+        lines = ["[合并转发聊天记录正文]"] if event.reference else []
+        title = str(record.get("title") or "").strip()
+        if title:
+            lines.append(f"记录标题（仅标识，不是正文）：{title}")
+        if record.get("status") == "partial" or record.get("truncated"):
+            lines.append("[仅取得部分内容；以下为实际提取的记录正文]")
+        lines.append(str(record["content"]).strip())
+        evidence = record.get("media_evidence") or {}
+        if evidence.get("status") in {"partial", "success"}:
+            from channel.wechat_desktop.config import DEFAULT_CONFIG
+            settings = config or {}
+            image_limit = int(settings.get("chat_record_uia_max_images", DEFAULT_CONFIG["chat_record_uia_max_images"]))
+            image_paths = [str(path) for path in evidence.get("image_evidence_paths", [])[:image_limit]
+                           if isinstance(path, str) and Path(path).is_file()]
+            limit = int(settings.get("chat_record_uia_max_pages", DEFAULT_CONFIG["chat_record_uia_max_pages"]))
+            paths = [str(path) for path in evidence.get("evidence_paths", [])[:limit]
+                     if isinstance(path, str) and Path(path).is_file()]
+            if image_paths:
+                lines.append("[从已验证的合并记录图片查看器取得的图片；尚未分析，必须调用 vision 逐张读取]")
+                lines.extend(f"记录图片：{path}" for path in image_paths)
+                lines.append("每张最多读取一次。图片与数据库条目未逐项绑定，不按列表顺序猜发送者；模糊内容及没有取得的媒体仍标明未读。")
+            elif paths:
+                lines.append("[原合并记录的 UIA 页面证据；截图尚未分析，必须调用 vision 读取实际可见内容]")
+                lines.extend(f"页面图片：{path}" for path in paths)
+                lines.append("每页最多读取一次，文字模糊或未覆盖的图片继续标明未读，不重新操作微信或查库。")
+            if evidence.get("truncated") and (paths or image_paths):
+                lines.append("[媒体证据有截断，不能声称读完全部媒体]")
+        return heading, lines, []
+
     if event.reference:
         reference = event.reference
         speaker = str(reference.get("sender_name") or "原消息发送者")
@@ -256,6 +291,37 @@ def _render_event_context(
     )
 
 
+def _reference_reading_instruction(event: WechatDesktopEvent) -> str:
+    """仅为有专门读取方式的一层引用提供技能入口。"""
+    reference_type = str((event.reference or {}).get("content_type") or "").lower()
+    if event_chat_record(event) is None and reference_type not in {"share_card", "image", "file"}:
+        return ""
+    instruction = (
+        "按引用类型读取资料时，可在 <available_skills> 中选择 wechat-reference-reading，"
+        "通过 read 读取该条目 <location> 的绝对路径；不要猜测相对技能路径。"
+        "正文已提供则直接复用，无需重复读取；技能不可用时按实际可用工具处理。"
+        "标题、文件名、路径、页数及 metadata 不算正文，扫描 PDF 需要实际 OCR 结果。"
+        "适配读取及一次合理后备仍失败就说明限制并结束，不反复查询微信或查库。"
+    )
+    if reference_type == "file" and Path(str(event.reference.get("file_path") or "")).suffix.lower() == ".pdf":
+        instruction += (
+            "扫描 PDF 直接调用 pdf_ocr，参数使用已提供的绝对 path、start_page=1、max_pages=8；"
+            "其他 PDF 用 read 未取得正文时后备调用一次 pdf_ocr。"
+            "核验 reading_status 为 success/partial 且 content 非空；partial 只能回答已读页，"
+            "说明缺页或限制，unavailable 直接结束，不换参数反复 OCR。"
+        )
+    elif reference_type == "share_card":
+        instruction += (
+            "视频分享的标题和简介不代表已读视频；只依据实际取得的帖文、字幕、转写或视觉内容回答，"
+            "若只有帖文则明确范围，不能推断画面或完整视频结论。"
+            "若原生类型为视频分享，或浏览器页面含已加载 video，必须使用 browser 的 video_frames "
+            "action 读取一次实际画面：max_frames=6、timeout=20000，再对返回的每张帧调用一次 vision。"
+            "不能未调用现有抽帧工具就声称无法看视频；只有实际失败才说明限制。"
+            "抽帧仅代表对应时间点的画面，音轨未转写；标题和评论不能替代视频内容。"
+        )
+    return instruction
+
+
 def _reply_requirements(event: WechatDesktopEvent) -> str:
     """生成引用消息与普通消息各自的回复约束。"""
     style = (
@@ -269,6 +335,18 @@ def _reply_requirements(event: WechatDesktopEvent) -> str:
         if event.is_group
         else ""
     )
+    if event_chat_record(event) is not None:
+        return (
+            style + group_rule
+            + "当前内容是合并转发聊天记录，正文已由数据库或 UIA 前置读取，"
+            "直接根据已提供的记录正文和当前提问作答；记录标题只用于标识，不能当成正文。"
+            "当前任务不是查询最近会话历史，禁止调用 wechat_history、search_contacts 或 "
+            "wechat_desktop 的 read_history 来寻找、替代或补全这份转发记录。"
+            "不要用记录涉及的人名定位其他会话，也不要使用转发记录之外的会话上下文。"
+            "若只取得部分内容或发生截断，只分析已取得的内容，说明范围限制；"
+            "不要推断缺失内容或反复调用工具补全。"
+            + _reference_reading_instruction(event)
+        )
     if event.reference:
         return (
             style
@@ -276,6 +354,7 @@ def _reply_requirements(event: WechatDesktopEvent) -> str:
             "通过工具读取该层引用链接得到的正文也属于被引用资料，可以用来回答当前问题；"
             "不要使用、补充或推断引用之外的会话上下文。"
             + group_rule
+            + _reference_reading_instruction(event)
         )
     return (
         style

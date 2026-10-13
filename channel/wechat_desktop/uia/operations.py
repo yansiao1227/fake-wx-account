@@ -8,14 +8,137 @@ from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import unquote
 
+from channel.wechat_desktop.config import DEFAULT_CONFIG
+
 # 保留旧导入路径；标题规则只有通道根模块这一份实现。
 from channel.wechat_desktop.conversation import (
+    conversation_header_matches_target,
     conversation_titles_match,
     strip_member_count_suffix,
 )
 from channel.wechat_desktop.models import ConversationInfo
 from channel.wechat_desktop.contracts import SendResult, SendStatus
-from channel.wechat_desktop.send_control import SendCancelled, SendNotSubmitted
+from channel.wechat_desktop.send_control import SendCancelled, SendNotSubmitted, wait_send_delay
+from channel.wechat_desktop.uia.controls import _runtime_id, _text
+
+
+class WechatConversationSearchOperations:
+    """为唯一数据库联系人有界打开本地搜索结果，不把搜索行当作会话绑定。"""
+
+    def __init__(self, client):
+        self._client = client
+
+    def _require_window(self, hwnd: int, pid: int) -> None:
+        if (int(self._client.get_owner_window_handle()) != hwnd
+                or int(self._client.get_owner_window_process_id()) != pid):
+            raise SendNotSubmitted("conversation_search_window_changed")
+
+    @staticmethod
+    def _require_root(root, hwnd: int, pid: int) -> None:
+        if (int(getattr(root, "NativeWindowHandle", 0)) != hwnd
+                or int(getattr(root, "ProcessId", 0)) != pid):
+            raise SendNotSubmitted("conversation_search_root_unverified")
+
+    def _search_edit(self, root, pid: int):
+        candidates = [control for control in self._client._walk(root)
+                      if _text(getattr(control, "ControlTypeName", "")) == "EditControl"
+                      and _text(getattr(control, "Name", "")) == "搜索"
+                      and int(getattr(control, "ProcessId", 0)) == pid]
+        return candidates[0] if len(candidates) == 1 and _runtime_id(candidates[0]) else None
+
+    def _search_result(self, root, name: str, pid: int):
+        candidates = [control for control in self._client._walk(root)
+                      if _text(getattr(control, "AutomationId", "")) == "search_item_" + name
+                      and _text(getattr(control, "Name", "")) == name
+                      and int(getattr(control, "ProcessId", 0)) == pid]
+        return candidates[0] if len(candidates) == 1 and _runtime_id(candidates[0]) else None
+
+    def _settle(self) -> None:
+        # 固定次数、单次至多一秒；不引入独立的业务默认值或无限重试。
+        delay = max(0, min(int(self._client.config.get(
+            "uia_selection_settle_ms", DEFAULT_CONFIG["uia_selection_settle_ms"])), 1000))
+        wait_send_delay(delay / 1000.0, self._client._stop_event)
+
+    def _clear_own_search(self, name: str, edit_id: str, hwnd: int, pid: int) -> None:
+        """仅清除本次仍持有的查询；不覆盖期间改动的搜索输入。"""
+        self._require_window(hwnd, pid)
+        with self._client._uia_root() as root:
+            self._require_root(root, hwnd, pid)
+            edit = self._search_edit(root, pid)
+            if edit is not None and _runtime_id(edit) == edit_id:
+                pattern = edit.GetValuePattern()
+                if str(pattern.Value or "") == name:
+                    pattern.SetValue("")
+
+    def ensure_conversation_visible(self, display_name: str, *, is_group: bool, expected_pid: int) -> bool:
+        name = str(display_name or "").strip()
+        pid = int(expected_pid or 0)
+        if not name or not isinstance(is_group, bool) or pid <= 0:
+            raise SendNotSubmitted("conversation_search_identity_unverified")
+        hwnd = int(self._client.get_owner_window_handle())
+        self._require_window(hwnd, pid)
+        with self._client.operation_lock:
+            self._client.ensure_foreground_window()
+            self._require_window(hwnd, pid)
+            with self._client._uia_root() as root:
+                self._require_root(root, hwnd, pid)
+                edit = self._search_edit(root, pid)
+                if edit is None:
+                    return False
+                edit_id = _runtime_id(edit)
+                pattern = edit.GetValuePattern()
+                pattern.SetValue(name)
+                if str(pattern.Value or "") != name:
+                    raise SendNotSubmitted("conversation_search_query_unverified")
+            opened = False
+            try:
+                for _ in range(3):
+                    self._settle()
+                    self._require_window(hwnd, pid)
+                    with self._client._uia_root() as root:
+                        self._require_root(root, hwnd, pid)
+                        current_edit = self._search_edit(root, pid)
+                        if (current_edit is None or _runtime_id(current_edit) != edit_id
+                                or str(current_edit.GetValuePattern().Value or "") != name):
+                            raise SendNotSubmitted("conversation_search_query_changed")
+                        result = self._search_result(root, name, pid)
+                        if result is None:
+                            continue
+                        runtime_id = _runtime_id(result)
+                        # 在提交点击前重新读取唯一身份，拒绝运行期间换行。
+                        fresh = self._search_result(root, name, pid)
+                        if fresh is None or _runtime_id(fresh) != runtime_id:
+                            raise SendNotSubmitted("conversation_search_result_changed")
+                        old_cursor = None
+                        try:
+                            import win32api
+                            old_cursor = win32api.GetCursorPos()
+                            click = getattr(self._client, "_click_control_point", None)
+                            if callable(click):
+                                if not click(fresh):
+                                    raise SendNotSubmitted("conversation_search_result_not_clickable")
+                            else:
+                                fresh.Click()
+                        finally:
+                            if old_cursor is not None:
+                                win32api.SetCursorPos(old_cursor)
+                        opened = True
+                        break
+                if not opened:
+                    return False
+                self._settle()
+                self._require_window(hwnd, pid)
+                if not conversation_header_matches_target(
+                        self._client.get_title(), name, is_group=is_group):
+                    raise SendNotSubmitted("conversation_search_header_unverified")
+            finally:
+                self._clear_own_search(name, edit_id, hwnd, pid)
+            self._settle()
+            self._require_window(hwnd, pid)
+            rows = [row for row in self._client.get_visible_conversations()
+                    if (conversation_titles_match(row.conversation_title, name) if is_group
+                        else str(row.conversation_title or "").strip() == name)]
+            return len(rows) == 1 and bool(rows[0].runtime_id)
 
 
 @dataclass(frozen=True)

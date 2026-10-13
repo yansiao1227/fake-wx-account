@@ -171,6 +171,7 @@ class WechatDesktopEvent:
     history: List[Dict[str, Any]] = field(default_factory=list)
     reference: Dict[str, Any] = field(default_factory=dict)
     share_card: Dict[str, Any] = field(default_factory=dict)
+    chat_record: Dict[str, Any] = field(default_factory=dict)
     target_key: str = ""
     message_runtime_id: str = ""
     message_stable_id: str = ""

@@ -65,6 +65,8 @@ def test_native_dialog_cancel_refuses_main_window_and_uses_exact_cancel_control(
     cancel.ControlTypeName = "ButtonControl"
     cancel.GetInvokePattern = lambda: InvokePattern()
     root = GeometryControl((0, 0, 200, 200), "另存为", "#32770", [cancel])
+    root.GetRuntimeId = lambda: (42, 200)
+    cancel.ProcessId = 42
 
     @contextmanager
     def uia_thread():
@@ -79,6 +81,8 @@ def test_native_dialog_cancel_refuses_main_window_and_uses_exact_cancel_control(
         ),
     )
     monkeypatch.setattr(win32gui, "IsWindow", lambda hwnd: hwnd in {100, 200})
+    monkeypatch.setattr(win32gui, "IsWindowVisible", lambda hwnd: True)
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 200)
     monkeypatch.setattr(
         win32gui,
         "GetClassName",
@@ -92,8 +96,29 @@ def test_native_dialog_cancel_refuses_main_window_and_uses_exact_cancel_control(
 
     assert client._try_cancel_verified_native_dialog(100, 100) is False
     assert calls == []
-    assert client._try_cancel_verified_native_dialog(200, 100) is True
+    assert client._try_cancel_verified_native_dialog(
+        200, 100, expected_identity=(42, "WeChatMainWndForPC", "42.200")) is True
     assert calls == ["cancel"]
+
+
+def _mock_verified_image_viewer(monkeypatch, client):
+    """提供实测 Qt 原生类与独立 UIA aid，采集流程仍执行固定身份校验。"""
+    import win32gui
+
+    native = (200, 42, "图片和视频", "Qt51514QWindowIcon")
+    uia = ("mmui::XView", "PreviewWindow_0123456789abcdef0123456789abcdef_0_0")
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 200)
+    monkeypatch.setattr(client._image_viewer, "_native_image_viewer_identity",
+                        lambda hwnd, main: native if hwnd == 200 and main == 100 else None)
+    monkeypatch.setattr(client._image_viewer, "_image_viewer_uia_identity", lambda hwnd: uia)
+
+    def wait(main, before, *, observation, strict_viewer_identity, validate_context=None):
+        assert main == 100 and strict_viewer_identity is True
+        hwnd = client._find_opened_image_viewer(main, before)
+        observation.update(native_identity=native, verified_identity=native, uia_identity=uia)
+        return hwnd
+
+    monkeypatch.setattr(client._image_viewer, "_wait_opened_image_viewer", wait)
 
 
 def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp_path):
@@ -102,6 +127,7 @@ def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp
     from PIL import Image, ImageGrab
 
     client = WechatUiaClient({"uia_image_viewer_enabled": True})
+    _mock_verified_image_viewer(monkeypatch, client)
     message = UiaChatMessage(
         "Alice",
         "图片",
@@ -153,7 +179,7 @@ def test_image_capture_sequence_closes_viewer_and_restores_main(monkeypatch, tmp
     monkeypatch.setattr(
         client,
         "_close_image_viewer",
-        lambda viewer_hwnd, main_hwnd: calls.append(
+        lambda viewer_hwnd, main_hwnd, **kwargs: calls.append(
             ("close_viewer", viewer_hwnd, main_hwnd)
         )
         or True,
@@ -203,6 +229,7 @@ def test_image_viewer_waits_for_configured_stability_before_close(
         }
     )
     target = tmp_path / "viewer.png"
+    _mock_verified_image_viewer(monkeypatch, client)
     calls = []
     monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
     monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
@@ -229,7 +256,7 @@ def test_image_viewer_waits_for_configured_stability_before_close(
     monkeypatch.setattr(
         client,
         "_close_image_viewer",
-        lambda *_args: calls.append("close") or True,
+        lambda *_args, **kwargs: calls.append("close") or True,
     )
     monkeypatch.setattr(client, "_restore_main_window_after_viewer", lambda _hwnd: True)
 
@@ -245,6 +272,7 @@ def test_image_viewer_capture_is_not_successful_until_viewer_closes(
 
     client = WechatUiaClient({})
     target = tmp_path / "viewer.png"
+    _mock_verified_image_viewer(monkeypatch, client)
     calls = []
     monkeypatch.setattr(client, "get_owner_window_handle", lambda: 100)
     monkeypatch.setattr(client, "_visible_top_level_window_handles", lambda: {100})
@@ -257,7 +285,7 @@ def test_image_viewer_capture_is_not_successful_until_viewer_closes(
         "grab",
         lambda **_kwargs: Image.new("RGB", (800, 600), "red"),
     )
-    monkeypatch.setattr(client, "_close_image_viewer", lambda *_args: False)
+    monkeypatch.setattr(client, "_close_image_viewer", lambda *_args, **kwargs: False)
     monkeypatch.setattr(
         client,
         "_restore_main_window_after_viewer",
@@ -824,6 +852,8 @@ def test_locate_conversation_does_not_click_populated_active_chat(monkeypatch):
 
 
 def test_locate_conversation_clicks_when_active_chat_is_blank(monkeypatch):
+    monkeypatch.setattr("win32api.GetCursorPos", lambda: (0, 0))
+    monkeypatch.setattr("win32api.SetCursorPos", lambda _point: None)
     message = GeometryControl(
         (400, 200, 900, 260), "恢复后的消息", "mmui::ChatTextItemView"
     )
@@ -858,6 +888,8 @@ def test_locate_conversation_rejects_click_that_leaves_previous_chat(monkeypatch
     """A failed session switch must not look successful just because a message
     list is still visible from the previous private chat.
     """
+    monkeypatch.setattr("win32api.GetCursorPos", lambda: (0, 0))
+    monkeypatch.setattr("win32api.SetCursorPos", lambda _point: None)
     previous_message = GeometryControl(
         (400, 200, 900, 260), "私聊旧消息", "mmui::ChatTextItemView"
     )
@@ -885,6 +917,8 @@ def test_locate_conversation_rejects_click_that_leaves_previous_chat(monkeypatch
 
 def test_locate_conversation_accepts_group_title_with_member_count(monkeypatch):
     """Detail headers often show '群名(n)' while session_item_/config use bare names."""
+    monkeypatch.setattr("win32api.GetCursorPos", lambda: (0, 0))
+    monkeypatch.setattr("win32api.SetCursorPos", lambda _point: None)
     message = GeometryControl(
         (400, 200, 900, 260), "群消息", "mmui::ChatTextItemView"
     )

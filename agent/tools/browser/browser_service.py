@@ -13,6 +13,11 @@ import json
 import uuid
 import queue
 import threading
+import base64
+import hashlib
+import io
+import math
+import time
 from typing import Optional, Dict, Any, List, Callable
 
 from common.log import logger
@@ -20,6 +25,109 @@ from common.utils import expand_path, is_cloud_deployment
 
 
 _DEFAULT_USER_DATA_DIR = "~/.cow/browser_profile"
+
+
+# Retain the actual ElementHandle throughout sampling. Re-querying a locator after
+# a SPA update could silently capture a different video with the same selector.
+_VISIBLE_VIDEO_JS = """() => {
+    const visible = v => {
+        const r = v.getBoundingClientRect(), s = getComputedStyle(v);
+        return v.isConnected && r.width > 0 && r.height > 0 &&
+            r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight &&
+            s.display !== 'none' && s.visibility === 'visible' && Number(s.opacity) > 0;
+    };
+    const videos = Array.from(document.querySelectorAll('video')).filter(visible);
+    if (videos.length !== 1) throw new Error('unique_visible_video_required');
+    return videos[0];
+}"""
+
+_VIDEO_CHECK_JS = """(v, state) => {
+    const visible = el => {
+        const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return el.isConnected && r.width > 0 && r.height > 0 &&
+            r.right > 0 && r.bottom > 0 && r.left < innerWidth && r.top < innerHeight &&
+            s.display !== 'none' && s.visibility === 'visible' && Number(s.opacity) > 0;
+    };
+    const videos = Array.from(document.querySelectorAll('video')).filter(visible);
+    return location.href === state.url && videos.length === 1 && videos[0] === v &&
+        v.currentSrc === state.currentSrc && v.getAttribute('src') === state.srcAttribute &&
+        Number.isFinite(v.duration) && Math.abs(v.duration - state.duration) <= state.durationTolerance &&
+        v.videoWidth === state.width &&
+        v.videoHeight === state.height && !v.error;
+}"""
+
+_VIDEO_INITIAL_STATE_JS = """(v, url) => {
+    if (!v.isConnected || location.href !== url || !Number.isFinite(v.duration) ||
+        v.duration <= 0 || v.readyState < 2 || v.videoWidth <= 0 || v.videoHeight <= 0 ||
+        v.seekable.length === 0 || v.error) throw new Error('loaded_seekable_video_required');
+    const ranges = [];
+    for (let i = 0; i < v.seekable.length; ++i) ranges.push([v.seekable.start(i), v.seekable.end(i)]);
+    return {url, duration: v.duration, durationTolerance: Math.min(0.5, v.duration * 0.01),
+        width: v.videoWidth, height: v.videoHeight,
+        currentSrc: v.currentSrc, srcAttribute: v.getAttribute('src'),
+        currentTime: v.currentTime, paused: v.paused, muted: v.muted, ranges};
+}"""
+
+_VIDEO_SEEK_JS = """(v, args) => new Promise(resolve => {
+    let done = false, timer;
+    const sameSource = () => v.isConnected && location.href === args.state.url &&
+        v.currentSrc === args.state.currentSrc && v.getAttribute('src') === args.state.srcAttribute &&
+        Number.isFinite(v.duration) && Math.abs(v.duration - args.state.duration) <= args.state.durationTolerance &&
+        v.videoWidth === args.state.width &&
+        v.videoHeight === args.state.height;
+    const finish = value => {
+        if (done) return;
+        done = true; clearTimeout(timer); v.removeEventListener('seeked', ready);
+        v.removeEventListener('error', failed); resolve(value);
+    };
+    const failed = () => finish({error: 'video_decode_failed'});
+    const ready = () => {
+        if (!sameSource()) { finish({error: 'video_source_changed'}); return; }
+        if (v.seeking || v.readyState < 2 || Math.abs(v.currentTime - args.time) > 0.25) return;
+        // Two animation frames allow the decoded image to reach the compositor.
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (!sameSource()) finish({error: 'video_source_changed'});
+            else if (!v.seeking && v.readyState >= 2 && Math.abs(v.currentTime - args.time) <= 0.25)
+                finish({time_seconds: v.currentTime});
+        }));
+    };
+    timer = setTimeout(() => finish({error: 'video_seek_timeout'}), args.timeout);
+    v.addEventListener('seeked', ready); v.addEventListener('error', failed);
+    v.pause(); v.muted = true;
+    try { v.currentTime = args.time; ready(); } catch (_) { finish({error: 'video_not_seekable'}); }
+})"""
+
+_VIDEO_CANVAS_JS = """(v, args) => {
+    if (v.seeking || v.readyState < 2 || Math.abs(v.currentTime - args.time) > 0.25)
+        throw new Error('video_frame_not_ready');
+    const scale = Math.min(1, Math.sqrt(args.maxPixels / (v.videoWidth * v.videoHeight)));
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.floor(v.videoWidth * scale));
+    c.height = Math.max(1, Math.floor(v.videoHeight * scale));
+    c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+    return c.toDataURL('image/png');
+}"""
+
+_VIDEO_RESTORE_JS = """(v, args) => new Promise(resolve => {
+    let finished = false, timer;
+    const finish = () => {
+        if (finished) return; finished = true; clearTimeout(timer);
+        v.removeEventListener('seeked', finish);
+        if (!v.isConnected || location.href !== args.url || v.currentSrc !== args.currentSrc ||
+            v.getAttribute('src') !== args.srcAttribute || !Number.isFinite(v.duration) ||
+            Math.abs(v.duration - args.duration) > args.durationTolerance) {
+            resolve(false); return;
+        }
+        v.muted = args.muted;
+        if (args.paused) v.pause();
+        else { try { const p = v.play(); if (p) p.catch(() => {}); } catch (_) {} }
+        resolve(Math.abs(v.currentTime - args.currentTime) <= 0.25 && !v.seeking);
+    };
+    v.pause(); v.muted = true;
+    timer = setTimeout(finish, args.timeout);
+    v.addEventListener('seeked', finish);
+    try { v.currentTime = args.currentTime; if (!v.seeking) finish(); } catch (_) { finish(); }
+})"""
 
 try:
     from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, Playwright
@@ -321,6 +429,9 @@ class BrowserService:
         self._thread: Optional[threading.Thread] = None
         self._task_queue: queue.Queue = queue.Queue()
         self._lock = threading.Lock()
+        self._activity_lock = threading.RLock()
+        self._pending_operations = 0
+        self._idle_generation = 0
         self._alive = False
         self._ready = threading.Event()
 
@@ -401,7 +512,15 @@ class BrowserService:
 
         # Idle auto-release
         idle_cfg = self._config.get("idle_timeout")
-        self._idle_timeout: float = float(idle_cfg) if idle_cfg is not None else self._IDLE_TIMEOUT_DEFAULT
+        try:
+            idle_seconds = float(idle_cfg) if idle_cfg is not None else self._IDLE_TIMEOUT_DEFAULT
+            if (isinstance(idle_cfg, bool) or not math.isfinite(idle_seconds) or
+                    not 0 < idle_seconds <= threading.TIMEOUT_MAX):
+                raise ValueError("idle_timeout must be finite and positive")
+        except (TypeError, ValueError, OverflowError):
+            idle_seconds = self._IDLE_TIMEOUT_DEFAULT
+            logger.warning("[Browser] Invalid idle_timeout; using 300 seconds")
+        self._idle_timeout: float = idle_seconds
         self._idle_timer: Optional[threading.Timer] = None
 
         # Set when the browser / page is detected to have died externally
@@ -416,20 +535,30 @@ class BrowserService:
     def _start_thread(self):
         """Start the dedicated Playwright thread if not already running."""
         with self._lock:
+            old = self._thread if not self._alive else None
+        # Joining under a lifecycle lock can block the old worker's cleanup.
+        if old and old.is_alive():
+            old.join(timeout=5)
+            if old.is_alive():
+                raise RuntimeError("Previous browser thread is still shutting down; retry after it exits")
+        with self._lock:
             if self._alive and self._thread and self._thread.is_alive():
-                return
-            # Wait for old thread to fully exit before creating a new one
-            old = self._thread
-            if old and old.is_alive():
-                old.join(timeout=5)
-            # Fresh queue to avoid stale sentinels from a previous close()
-            self._task_queue = queue.Queue()
-            self._alive = True
-            self._ready = threading.Event()
-            self._thread = threading.Thread(target=self._run_loop, daemon=True, name="BrowserThread")
-            self._thread.start()
-            # Block until browser is ready (or failed)
-            self._ready.wait(timeout=30)
+                ready = self._ready
+            else:
+                # Another caller may have started or stopped a generation while
+                # we waited. Never replace a thread that has not exited.
+                if self._thread and self._thread.is_alive():
+                    raise RuntimeError("Previous browser thread is still shutting down; retry after it exits")
+                self._task_queue = queue.Queue()
+                self._alive = True
+                self._needs_restart = False
+                self._ready = threading.Event()
+                ready = self._ready
+                self._thread = threading.Thread(target=self._run_loop, daemon=True, name="BrowserThread")
+                self._thread.start()
+        # Concurrent callers must also wait for this generation's launch.
+        if not ready.wait(timeout=30):
+            raise TimeoutError("Browser startup timed out (30s)")
 
     def _run_loop(self):
         """Event loop running on the dedicated thread. Processes tasks until stopped."""
@@ -439,6 +568,7 @@ class BrowserService:
         except Exception as e:
             logger.error(f"[Browser] Failed to launch browser: {e}")
             self._alive = False
+            self._shutdown_browser()
             self._ready.set()
             self._drain_queue(RuntimeError(f"Browser launch failed: {e}"))
             return
@@ -463,7 +593,7 @@ class BrowserService:
                         "will relaunch on next request."
                     )
             finally:
-                result_slot["event"].set()
+                self._complete_result_slot(result_slot)
 
         self._shutdown_browser()
         self._drain_queue(RuntimeError("Browser thread stopped"))
@@ -480,7 +610,12 @@ class BrowserService:
                 continue
             _, _, _, result_slot = task
             result_slot["error"] = error
-            result_slot["event"].set()
+            self._complete_result_slot(result_slot)
+
+    def _complete_result_slot(self, result_slot):
+        if result_slot.pop("activity_lease", False):
+            self._release_activity()
+        result_slot["event"].set()
 
     def _launch_browser(self):
         """Launch / connect Chromium on the background thread."""
@@ -746,72 +881,99 @@ class BrowserService:
 
     def _submit(self, fn: Callable, *args, **kwargs):
         """Submit *fn* to the background thread and block until it completes."""
-        # If the browser died externally (e.g. user closed the window), tear
-        # down the stale thread first so _start_thread() will relaunch fresh.
-        if self._needs_restart:
-            logger.info("[Browser] Restarting after detecting closed browser")
-            self.close()
-            self._needs_restart = False
-
-        self._start_thread()
-
-        if not self._alive:
-            raise RuntimeError("Browser is not available")
-
-        self._reset_idle_timer()
-
-        result_slot: Dict[str, Any] = {"event": threading.Event()}
-        self._task_queue.put((fn, args, kwargs, result_slot))
-
-        # Timeout prevents permanent hang if the background thread crashes
-        completed = result_slot["event"].wait(timeout=120)
-        if not completed:
-            raise TimeoutError("Browser operation timed out (120s)")
-
-        if "error" in result_slot:
-            raise result_slot["error"]
-        return result_slot.get("value")
+        self._acquire_activity()
+        submitted = False
+        try:
+            if self._needs_restart:
+                logger.info("[Browser] Restarting after detecting closed browser")
+                self.close()
+            self._start_thread()
+            result_slot: Dict[str, Any] = {"event": threading.Event(), "activity_lease": True}
+            with self._lock:
+                if not self._alive:
+                    raise RuntimeError("Browser is not available")
+                self._task_queue.put((fn, args, kwargs, result_slot))
+                submitted = True
+            # A caller timeout does not end its actual queued/running operation.
+            # The worker retains the lease until it completes or drains the task.
+            if not result_slot["event"].wait(timeout=120):
+                raise TimeoutError("Browser operation timed out (120s)")
+            if "error" in result_slot:
+                raise result_slot["error"]
+            return result_slot.get("value")
+        finally:
+            if not submitted:
+                self._release_activity()
 
     # ------------------------------------------------------------------
     # Idle auto-release
     # ------------------------------------------------------------------
 
+    def _acquire_activity(self):
+        with self._activity_lock:
+            self._pending_operations += 1
+            self._cancel_idle_timer()
+
+    def _release_activity(self):
+        with self._activity_lock:
+            self._pending_operations -= 1
+            if self._pending_operations == 0 and self._alive:
+                self._reset_idle_timer()
+
     def _reset_idle_timer(self):
-        self._cancel_idle_timer()
-        if self._idle_timeout > 0:
-            self._idle_timer = threading.Timer(self._idle_timeout, self._on_idle_timeout)
+        with self._activity_lock:
+            self._cancel_idle_timer()
+            if self._pending_operations or not self._alive:
+                return
+            generation = self._idle_generation
+            self._idle_timer = threading.Timer(
+                self._idle_timeout, self._on_idle_timeout, args=(generation,)
+            )
             self._idle_timer.daemon = True
             self._idle_timer.start()
 
     def _cancel_idle_timer(self):
-        if self._idle_timer:
-            self._idle_timer.cancel()
-            self._idle_timer = None
+        with self._activity_lock:
+            self._idle_generation += 1
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
 
-    def _on_idle_timeout(self):
-        logger.info(f"[Browser] Idle for {self._idle_timeout}s, auto-releasing browser")
-        self.close()
+    def _on_idle_timeout(self, generation):
+        self.close(_idle_generation=generation)
 
     # ------------------------------------------------------------------
     # Public lifecycle
     # ------------------------------------------------------------------
 
-    def close(self):
+    def close(self, *, _idle_generation=None):
         """Shut down browser and background thread (safe from any thread)."""
-        self._cancel_idle_timer()
-        with self._lock:
-            if not self._alive:
-                self._needs_restart = False
+        # Claim idle shutdown atomically with activity validation. An already
+        # running old Timer callback cannot close a browser that was reused.
+        with self._activity_lock:
+            if _idle_generation is not None and (
+                _idle_generation != self._idle_generation or self._pending_operations
+            ):
                 return
-            self._alive = False
-            t = self._thread
-        if self._task_queue is not None:
-            self._task_queue.put(None)
+            self._cancel_idle_timer()
+            with self._lock:
+                if not self._alive:
+                    if self._thread is None or not self._thread.is_alive():
+                        self._needs_restart = False
+                    return
+                self._alive = False
+                t = self._thread
+                task_queue = self._task_queue
+        if _idle_generation is not None:
+            logger.info(f"[Browser] Idle for {self._idle_timeout}s, auto-releasing browser")
+        if task_queue is not None:
+            task_queue.put(None)
         if t is not None and t.is_alive():
             t.join(timeout=10)
         with self._lock:
-            self._thread = None
-            self._needs_restart = False
+            if self._thread is t and (t is None or not t.is_alive()):
+                self._thread = None
+                self._needs_restart = False
 
     # ------------------------------------------------------------------
     # Actions  (each method is dispatched to the background thread)
@@ -1083,6 +1245,210 @@ class BrowserService:
             return {"result": result}
         except Exception as e:
             return {"error": f"Evaluate failed: {e}"}
+
+    def video_frames(self, max_frames: int = 6, timeout: int = 20000,
+                     cwd: str = "") -> Dict[str, Any]:
+        """Sample the current page's unique video without navigating or reading audio."""
+        if isinstance(max_frames, bool) or not isinstance(max_frames, int) or not 1 <= max_frames <= 8:
+            return {"error": "video_frames 的 max_frames 必须是 1..8 的整数",
+                    "reading_status": "unavailable", "frames": [], "audio_read": False}
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+            return {"error": "video_frames 的 timeout 必须是正整数毫秒",
+                    "reading_status": "unavailable", "frames": [], "audio_read": False}
+        return self._submit(self._do_video_frames, max_frames, min(timeout, 20000), cwd)
+
+    def _do_video_frames(self, max_frames: int, timeout: int, cwd: str) -> Dict[str, Any]:
+        page = self._page
+        started = time.monotonic()
+        deadline = started + timeout / 1000
+        # Leave time to restore the original position and playback state.
+        sampling_deadline = deadline - min(1.0, timeout / 5000)
+        frames: List[Dict[str, Any]] = []
+        frame_paths: List[str] = []
+        hashes = set()
+        state = None
+        video = None
+        modified = False
+        limitation = "仅抽取部分时间点的画面，音轨未读取"
+        identity_valid = True
+        result: Dict[str, Any] = {"reading_status": "unavailable", "frames": frames,
+                                 "audio_read": False, "limitation": limitation}
+
+        def remaining_ms(end=sampling_deadline):
+            return max(0, int((end - time.monotonic()) * 1000))
+
+        def check_identity():
+            try:
+                return self._page is page and page.url == state["url"] and bool(
+                    video.evaluate(_VIDEO_CHECK_JS, state)
+                )
+            except Exception:
+                return False
+
+        try:
+            url = page.url
+            handle = page.evaluate_handle(_VISIBLE_VIDEO_JS)
+            video = handle.as_element()
+            if video is None:
+                raise ValueError("unique_visible_video_required")
+            state = video.evaluate(_VIDEO_INITIAL_STATE_JS, url)
+            duration = float(state["duration"])
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError("finite_video_duration_required")
+            if not check_identity():
+                identity_valid = False
+                raise ValueError("video_source_changed")
+            result["duration_seconds"] = duration
+            # Seeking to the exact duration often displays a poster/end card.
+            # The last sample is the final decodable instant before the end.
+            last = max(0.0, duration - min(0.5, duration / 10))
+            targets = [0.0] if max_frames == 1 else [last * i / (max_frames - 1) for i in range(max_frames)]
+            if any(not any(float(a) <= target <= float(b) for a, b in state["ranges"])
+                   for target in targets):
+                raise ValueError("video_sample_range_not_seekable")
+            save_dir = os.path.abspath(os.path.join(cwd or os.getcwd(), "tmp"))
+            os.makedirs(save_dir, exist_ok=True)
+            prefix = f"video_frame_{uuid.uuid4().hex}"
+            for target in targets:
+                if remaining_ms() <= 0:
+                    limitation += "；达到总时间预算"
+                    break
+                if not check_identity():
+                    identity_valid = False
+                    raise ValueError("video_source_changed")
+                modified = True
+                seek_result = video.evaluate(_VIDEO_SEEK_JS, {
+                    "state": state, "time": target, "timeout": max(1, min(2500, remaining_ms()))
+                })
+                if seek_result.get("error"):
+                    if seek_result["error"] == "video_source_changed":
+                        identity_valid = False
+                        raise ValueError("video_source_changed")
+                    limitation += f"；{seek_result['error']}"
+                    break
+                actual_time = float(seek_result["time_seconds"])
+                if not math.isfinite(actual_time) or abs(actual_time - target) > 0.25:
+                    raise ValueError("video_frame_timestamp_mismatch")
+                if not check_identity():
+                    identity_valid = False
+                    raise ValueError("video_source_changed")
+                if remaining_ms() <= 0:
+                    limitation += "；达到总时间预算"
+                    break
+                try:
+                    data_url = video.evaluate(_VIDEO_CANVAS_JS, {"time": actual_time, "maxPixels": 1500000})
+                    if not isinstance(data_url, str) or not data_url.startswith("data:image/png;base64,"):
+                        raise ValueError("video_canvas_format_invalid")
+                    png_bytes = base64.b64decode(data_url.split(",", 1)[1], validate=True)
+                    strategy = "video_canvas"
+                except Exception as exc:
+                    # A cross-origin video taints canvas. Screenshot the retained
+                    # video element only; never substitute a page screenshot.
+                    if not any(marker in str(exc).lower() for marker in ("taint", "securityerror", "cross-origin", "insecure")):
+                        raise
+                    if not check_identity():
+                        identity_valid = False
+                        raise ValueError("video_source_changed")
+                    if remaining_ms() <= 0:
+                        limitation += "；达到总时间预算"
+                        break
+                    png_bytes = video.screenshot(type="png", scale="css", timeout=max(1, remaining_ms()))
+                    strategy = "video_element_screenshot"
+                if not check_identity():
+                    identity_valid = False
+                    raise ValueError("video_source_changed")
+                # Verify timestamps again after capture: a site's autoplay hook
+                # must not advance the frame while its image is being obtained.
+                frame_state = video.evaluate("v => ({time: v.currentTime, ready: v.readyState, seeking: v.seeking})")
+                if frame_state["ready"] < 2 or frame_state["seeking"] or abs(float(frame_state["time"]) - actual_time) > 0.25:
+                    raise ValueError("video_frame_changed_during_capture")
+                png_bytes, digest = self._bounded_video_png(png_bytes)
+                if digest in hashes:
+                    continue
+                hashes.add(digest)
+                filepath = os.path.abspath(os.path.join(save_dir, f"{prefix}_{len(frames)}.png"))
+                with open(filepath, "wb") as output:
+                    output.write(png_bytes)
+                frame_paths.append(filepath)
+                frames.append({"path": filepath, "time_seconds": actual_time, "strategy": strategy})
+            if not check_identity():
+                identity_valid = False
+                raise ValueError("video_source_changed")
+            if frames:
+                result["reading_status"] = "partial"
+            else:
+                result["error"] = "没有取得可校验的视频画面；请报告未读，勿循环重试"
+        except Exception as exc:
+            error = str(exc)
+            # A changed source invalidates the entire result, including frames
+            # captured before a navigation: callers must not mix two pages.
+            if not identity_valid or error == "video_source_changed":
+                for filepath in frame_paths:
+                    try:
+                        os.remove(filepath)
+                    except OSError:
+                        pass
+                frames.clear()
+                result["error"] = "视频页面或来源发生变化，未返回画面；勿循环重试"
+            elif frames:
+                result["reading_status"] = "partial"
+                limitation += f"；抽帧中断：{error}"
+            else:
+                result["error"] = f"视频抽帧不可用：{error}；请报告未读，勿循环重试"
+        finally:
+            if state is not None and video is not None:
+                try:
+                    if check_identity() and modified:
+                        result["restored"] = bool(video.evaluate(_VIDEO_RESTORE_JS, {
+                            **state, "timeout": max(1, remaining_ms(deadline))
+                        }))
+                        if not check_identity():
+                            identity_valid = False
+                    elif not check_identity():
+                        identity_valid = False
+                        result["restored"] = False
+                    else:
+                        result["restored"] = True
+                except Exception:
+                    result["restored"] = False
+                if not identity_valid:
+                    for filepath in frame_paths:
+                        try:
+                            os.remove(filepath)
+                        except OSError:
+                            pass
+                    frames.clear()
+                    result["reading_status"] = "unavailable"
+                    result["error"] = "视频页面或来源发生变化，未返回画面；勿循环重试"
+                if result.get("restored") is False:
+                    limitation += "；未能确认播放位置恢复"
+            if video is not None:
+                try:
+                    video.dispose()
+                except Exception:
+                    pass
+            result["limitation"] = limitation
+        return result
+
+    @staticmethod
+    def _bounded_video_png(data: bytes):
+        from PIL import Image
+        if len(data) > 12000000:
+            raise ValueError("video_frame_bytes_limit")
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("video_frame_format_invalid")
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "PNG" or image.width * image.height > 40000000:
+                raise ValueError("video_frame_pixels_limit")
+            image.load()
+            image = image.convert("RGB")
+            if image.width * image.height > 1500000:
+                factor = math.sqrt(1500000 / (image.width * image.height))
+                image = image.resize((max(1, int(image.width * factor)), max(1, int(image.height * factor))))
+            digest = hashlib.sha256(image.tobytes()).hexdigest()
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            return output.getvalue(), digest
 
     def press(self, key: str) -> Dict[str, Any]:
         return self._submit(self._do_press, key)

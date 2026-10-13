@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 from channel.wechat_desktop.pipeline.agent_reply import AgentReplyCoordinator
+from channel.wechat_desktop.config import DEFAULT_CONFIG
+from channel.wechat_desktop.references import (
+    chat_record_ready, event_chat_record, event_native_xml_unavailable,
+    standalone_attachment_requires_reference,
+)
 from bridge.context import Context, ContextType
 from channel.wechat_desktop.pipeline.prompts import ATTACHMENT_REFERENCE_REQUIRED_REPLY
 from channel.wechat_desktop.pipeline.fifo_queue import ReplyQueueItem
@@ -16,13 +21,33 @@ class WechatDesktopReplyMixin:
 
     def _send_attachment_reference_prompt(self, item: ReplyQueueItem) -> str:
         """拒绝猜测未明确指向的附件，并直接发送“请引用后再问”的提示。"""
+        return self._send_prepared_text_reply(
+            item, ATTACHMENT_REFERENCE_REQUIRED_REPLY, detail="attachment reference required",
+        )
+
+    def _send_chat_record_unavailable_reply(self, item: ReplyQueueItem) -> str:
+        """记录正文不可用时只发送一次提示，不再启动 Agent 寻找其他会话。"""
+        text = str(self.config.get("chat_record_unavailable_reply")
+                   or DEFAULT_CONFIG["chat_record_unavailable_reply"])
+        return self._send_prepared_text_reply(item, text, detail="chat record content unavailable")
+
+    def _send_native_xml_unavailable_reply(self, item: ReplyQueueItem) -> str:
+        """XML 失败且无法确定卡片类型时，同样一次终结，不将原始 XML 交给 Agent。"""
+        text = str(self.config.get("native_xml_unavailable_reply")
+                   or DEFAULT_CONFIG["native_xml_unavailable_reply"])
+        return self._send_prepared_text_reply(item, text, detail="native application content unavailable")
+
+    def _send_prepared_text_reply(self, item: ReplyQueueItem, text: str, *, detail: str) -> str:
+        """已确定的回复复用目标、来源和发送门禁，发送结果直接终结当前任务。"""
+        if item.expired or (item.token and not self._reply_queue.is_active(item.token)):
+            return "skipped"
         event = item.event
         target_name = event.conversation_name
         target_id = event.conversation_id
         context = {"wechat_desktop_queue_token": item.token}
         target = self._resolve_reply_send_target(
             target_id or target_name, context, target_name,
-            ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text",
+            text, "text",
         )
         if target is None:
             return "skipped"
@@ -36,14 +61,14 @@ class WechatDesktopReplyMixin:
         ):
             return "skipped"
         if not self._validate_source_before_reply(
-            event, context, target_name, ATTACHMENT_REFERENCE_REQUIRED_REPLY, "text"
+            event, context, target_name, text, "text"
         ):
             return "skipped"
         send_target = (target_id or target_name)
         self._mark_lifecycle(item.source_event_ids, "send_started")
         try:
             result = self._deliver(
-                send_target, ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+                send_target, text,
                 policy_target=target_name, is_group=is_group, token=item.token,
                 source_event_ids=item.source_event_ids, authorized_target=target,
             )
@@ -54,18 +79,20 @@ class WechatDesktopReplyMixin:
                 send_result="failed",
             )
             logger.warning(
-                "[WechatDesktop] attachment reference prompt failed: %s",
+                "[WechatDesktop] prepared reply failed (%s): %s",
+                detail,
                 exc,
             )
             return "failed"
-        if not result.get("success"):
+        outcome = SendResult.from_backend(result)
+        if outcome.terminal == "failed":
             self._mark_lifecycle(
                 item.source_event_ids,
                 "send_started",
                 send_result="failed",
             )
             return "failed"
-        verified = bool(result.get("verified"))
+        verified = bool(outcome.get("verified"))
         self._mark_lifecycle(
             item.source_event_ids,
             "send_verified" if verified else "send_started",
@@ -75,8 +102,8 @@ class WechatDesktopReplyMixin:
             "send_text",
             target_name,
             "success" if verified else "unverified",
-            self._content_hash(ATTACHMENT_REFERENCE_REQUIRED_REPLY),
-            detail="attachment reference required",
+            self._content_hash(text),
+            detail=detail,
         )
         self._store.append_conversation_history(
             conversation_id=target_id,
@@ -84,10 +111,10 @@ class WechatDesktopReplyMixin:
             sender_name=str(self.config.get("self_display_name") or "我"),
             direction="outgoing",
             content_type="text",
-            content=ATTACHMENT_REFERENCE_REQUIRED_REPLY,
+            content=text,
             source_type=event.source_type,
         )
-        return SendResult.from_backend(result).terminal
+        return outcome.terminal
 
     def _send_deferred_attachment_notice(self, item: ReplyQueueItem) -> bool:
         return AgentReplyCoordinator(self).send_attachment_notice(item)
@@ -115,6 +142,12 @@ class WechatDesktopReplyMixin:
         self._service.update_status(reply_in_flight=False, reply_conversation="", **status)
 
     def _process_reply_item(self, item: ReplyQueueItem) -> str:
+        # 即使原消息被错误入队，也不能打开附件窗口或发送进度/失败提示。
+        if standalone_attachment_requires_reference(item.event):
+            if (item.expired or item.event.task.source_invalid
+                    or item.event.attachment_status == "source_invalid"):
+                return "skipped"
+            return "observed"
         self._store.set_event_state(item.source_event_ids, "running")
         self._service.update_status(
             mode="replying",
@@ -154,10 +187,18 @@ class WechatDesktopReplyMixin:
                 )
         # 任务在 FIFO 中等待时界面可能已经滑走，始终使用入队时固化的会话上下文回复。
         item.restore_context()
+        if (item.event.attachment_status == "source_invalid"
+                or str((item.event.reference or {}).get("fetch_status") or "").lower() == "source_invalid"):
+            item.event.task.source_invalid = True
         reference_required = bool(
             item.event.task.attachment_reference_required
         )
-        if not reference_required:
+        record = event_chat_record(item.event)
+        record_unavailable = record is not None and not chat_record_ready(record)
+        native_xml_unavailable = event_native_xml_unavailable(item.event)
+        unreadable = record_unavailable or native_xml_unavailable
+        agent_needed = not (reference_required or unreadable)
+        if agent_needed:
             self._mark_lifecycle(
                 item.source_event_ids,
                 "agent_started",
@@ -166,10 +207,14 @@ class WechatDesktopReplyMixin:
         try:
             if item.event.task.source_invalid:
                 terminal = "skipped"
-            elif deferred_failed:
-                terminal = "failed"
             elif item.expired:
                 terminal = item.terminal or "skipped"
+            elif record_unavailable:
+                terminal = self._send_chat_record_unavailable_reply(item)
+            elif native_xml_unavailable:
+                terminal = self._send_native_xml_unavailable_reply(item)
+            elif deferred_failed:
+                terminal = "failed"
             elif reference_required:
                 terminal = self._send_attachment_reference_prompt(item)
             elif not self._dispatch_message(item.event, item.token):
@@ -185,7 +230,7 @@ class WechatDesktopReplyMixin:
             if item.event.task.source_invalid:
                 terminal = "skipped"
             terminal = self._store.delivery_outcome(item.source_event_ids, terminal)
-            if terminal in {"failed", "timeout"}:
+            if terminal in {"failed", "timeout"} and not unreadable:
                 try:
                     self._send_agent_failure_notice(
                         event=item.event,
@@ -203,7 +248,7 @@ class WechatDesktopReplyMixin:
                     )
                 if item.event.task.source_invalid:
                     terminal = "skipped"
-            if not reference_required:
+            if agent_needed:
                 self._mark_lifecycle(item.source_event_ids, "agent_done")
             self._best_effort(
                 "reply_audit", self._store.audit, "reply_queue",

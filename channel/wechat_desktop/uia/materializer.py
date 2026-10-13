@@ -49,7 +49,7 @@ class WechatUiaMaterializer:
             raise RuntimeError("attachment_reference_type_changed")
 
     def materialize_event(self, event: WechatDesktopEvent, *, target_message: UiaChatMessage,
-                          validate=None, validate_target=None):
+                          validate=None, validate_target=None, on_file_materialized=None):
         """保留数据库身份和元数据，只补充已验证消息的附件与引用正文。"""
         if not isinstance(target_message, UiaChatMessage):
             raise TypeError("附件物化需要已验证的 UiaChatMessage 快照")
@@ -74,7 +74,8 @@ class WechatUiaMaterializer:
         with self.gateway.operation(reply=False):
             self._require_valid(validate)
             require_context()
-            resolved, resolve_count = self._resolve_target(event, target_message, require_context)
+            resolved, resolve_count = self._resolve_target(event, target_message, require_context,
+                                                           on_file_materialized)
             require_context()
             self._check_reference_type(event, resolved)
             self._apply_resolved_message(event, resolved)
@@ -162,7 +163,7 @@ class WechatUiaMaterializer:
                                  if reference is not None else None)}
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
-    def _resolve_target(self, event, message, validate_target):
+    def _resolve_target(self, event, message, validate_target, on_file_materialized=None):
         cache_key = (event.account_id, event.source_message_id, event.conversation_id,
                      message.runtime_id, event.content_signature, self._content_signature(message))
         # RuntimeId 缺失时不允许通过缓存绕过具体附件 API 的身份检查。
@@ -187,8 +188,9 @@ class WechatUiaMaterializer:
                     strategy="wechat_reference_image_viewer"))
             elif bool(self.config.get("resolve_message_references", True)):
                 count = 1
+                extra = {"on_file_materialized": on_file_materialized} if on_file_materialized else {}
                 message = self.client.resolve_message_reference(
-                    message, allow_filename_cache=False, validate_target=validate_target)
+                    message, allow_filename_cache=False, validate_target=validate_target, **extra)
             else:
                 message = replace(message, reference=replace(
                     message.reference, resolved=False, degraded=True, strategy="uia_reference_preview_only"))

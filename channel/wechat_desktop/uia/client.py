@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 from channel.wechat_desktop.config import DEFAULT_CONFIG
+from channel.wechat_desktop.references import is_chat_record_title
 from channel.wechat_desktop.uia.reference_resolver import WechatReferenceResolver
 from channel.wechat_desktop.uia.image_viewer import WechatImageViewer
 from channel.wechat_desktop.uia.attachments import WechatAttachmentReader
+from channel.wechat_desktop.uia.chat_record_reader import WechatChatRecordReader
 from channel.wechat_desktop.text import split_message_text
 from channel.wechat_desktop.send_control import (
     wait_send_delay,
@@ -128,6 +130,7 @@ class WechatUiaClient:
         self._reference_resolver = WechatReferenceResolver(self)
         self._image_viewer = WechatImageViewer(self)
         self._attachment_reader = WechatAttachmentReader(self)
+        self._chat_record_reader = WechatChatRecordReader(self)
         self.operation_lock = threading.RLock()
         # Serializes concurrent senders (reply FIFO vs. agent-initiated sends)
         # so humanized pacing waits happen outside any UIA lock: a waiting
@@ -212,6 +215,15 @@ class WechatUiaClient:
                 and native_class.endswith("QWindowIcon")
             ):
                 return True
+            if native_class != "mmui::MainWindow":
+                # 同进程的图片查看器、设置等窗口也使用 Qt 类。必须同时确认
+                # 主窗口标题，避免打开引用图片后将查看器当作第二个主窗口。
+                try:
+                    title = _text(win32gui.GetWindowText(hwnd)).casefold()
+                except Exception:
+                    return True
+                if title not in {"微信", "wechat"}:
+                    return True
             _, process_id = win32process.GetWindowThreadProcessId(hwnd)
             try:
                 process = win32api.OpenProcess(
@@ -1088,6 +1100,10 @@ class WechatUiaClient:
         content_value = _text(content)
         if WechatUiaClient._share_card_metadata(content_value)[0]:
             return "share_card"
+        if (any(name in class_value for name in ("chatbubbleitemview", "chatbubblereferitemview"))
+                and WechatUiaClient._parse_reference_label(content_value) is None
+                and WechatUiaClient._chat_record_card_title(content_value)):
+            return "chat_record"
         if (
             "image" in class_value
             or content_value in {"[图片]", "[Image]"}
@@ -1109,6 +1125,31 @@ class WechatUiaClient:
         ):
             return "file"
         return "text"
+
+    @staticmethod
+    def _chat_record_card_title(content: str) -> str:
+        """提取合并卡片标题，排除正文预览；结果始终只是身份元数据。
+
+        实测 Qt 会把标签、标题和首条预览拼接成一个 Name：
+        ``聊天记录A 和 B 的聊天记录A: [图片]``。
+        """
+        value = _text(content)
+        if WechatUiaClient._parse_reference_label(value) is not None:
+            return ""
+        marked = False
+        for marker in ("[聊天记录]", "聊天记录"):
+            if value.startswith(marker):
+                value = value[len(marker):].strip()
+                marked = True
+                break
+        first_line = value.splitlines()[0] if value else ""
+        match = re.match(r"^(.{1,180}?的聊天记录)(.*)$", first_line)
+        if match is None:
+            return value if marked and is_chat_record_title(value) else ""
+        title, tail = match.groups()
+        if tail and (not marked or not re.match(r"^[^:：\n]{1,80}[:：]", tail)):
+            return ""
+        return title if is_chat_record_title(title) else ""
 
     @staticmethod
     def _share_card_metadata(content: str) -> tuple[str, str]:
@@ -1173,6 +1214,8 @@ class WechatUiaClient:
         folded = value.casefold()
         if folded in {"图片", "image"}:
             return "image"
+        if cls._chat_record_card_title(value):
+            return "chat_record"
         if re.search(
             r"\.(?:docx?|pdf|xlsx?|pptx?|txt|md|csv|zip|rar|7z)$",
             value,
@@ -1339,6 +1382,85 @@ class WechatUiaClient:
                 except Exception:
                     return None
         return None
+
+    def scroll_chat_to_latest_for_attachment(self, *, validate) -> None:
+        """在已验证的附件会话中有界滚动；最终位置仍需数据库尾部序列证明。"""
+        with self.operation_lock, self._uia_root() as root:
+            validate()
+            lists = [control for control in self._walk(root)
+                     if _text(control.AutomationId) == MESSAGE_LIST_ID]
+            if len(lists) != 1:
+                raise RuntimeError("attachment_message_list_unavailable")
+            control = lists[0]
+            try:
+                pattern = control.GetScrollPattern()
+            except Exception:
+                pattern = None
+            validate()
+            if pattern is not None and bool(pattern.VerticallyScrollable):
+                pattern.SetScrollPercent(-1, 100)
+            elif pattern is None:
+                # Qt 未提供 ScrollPattern 时只滚动当前已验证列表，不对输入框按 End。
+                times = max(1, min(30, int(self.config.get(
+                    "uia_attachment_scroll_wheel_times", DEFAULT_CONFIG["uia_attachment_scroll_wheel_times"]))))
+                control.WheelDown(wheelTimes=times, interval=.02, waitTime=.1)
+            validate()
+
+    def get_attachment_message_list_identity(self) -> str:
+        """只接受唯一主消息列表，供有限历史定位固定滚动操作对象。"""
+        with self.operation_lock, self._uia_root() as root:
+            lists = [control for control in self._walk(root)
+                     if _text(control.AutomationId) == MESSAGE_LIST_ID]
+            if len(lists) != 1 or not _runtime_id(lists[0]):
+                raise RuntimeError("attachment_message_list_unavailable")
+            return _runtime_id(lists[0])
+
+    def is_attachment_message_fully_visible(self, message: UiaChatMessage, *, expected_list_identity: str) -> bool:
+        """只读重取同一列表内的目标，拒绝复用的 RuntimeId 或变化的几何证据。"""
+        with self.operation_lock, self._uia_root() as root:
+            lists = [control for control in self._walk(root)
+                     if _text(control.AutomationId) == MESSAGE_LIST_ID]
+            if (len(lists) != 1 or not expected_list_identity or
+                    _runtime_id(lists[0]) != expected_list_identity):
+                raise RuntimeError("attachment_message_list_changed")
+            message_list = lists[0]
+            viewport = _bounds(message_list)
+            if not viewport or viewport[2] <= viewport[0] or viewport[3] <= viewport[1]:
+                raise RuntimeError("attachment_viewport_unavailable")
+            matches = [item for item in message_list.GetChildren()
+                       if message.runtime_id and _runtime_id(item) == message.runtime_id]
+            if len(matches) != 1:
+                raise RuntimeError("attachment_control_identity_unavailable")
+            control = matches[0]
+            bounds = _bounds(control)
+            if not message.bounds or bounds != tuple(message.bounds):
+                raise RuntimeError("attachment_message_bounds_changed")
+            if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                raise RuntimeError("attachment_message_bounds_unavailable")
+            resolved = self._find_message_control(message_list, message)
+            if (resolved is None or _runtime_id(resolved) != message.runtime_id
+                    or _bounds(resolved) != bounds):
+                raise RuntimeError("attachment_message_identity_changed")
+            return (viewport[0] <= bounds[0] < bounds[2] <= viewport[2]
+                    and viewport[1] <= bounds[1] < bounds[3] <= viewport[3])
+
+    def scroll_chat_history_for_attachment(self, *, expected_list_identity: str, validate) -> None:
+        """每次上滚一个刻度，并在动作前后复核同一控件和原生来源。"""
+        with self.operation_lock, self._uia_root() as root:
+            validate()
+            lists = [control for control in self._walk(root)
+                     if _text(control.AutomationId) == MESSAGE_LIST_ID]
+            if (len(lists) != 1 or not expected_list_identity or
+                    _runtime_id(lists[0]) != expected_list_identity):
+                raise RuntimeError("attachment_message_list_changed")
+            control = lists[0]
+            validate()
+            control.WheelUp(wheelTimes=1, interval=.02, waitTime=.1)
+            validate()
+            current = [item for item in self._walk(root)
+                       if _text(item.AutomationId) == MESSAGE_LIST_ID]
+            if len(current) != 1 or _runtime_id(current[0]) != expected_list_identity:
+                raise RuntimeError("attachment_message_list_changed")
 
     @classmethod
     def _send_direction_from_children(cls, item, pane_bounds) -> str:
@@ -1610,8 +1732,11 @@ class WechatUiaClient:
     def _try_close_image_viewer_with_uia(self, viewer_hwnd: int) -> bool:
         return self._image_viewer._try_close_image_viewer_with_uia(viewer_hwnd)
 
-    def _close_image_viewer(self, viewer_hwnd: int, main_hwnd: int) -> bool:
-        return self._image_viewer._close_image_viewer(viewer_hwnd, main_hwnd)
+    def _close_image_viewer(self, viewer_hwnd: int, main_hwnd: int, *,
+                            validate_context=None, expected_identity=None, expected_uia_identity=None) -> bool:
+        return self._image_viewer._close_image_viewer(viewer_hwnd, main_hwnd,
+            validate_context=validate_context, expected_identity=expected_identity,
+            expected_uia_identity=expected_uia_identity)
 
     _restore_main_window_after_viewer = staticmethod(WechatImageViewer._restore_main_window_after_viewer)
 
@@ -1623,22 +1748,71 @@ class WechatUiaClient:
         win32api.keybd_event(win32con.VK_END, 0, 0, 0)
         win32api.keybd_event(win32con.VK_END, 0, win32con.KEYEVENTF_KEYUP, 0)
 
-    @classmethod
-    def _find_desktop_control(cls, name: str, class_name: str):
-        import uiautomation as auto
+    def _find_desktop_control(self, name: str, class_name: str):
+        """仅在绑定微信 PID 的可见原生顶层窗口中查唯一控件。
 
-        root = auto.GetRootControl()
-        if _text(root.Name) == name and _text(root.ClassName) == class_name:
-            return root
-        return next(
-            (
-                control
-                for control in cls._walk(root)
-                if _text(control.Name) == name
-                and _text(control.ClassName) == class_name
-            ),
-            None,
-        )
+        禁止遍历 GetRootControl 的所有应用：WPS 等大文档的 UIA 树可能
+        阻塞 GetNextSiblingControl，外层节点计数无法中断该同步调用。
+        """
+        import uiautomation as auto
+        import win32gui
+        import win32process
+
+        main_hwnd, process_id = self._window()
+        handles = []
+
+        def collect(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                _, candidate_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(candidate_pid) == int(process_id):
+                    handles.append(int(hwnd))
+            return True
+
+        win32gui.EnumWindows(collect, None)
+        foreground = int(win32gui.GetForegroundWindow() or 0)
+        handles = sorted(set(handles), key=lambda hwnd: (hwnd != foreground, hwnd == main_hwnd, hwnd))[:12]
+        matches = {}
+        remaining = 1200
+        with auto.UIAutomationInitializerInThread():
+            for hwnd in handles:
+                if remaining <= 0 or not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                    continue
+                _, candidate_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if int(candidate_pid) != int(process_id):
+                    continue
+                root = auto.ControlFromHandle(hwnd)
+                for control in self._walk_process_controls(root, process_id, min(300, remaining)):
+                    remaining -= 1
+                    if _text(control.Name) == name and _text(control.ClassName) == class_name:
+                        key = _runtime_id(control) or (hwnd, id(control))
+                        matches[key] = control
+        # 同名残留菜单或多个根视图不可按桌面遍历顺序选择。
+        return next(iter(matches.values())) if len(matches) == 1 else None
+
+    def _find_main_window_control(self, name: str, class_name: str):
+        """返回栏等主窗控件绝不扫描查看器、其他账号或外部应用。"""
+        _, process_id = self._window()
+        with self.operation_lock, self._uia_root() as root:
+            matches = [control for control in self._walk_process_controls(root, process_id, 1200)
+                if _text(control.Name) == name and _text(control.ClassName) == class_name]
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _walk_process_controls(root, process_id: int, max_nodes: int):
+        """不进入外部 PID 子树；即使出现跨进程 UIA 嵌入也不读其子控件。"""
+        queue = [root]
+        count = 0
+        while queue and count < max_nodes:
+            control = queue.pop(0)
+            count += 1
+            try:
+                control_pid = int(getattr(control, "ProcessId", process_id) or process_id)
+                if control_pid != int(process_id):
+                    continue
+                yield control
+                queue.extend(control.GetChildren())
+            except Exception:
+                continue
 
     @classmethod
     def _pick_located_original_control(cls, message_list, message_type: str, preview: str):
@@ -1649,9 +1823,17 @@ class WechatUiaClient:
 
     def resolve_message_reference(
         self, message: UiaChatMessage, *, allow_filename_cache: bool = True, validate_target=None,
+        on_file_materialized=None,
     ) -> UiaChatMessage:
         return self._reference_resolver.resolve_message_reference(
-            message, allow_filename_cache=allow_filename_cache, validate_target=validate_target)
+            message, allow_filename_cache=allow_filename_cache, validate_target=validate_target,
+            **({"on_file_materialized": on_file_materialized} if on_file_materialized else {}))
+
+    def fetch_referenced_chat_record(self, message, record, *, tmp_root,
+                                    validate_target, validate_source=None, diagnostics_only=False):
+        return self._chat_record_reader.fetch_referenced_chat_record(
+            message, record, tmp_root=tmp_root, validate_target=validate_target,
+            validate_source=validate_source, diagnostics_only=diagnostics_only)
 
     @staticmethod
     def _share_card_activation_point(
@@ -1895,31 +2077,44 @@ class WechatUiaClient:
         content: str,
         target_root: Path,
         timeout: float,
+        *, validate_target=None, on_file_materialized=None,
     ) -> str:
-        return self._attachment_reader._save_control_file_as(control, content, target_root, timeout)
+        return self._attachment_reader._save_control_file_as(
+            control, content, target_root, timeout, validate_target=validate_target,
+            on_file_materialized=on_file_materialized)
 
     def _try_cancel_verified_native_dialog(
         self,
         dialog_hwnd: int,
         main_hwnd: int,
+        *, expected_identity=None, validate_target=None,
     ) -> bool:
-        return self._attachment_reader._try_cancel_verified_native_dialog(dialog_hwnd, main_hwnd)
+        return self._attachment_reader._try_cancel_verified_native_dialog(
+            dialog_hwnd, main_hwnd, expected_identity=expected_identity,
+            validate_target=validate_target)
 
     def fetch_message_file(
         self, message: UiaChatMessage, tmp_root: Optional[Path] = None,
         *, allow_filename_cache: bool = True, validate_target=None,
+        on_file_materialized=None,
     ) -> str:
         return self._attachment_reader.fetch_message_file(
-            message, tmp_root, allow_filename_cache=allow_filename_cache, validate_target=validate_target)
+            message, tmp_root, allow_filename_cache=allow_filename_cache, validate_target=validate_target,
+            **({"on_file_materialized": on_file_materialized} if on_file_materialized else {}))
 
     def _capture_image_viewer_from_point(
         self,
         point: tuple[int, int],
         target: Path,
-        *, validate_before_click=None, validate_context=None,
+        *, validate_before_click=None, validate_context=None, return_hwnd=None,
+        validate_return_window=None, prefer_original=False, capture_metadata=None,
+        image_asset_cache=None,
     ) -> str:
         return self._attachment_reader._capture_image_viewer_from_point(
-            point, target, validate_before_click=validate_before_click, validate_context=validate_context)
+            point, target, validate_before_click=validate_before_click, validate_context=validate_context,
+            return_hwnd=return_hwnd, validate_return_window=validate_return_window,
+            prefer_original=prefer_original, capture_metadata=capture_metadata,
+            **({"image_asset_cache": image_asset_cache} if image_asset_cache is not None else {}))
 
     _reference_image_activation_point = staticmethod(WechatAttachmentReader._reference_image_activation_point)
 

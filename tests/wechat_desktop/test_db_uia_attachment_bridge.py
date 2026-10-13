@@ -39,6 +39,23 @@ class AttachmentClient(Client):
     def get_chat_scroll_position_passive(self):
         return self.bottom
 
+    def get_attachment_message_list_identity(self):
+        return "verified-message-list"
+
+    def is_attachment_message_fully_visible(self, message, *, expected_list_identity):
+        assert expected_list_identity == "verified-message-list"
+        matched = [item for item in self.messages if item.runtime_id == message.runtime_id]
+        assert len(matched) == 1
+        assert (matched[0].content, matched[0].message_type, matched[0].bounds) == (
+            message.content, message.message_type, message.bounds)
+        if message.reference:
+            assert matched[0].reference and (matched[0].reference.content, matched[0].reference.sender_name) == (
+                message.reference.content, message.reference.sender_name)
+        if not message.bounds:
+            raise RuntimeError("attachment_message_bounds_changed")
+        left, top, right, bottom = message.bounds
+        return 0 <= left < right <= 600 and 0 <= top < bottom <= 800
+
     def get_send_bubble_snapshot(self, title, limit=20):
         assert title == "Synthetic"
         return self.messages[-limit:]
@@ -98,10 +115,13 @@ def observe_target(bridge, body, *, message_type=49, reference=None):
     instance.acknowledge_events([status["source_batch"].batch_id])
     event = next(event for event in events if event.source_local_id == 2)
     client.messages = [
-        UiaChatMessage("Synthetic", "synthetic anchor", direction="incoming", runtime_id="bubble-1"),
+        UiaChatMessage("Synthetic", "synthetic anchor", direction="incoming", runtime_id="bubble-1",
+                       bounds=(10, 100, 500, 140)),
         UiaChatMessage("Synthetic", "文件\nsynthetic.pdf\n1K" if event.content_type == "file" else event.content,
-                       event.content_type, "incoming", runtime_id="bubble-2", reference=reference),
-        UiaChatMessage("Synthetic", "synthetic tail", direction="incoming", runtime_id="bubble-3"),
+                       event.content_type, "incoming", runtime_id="bubble-2", reference=reference,
+                       bounds=(10, 140, 500, 240)),
+        UiaChatMessage("Synthetic", "synthetic tail", direction="incoming", runtime_id="bubble-3",
+                       bounds=(10, 240, 500, 300)),
     ]
     return event
 
@@ -165,13 +185,37 @@ def test_media_reference_uses_verified_current_bubble(bridge, kind, raw, preview
     assert bridge[3].downloads == [(operation, "bubble-2")]
 
 
-@pytest.mark.parametrize("bottom", [None, False])
-def test_unverified_bottom_refuses_download(bridge, bottom):
+def test_explicit_non_bottom_refuses_download(bridge):
     event = observe_target(bridge, "<msg><appmsg><type>6</type><title>synthetic.pdf</title></appmsg></msg>")
-    bridge[3].bottom = bottom
+    bridge[3].bottom = False
     event, count = bridge[0].materialize_event(event)
     assert count == 0 and event.attachment_status == "attachment_identity_unavailable"
     assert bridge[3].downloads == []
+
+
+def test_missing_scroll_pattern_uses_unique_native_tail(bridge):
+    event = observe_target(bridge, "<msg><appmsg><type>6</type><title>synthetic.pdf</title></appmsg></msg>")
+    bridge[3].bottom = None
+    event, count = bridge[0].materialize_event(event)
+    assert count == 1 and event.attachment_status == "materialized"
+
+
+def test_missing_scroll_pattern_rejects_old_native_sequence(bridge):
+    event = observe_target(bridge, "<msg><appmsg><type>6</type><title>synthetic.pdf</title></appmsg></msg>")
+    bridge[3].bottom = None
+    add_message(bridge[1].caches["message/message_0.db"], bridge[5], 4,
+                content="new native tail", created=1003, sort_seq=4)
+    event, count = bridge[0].materialize_event(event)
+    assert count == 0 and event.attachment_status == "attachment_identity_unavailable"
+    assert bridge[3].downloads == []
+
+
+def test_scroll_state_change_during_snapshot_refuses_download(bridge):
+    event = observe_target(bridge, "<msg><appmsg><type>6</type><title>synthetic.pdf</title></appmsg></msg>")
+    positions = iter([None, True])
+    bridge[3].get_chat_scroll_position_passive = lambda: next(positions)
+    event, count = bridge[0].materialize_event(event)
+    assert count == 0 and bridge[3].downloads == []
 
 
 def test_repeated_identical_sequence_is_not_guessed(bridge):

@@ -19,6 +19,7 @@ import ipaddress
 import json
 import os
 import socket
+import threading
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 
@@ -40,13 +41,16 @@ class BrowserTool(BaseTool):
     description: str = (
         "Control a browser to navigate web pages, interact with elements, and extract content. "
         "Actions: navigate, snapshot, click, fill, select, scroll, screenshot, wait, back, forward, "
-        "get_text, press, evaluate.\n\n"
+        "get_text, press, evaluate, video_frames.\n\n"
         "Workflow: navigate (auto-includes snapshot with element refs) → click/fill/select by ref → snapshot to verify.\n\n"
         "Use snapshot as the primary way to read pages. Use screenshot + send to show key results to the user. "
         "For login/CAPTCHA/authorization etc., screenshot and ask the user for help. "
         "Login state is persisted across sessions (cookies / localStorage are kept in a "
         "user profile directory), so once the user logs in to a site, the agent can keep "
-        "using it without logging in again."
+        "using it without logging in again. "
+        "For a video, video_frames captures bounded, timestamped samples from the unique "
+        "visible loaded video on the current page. Read each returned image with vision; "
+        "samples do not establish the entire video or its audio."
     )
 
     params: dict = {
@@ -57,12 +61,12 @@ class BrowserTool(BaseTool):
                 "description": (
                     "The browser action to perform. One of: "
                     "navigate, snapshot, click, fill, select, scroll, "
-                    "screenshot, wait, back, forward, get_text, press, evaluate"
+                    "screenshot, wait, back, forward, get_text, press, evaluate, video_frames"
                 ),
                 "enum": [
                     "navigate", "snapshot", "click", "fill", "select", "scroll",
                     "screenshot", "wait", "back", "forward", "get_text", "press",
-                    "evaluate"
+                    "evaluate", "video_frames"
                 ]
             },
             "url": {
@@ -104,12 +108,19 @@ class BrowserTool(BaseTool):
             "timeout": {
                 "type": "integer",
                 "description": "Timeout in milliseconds (optional, default varies by action)"
+            },
+            "max_frames": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 8,
+                "description": "Video frame sample limit, 1..8 (for video_frames, default 6; at most 20 seconds total)"
             }
         },
         "required": ["action"]
     }
 
     _shared_service: Optional[BrowserService] = None
+    _shared_service_lock = threading.Lock()
 
     def __init__(self, config: dict = None):
         self.config = config or {}
@@ -118,17 +129,13 @@ class BrowserTool(BaseTool):
 
     def _get_service(self) -> BrowserService:
         """Get or create the browser service, sharing across copies."""
-        if self._service is not None:
-            return self._service
-
-        # Reuse shared service across tool copies within the same session
-        if BrowserTool._shared_service is not None:
+        with BrowserTool._shared_service_lock:
+            if BrowserTool._shared_service is None:
+                BrowserTool._shared_service = BrowserService(self.config)
+            # A copy may still cache a service explicitly closed by another
+            # copy. Always reuse the current shared instance instead.
             self._service = BrowserTool._shared_service
             return self._service
-
-        self._service = BrowserService(self.config)
-        BrowserTool._shared_service = self._service
-        return self._service
 
     def _allow_private_targets(self) -> bool:
         """Whether the link-local / cloud-metadata guard is disabled.
@@ -396,6 +403,29 @@ class BrowserTool(BaseTool):
             return ToolResult.success(json.dumps(val, ensure_ascii=False, indent=2))
         return ToolResult.success(str(val) if val is not None else "(no return value)")
 
+    def _do_video_frames(self, args: Dict[str, Any]) -> ToolResult:
+        max_frames = args.get("max_frames", 6)
+        timeout = args.get("timeout", 20000)
+        if isinstance(max_frames, bool) or not isinstance(max_frames, int) or not 1 <= max_frames <= 8:
+            return ToolResult.fail("video_frames 的 max_frames 必须是 1..8 的整数")
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+            return ToolResult.fail("video_frames 的 timeout 必须是正整数毫秒")
+        result = self._get_service().video_frames(
+            max_frames=max_frames, timeout=min(timeout, 20000), cwd=self.cwd
+        )
+        if "error" in result:
+            return ToolResult.fail(result["error"], ext_data=result)
+        lines = [
+            "[视频抽帧：部分读取]",
+            f"视频时长：{result['duration_seconds']:.3f} 秒；取得 {len(result['frames'])} 张实际画面。",
+            "逐张调用 vision 读取以下画面，每张最多一次。仅能描述这些时间点的可见内容；"
+            "音轨尚未读取，抽帧不代表完整观看，标题和评论也不属于视频正文。",
+        ]
+        lines.extend(f"{frame['time_seconds']:.3f} 秒：{frame['path']}" for frame in result["frames"])
+        if result.get("limitation"):
+            lines.append(f"读取限制：{result['limitation']}")
+        return ToolResult.success("\n".join(lines), ext_data=result)
+
     # Action dispatch table
     _ACTION_MAP = {
         "navigate": _do_navigate,
@@ -411,6 +441,7 @@ class BrowserTool(BaseTool):
         "get_text": _do_get_text,
         "press": _do_press,
         "evaluate": _do_evaluate,
+        "video_frames": _do_video_frames,
     }
 
     # ------------------------------------------------------------------
@@ -428,8 +459,11 @@ class BrowserTool(BaseTool):
 
     def close(self):
         """Release browser resources."""
-        if self._service:
-            self._service.close()
-            self._service = None
-        BrowserTool._shared_service = None
+        with BrowserTool._shared_service_lock:
+            service = self._service
+            if service is not None:
+                service.close()
+                self._service = None
+                if BrowserTool._shared_service is service:
+                    BrowserTool._shared_service = None
         logger.info("[Browser] BrowserTool closed")
