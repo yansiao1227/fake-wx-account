@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 
+from channel.wechat_desktop.contracts import ConversationTarget
 from channel.wechat_desktop.db.errors import DatabaseReadError
 from common.log import logger
 
@@ -73,6 +74,10 @@ class WechatDatabaseSource:
     def search_contacts(self, query="", limit=20):
         with self.reader_session() as reader:
             return reader.search_contacts(query, limit)
+
+    def list_group_conversations(self) -> list[ConversationTarget]:
+        with self.reader_session() as reader:
+            return reader.list_group_conversations()
 
     def read_chat_history(self, conversation_id, limit=20, *, session_epoch=None):
         with self.reader_session() as reader:

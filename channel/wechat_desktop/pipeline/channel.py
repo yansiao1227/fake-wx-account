@@ -8,8 +8,8 @@
 3. 物化线程只解析真正需要的图片/文件，并将任务写入全局回复 FIFO；
 4. 回复线程串行调用 Agent，等待回调，然后在发送前再次校验会话目标。
 
-这三个阶段刻意分离：耗时的附件读取和 Agent 推理不能阻塞微信消息扫描；所有真正
-发送到微信的动作仍通过回复 FIFO 串行执行，避免多个线程同时操作同一个客户端窗口。
+这三个阶段刻意分离：耗时的附件读取和 Agent 推理不能阻塞微信消息扫描；自动回复
+通过 FIFO 串行执行，每日更新通知独立调度，所有发送共享后端的 UI 租约与发送锁。
 
 实现按流水线阶段拆到 ``pipeline/`` 各模块，本文件只负责组合、启停和对外导出：
 
@@ -30,6 +30,7 @@ from channel.chat_channel import ChatChannel
 from channel.wechat_desktop.config import load_wechat_desktop_config
 from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
+from channel.wechat_desktop.pipeline.changelog import DailyChangelogScheduler
 from channel.wechat_desktop.pipeline.fifo_queue import WechatReplyQueue
 from channel.wechat_desktop.pipeline.materialize import WechatDesktopMaterializeMixin
 from channel.wechat_desktop.pipeline.policy import WechatDesktopPolicy
@@ -62,6 +63,7 @@ class WechatDesktopChannel(
     - ``_scan_thread`` 只发现和路由事件；
     - ``_materialize_thread`` 解析附件并生成稳定的回复任务；
     - ``_queue_thread`` 串行消费回复任务，等待 Agent 和发送结果。
+    - ``_changelog_thread`` 按北京时间检查并广播当天变更，共享发送门禁与 UI 锁。
 
     后端通过工厂注入，因此这里不应出现 UIA 控件选择器或窗口句柄操作。
     """
@@ -97,6 +99,7 @@ class WechatDesktopChannel(
         self._queue_thread = None
         self._scan_thread = None
         self._materialize_thread = None
+        self._changelog_thread = None
 
         # 生命周期表只用于诊断耗时，不参与消息业务判断。
         self._lifecycle = LifecycleRecorder()
@@ -146,7 +149,8 @@ class WechatDesktopChannel(
         self._lifecycle.finish(event_ids, terminal)
 
     def _live_workers(self):
-        workers = [self._scan_thread, self._materialize_thread, self._queue_thread]
+        workers = [self._scan_thread, self._materialize_thread, self._queue_thread,
+                   getattr(self, "_changelog_thread", None)]
         alive = [worker.name for worker in workers if worker and worker.is_alive()]
         return alive
 
@@ -167,6 +171,8 @@ class WechatDesktopChannel(
         while not stop_event.wait(0.25):
             alive = self._live_workers()
             required = {"cow-wechat-scan", "cow-wechat-materialize", "cow-wechat-reply-fifo"}
+            if self.config["changelog_enabled"]:
+                required.add("cow-wechat-changelog")
             missing = required.difference(alive)
             if missing:
                 self._service.update_status(last_error=f"workers stopped: {sorted(missing)}", worker_healthy=False)
@@ -200,6 +206,16 @@ class WechatDesktopChannel(
             name="cow-wechat-scan",
             daemon=True,
         )
+        self._changelog_thread = None
+        if self.config["changelog_enabled"]:
+            scheduler = DailyChangelogScheduler(
+                config=self.config, store=self._store, backend=self._driver, policy=self._policy,
+                send=self._deliver, is_paused=lambda: bool(self._service.status().get("paused")),
+                stop_event=self._stop_event,
+            )
+            self._changelog_thread = threading.Thread(
+                target=scheduler.run, name="cow-wechat-changelog", daemon=True,
+            )
         self._service.set_agent_executor(self._execute_agent_action)
         self._service.update_status(
             running=True,
@@ -222,6 +238,8 @@ class WechatDesktopChannel(
         self._queue_thread.start()
         self._materialize_thread.start()
         self._scan_thread.start()
+        if self._changelog_thread is not None:
+            self._changelog_thread.start()
         self.report_startup_success()
         logger.info(
             "[WechatDesktop] Channel started in %s mode",
@@ -251,7 +269,8 @@ class WechatDesktopChannel(
                 self._best_effort("mark_event_processed", self._store.mark_event_processed, event_id, "stopped", "channel_stopped")
             self._best_effort("finish_lifecycle", self._finish_lifecycle, pending_ids, "stopped")
             # 消费者有短轮询，不依赖往满队列里写入哨兵来唤醒。
-            for worker in (self._scan_thread, self._materialize_thread, self._queue_thread):
+            for worker in (self._scan_thread, self._materialize_thread, self._queue_thread,
+                           getattr(self, "_changelog_thread", None)):
                 if worker and worker.ident is not None and worker is not threading.current_thread():
                     worker.join(timeout=timeout)
             alive = self._live_workers()

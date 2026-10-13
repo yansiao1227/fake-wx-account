@@ -123,6 +123,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_reply_group_blacklist": [],
     "conversation_history_retention_days": 90,
 
+    # 每日变更通知（北京时间 UTC+8），目录相对仓库根解析。
+    "changelog_enabled": True,
+    "changelog_directory": "changelogs",
+    "changelog_send_hour": 18,
+    "changelog_send_minute": 0,
+    "changelog_check_interval_seconds": 30,
+    "changelog_message_template": "今日更新（{date}）\n{content}",
+
     # 可选诊断能力：会话扫描细粒度日志写入 run.log，不打印到控制台。
     "diagnostic_logging": True,
 
@@ -271,9 +279,22 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} must be positive")
     if config["desktop_backend"] != "db_uia":
         raise ValueError("desktop_backend must be db_uia; UIA 消息接收后端已移除")
-    for key in ("db_data_dir", "db_account", "db_cache_dir"):
+    for key in ("db_data_dir", "db_account", "db_cache_dir", "changelog_directory", "changelog_message_template"):
         if not isinstance(config[key], str):
             raise ValueError(f"{key} must be a string")
+    if not config["changelog_directory"].strip():
+        raise ValueError("changelog_directory must not be empty")
+    if config["changelog_send_hour"] > 23 or config["changelog_send_minute"] > 59:
+        raise ValueError("invalid changelog send time")
+    if config["changelog_check_interval_seconds"] <= 0:
+        raise ValueError("changelog_check_interval_seconds must be positive")
+    try:
+        template = config["changelog_message_template"]
+        rendered = template.format(date="2026-10-13", content="- 更新")
+        if "{content}" not in template or not rendered.strip():
+            raise ValueError("missing content placeholder")
+    except (ValueError, KeyError, IndexError, AttributeError) as exc:
+        raise ValueError("invalid changelog_message_template; use {date} and {content}") from exc
     for key in config:
         if key.endswith("_min") and key[:-4] + "_max" in config:
             if config[key] > config[key[:-4] + "_max"]:

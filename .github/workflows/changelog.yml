@@ -1,0 +1,29 @@
+name: Changelog
+
+on:
+  pull_request:
+    branches: [master, main]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    name: Changelog check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a new changelog entry for the Beijing date
+        shell: pwsh
+        env:
+          CHANGELOG_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          & ./scripts/check_changelog.ps1 -BaseRef $env:CHANGELOG_BASE_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

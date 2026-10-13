@@ -57,7 +57,7 @@ def test_database_read_failure_never_initializes_or_falls_back_to_uia():
         assert not backend.uia_initialized
 
 
-def test_channel_startup_only_starts_database_pipeline_workers(monkeypatch):
+def test_channel_startup_starts_database_pipeline_and_changelog_without_uia(monkeypatch):
     import channel.wechat_desktop.pipeline.channel as channel_module
 
     created = []
@@ -83,6 +83,8 @@ def test_channel_startup_only_starts_database_pipeline_workers(monkeypatch):
     channel = _bare_wechat_channel()
     channel.config = load_wechat_desktop_config({"shadow_mode": True})
     channel._driver = Backend()
+    channel._policy = SimpleNamespace()
+    channel._stop_event = threading.Event()
     channel._store = SimpleNamespace(
         recover_interrupted_events=lambda: {}, get_state=lambda *_args: False
     )
@@ -97,6 +99,6 @@ def test_channel_startup_only_starts_database_pipeline_workers(monkeypatch):
 
     channel._start_workers()
 
-    assert calls == ["resume", "cow-wechat-reply-fifo", "cow-wechat-materialize", "cow-wechat-scan"]
-    assert len(created) == 3
+    assert calls == ["resume", "cow-wechat-reply-fifo", "cow-wechat-materialize", "cow-wechat-scan", "cow-wechat-changelog"]
+    assert len(created) == 4
     assert not hasattr(channel, "_warmup_thread")

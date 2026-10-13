@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from xml.etree import ElementTree
 
+from channel.wechat_desktop.contracts import ConversationTarget
 from channel.wechat_desktop.db.errors import DatabaseReadError
 from channel.wechat_desktop.db.types import SourceBatch, SourceCheckpoint, SourceRecord
 from channel.wechat_desktop.models import (
@@ -388,6 +389,18 @@ class WechatDatabaseReader:
             matches = [dict(item) for item in self._contacts.values() if not needle or any(
                 needle in str(item[field]).casefold() for field in ("username", "nick_name", "remark", "alias"))]
             return sorted(matches, key=lambda item: (item["display_name"], item["username"]))[:max(1, min(50, int(limit)))]
+
+    def list_group_conversations(self) -> list[ConversationTarget]:
+        """枚举联系人、会话及映射索引中的群，包含没有消息流的群。"""
+        self.refresh()
+        with self._lock:
+            groups = {
+                item["conversation_id"]: ConversationTarget(
+                    item["conversation_id"], item["display_name"], True
+                )
+                for item in self._contacts.values() if item["is_group"] is True
+            }
+            return sorted(groups.values(), key=lambda item: (item.display_name, item.conversation_id))
 
     def get_contact_by_conversation_id(self, conversation_id):
         with self._lock:

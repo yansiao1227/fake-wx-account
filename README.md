@@ -62,6 +62,7 @@ D:\Miniconda\envs\cowagent-wechat\python.exe .\app.py
 - **历史上下文：** 普通回复默认附带最近 3 条同会话微信历史（最多 1500 字符），旧 Agent 对话保留最近 2 轮（最多 1500 字符）。更早或完整内容按需调用 `wechat_history`，默认 20 条、上限 50 条；联系人检索和稳定会话 ID 用法见 [只读工具说明](docs/wechat-db-backend.md#agent-只读工具)。
 - **引用资料：** 先在微信引用文字、图片、文件或分享卡片，再输入问题。回复只使用当前问题与直接引用的一层资料；图片/文件需唯一关联后读取，独立图片和分享卡片只观察。网页由 [analyze-url](skills/analyze-url/SKILL.md) 技能读取实际正文，访问受限时说明限制。
 - **AI 作图：** 使用 [image-generation](skills/image-generation/SKILL.md) 技能；在 `~/.cow/.env` 配置独立的 `SKILL_IMAGE_GENERATION_*` 凭据，生成图片经现有图片发送权限与目标校验后发送。
+- **每日更新通知：** 每天北京时间 18:00，将 `changelogs/YYYY-MM-DD.md` 的当天非空内容发送给数据库已知且当前不在群黑名单中的群，无需 @ 触发。无当天内容时不发送；暂停、停止或影子模式时禁止发送。18:00 后启动或恢复会补跑当晚，往日不追补，每群每天至多一次，重启或结果不确定时不自动重发。服务需持续运行且微信已登录；目标定位等实机失败保留发送记录。配置见 [更新日志说明](changelogs/README.md)。
 - **恢复与边界：** 数据库故障暂停新事件并重试；进程重启不自动重放回复，未确认发送不自动重发。本机数据库仅覆盖已同步的消息，尚未接入朋友圈或媒体数据库解密。
 
 解密缓存与业务账本包含聊天明文，数据库密钥使用 Windows DPAPI 保存。真实附件流程仍需对应微信版本的实机验收；数据位置、读取边界和验证方法见 [数据库后端说明](docs/wechat-db-backend.md)，组件与接口见 [通道架构](channel/wechat_desktop/ARCHITECTURE.md)。
@@ -81,7 +82,11 @@ D:\Miniconda\envs\cowagent-wechat\python.exe scripts\wechat_db_doctor.py --shado
 D:\Miniconda\envs\cowagent-wechat\python.exe -m pytest tests -q
 ```
 
-贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，工作区与中文提交规范见 [AGENTS.md](AGENTS.md)。
+每次合并到 `master` / `main` 前，必须新建或追加北京时间合并日的
+`changelogs/YYYY-MM-DD.md`，用几条精简中文列表记录本次变化；同日共用文件，跨日合并更新日期。
+提交后运行 `.\scripts\check_changelog.ps1 -BaseRef origin/master` 检查当日新增条目。
+格式见 [更新日志说明](changelogs/README.md)，贡献流程见 [CONTRIBUTING.md](CONTRIBUTING.md)，
+工作区与中文提交规范见 [AGENTS.md](AGENTS.md)。
 
 ## 上游与许可证
 

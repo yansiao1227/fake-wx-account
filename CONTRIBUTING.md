@@ -28,7 +28,17 @@ avoid duplicates, and make sure you're on the latest version.
 2. Make your change. Keep it focused — one logical change per PR.
 3. Follow the existing code style. Write comments and docstrings in English.
 4. Run the app locally to confirm your change works.
-5. Open a PR with a clear title and a short description of **what** and **why**.
+5. 按北京时间的合并日期，新建或追加 `changelogs/YYYY-MM-DD.md`，用几条精简中文列表
+   记录本次用户可感知的变化；同一天共用一个文件，跨日合并时更新本次条目的日期。
+6. 提交改动后执行 `.\scripts\check_changelog.ps1 -BaseRef origin/master`
+   （合并到 `main` 时替换基准分支）。检查比较已提交变更，要求当日文件新增有效列表项。
+7. Open a PR with a clear title and a short description of **what** and **why**.
+
+每次合并到 `master` / `main` 前都需要完成这项记录，包括文档及维护改动。
+日志不包含真实密钥、内部日志或测试输出。主分支 PR 会自动检查当日条目；
+跨日待合并的 PR 需更新日志并重新检查。格式和每天 18:00 的群广播行为见
+[changelogs/README.md](changelogs/README.md)。
+维护者可在主分支保护中将 `Changelog check` 设为必需检查，强制执行合并前校验。
 
 We keep the bar friendly: clear, focused, and working is enough. Maintainers are
 happy to help polish details during review.

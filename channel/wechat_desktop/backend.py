@@ -87,6 +87,10 @@ class WechatDesktopBackend(ABC):
         """可选能力：联系人检索不得改变实时接收游标。"""
         raise NotImplementedError("当前后端不支持数据库联系人检索")
 
+    def list_group_conversations(self) -> list[ConversationTarget]:
+        """只读枚举当前账号全部已知群聊，不操作 UI 或改变接收游标。"""
+        raise NotImplementedError("当前后端不支持数据库群聊枚举")
+
     @abstractmethod
     def send_image(self, conversation: str, image_path: str, *,
                    authorized_target: ConversationTarget | None = None) -> SendResult:

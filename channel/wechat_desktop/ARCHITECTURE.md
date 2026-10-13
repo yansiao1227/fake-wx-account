@@ -20,6 +20,7 @@ channel/wechat_desktop/
   triggers.py               扫描和策略层共用的群触发规则
   pipeline/                 通道编排（不碰 UIA 控件）
     channel.py              入口：组合组件、启停和通道兼容接口
+    changelog.py            北京时间每日更新日志调度与群广播
     scan.py                 扫描、策略过滤、私聊聚合
     materialize.py          附件物化、引用判断、入队
     reply.py                FIFO 任务准备、分流和终态收尾
@@ -51,7 +52,7 @@ channel/wechat_desktop/
     discovery.py / keys.py  账号定位和只读密钥获取
     security.py             Windows DPAPI 与缓存目录权限
   storage/                  持久化与运行状态
-    store.py                会话历史与事件账本
+    store.py                会话历史、事件账本与每日群广播记录
     service.py              给 Web/工具用的状态门面
 ```
 
@@ -94,7 +95,7 @@ UIA 随机等待统一调用 `_paced_wait(minimum_key, maximum_key)`；节拍默
 ```text
 pipeline/channel.py
    |
-   +-> pipeline/{scan, materialize, reply, send, prompts, fifo_queue, policy}
+   +-> pipeline/{scan, materialize, reply, send, prompts, fifo_queue, policy, changelog}
    |                          +-> agent_reply
    +-> pipeline/lifecycle（仅诊断）
    |
@@ -248,6 +249,29 @@ OCR 只在显式 UI 诊断与分享卡片复制链接菜单后备中按需加载
 前缀缓存。数据库已知类型、发送者与来源证据不被 UIA 快照覆盖；未识别类型才允许补充准确
 分类。严格定位在焦点恢复后重新取 RuntimeId 与当前位置，返回引用位置及 End 前复核上下文。
 
+## 每日更新日志调度
+
+`pipeline/changelog.py` 的 `DailyChangelogScheduler` 运行在通道自身的
+`cow-wechat-changelog` 线程中，随通道启动、停止，并纳入线程健康管理。
+所有默认配置只定义在 `config.py` 的 `DEFAULT_CONFIG`；相对日志目录以仓库根目录解析。
+每天北京时间（UTC+8）到达配置时刻后，读取 `changelogs/YYYY-MM-DD.md` 的当天非空内容。
+默认时刻为 18:00、检查间隔为 30 秒；读取时去除 Markdown 标题和 HTML 注释，
+文件缺失或去除后只有空白时不触发发送。
+18:00 后启动或恢复只补跑当天，跨日不追补。
+
+调度通过数据库接口遍历全部已知群，不复用公开联系人检索的 50 条上限。
+每次发送均使用已有 `DeliveryService` 门禁和 UIA 发送链，按数据库可信群类型及显示名
+检查 `auto_reply_group_blacklist`，实际提交前再校验目标与权限。
+广播无需入站消息或 @ 触发；暂停、停止和影子模式均禁止提交。
+数据库已知目标仍可能因侧栏不可定位、窗口或账号校验失败而无法发送。
+
+Store 的 `changelog_deliveries` 表原子占位北京时间日期与稳定群会话 ID，
+持久化每群每天的处理结果；文件追加或进程重启不能绕过已有占位再次发送。
+已提交、部分发送、结果不确定以及失败均保留记录，不自动重发；
+限流等明确尚未提交的情况留待当晚后续周期继续。
+调度不使用普通回复 FIFO 的来源事件身份，也不因文件变更生成新的每日发送资格。
+日志写作及合并前检查约定见 [changelogs/README.md](../../changelogs/README.md)。
+
 ## 测试组织
 
 `tests/wechat_desktop/` 按组件组织回归，使用控件替身和临时 SQLite，不操作真实微信。
@@ -257,6 +281,7 @@ OCR 只在显式 UI 诊断与分享卡片复制链接菜单后备中按需加载
 | `test_agent_reply.py` | 上下文筛选、回调通知、超时取消顺序 |
 | `test_lifecycle.py` | 首次阶段时间、诊断副本、并发结束、日志幂等 |
 | `test_pipeline.py` | 扫描聚合、物化与回复分流的跨组件协作 |
+| `test_changelog.py` | 北京时间调度、全量已知群、黑名单门禁、启停及每日持久化防重发 |
 | `test_uia_attachments.py` | 附件缓存、文件与图片读取及相关集成 |
 | `test_uia_image_viewer.py` / `test_uia_reference.py` | 查看器安全恢复与引用解析 |
 | `test_contracts.py` / `test_correctness.py` | 接收确认、持久化占位、重启防重放与正确性约束 |

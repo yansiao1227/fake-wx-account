@@ -9,7 +9,7 @@ import unicodedata
 
 from channel.wechat_desktop.backend import WechatDesktopBackend
 from channel.wechat_desktop.binding import DatabaseUiaTargetBinder
-from channel.wechat_desktop.contracts import SendResult, SendStatus, TargetStatus
+from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus, TargetStatus
 from channel.wechat_desktop.conversation import conversation_titles_match
 from channel.wechat_desktop.db.errors import DatabaseReadError
 from channel.wechat_desktop.db.source import WechatDatabaseSource
@@ -312,6 +312,9 @@ class WechatDatabaseBackend(WechatDesktopBackend):
 
     def search_contacts(self, query="", limit=20):
         return {"contacts": self.source.search_contacts(query, limit), "source": "wechat_database"}
+
+    def list_group_conversations(self) -> list[ConversationTarget]:
+        return self.source.list_group_conversations()
 
     def read_chat_history(self, conversation_id, limit=20):
         try:

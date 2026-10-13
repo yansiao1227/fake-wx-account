@@ -6,6 +6,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -103,6 +104,14 @@ class WechatDesktopStore:
                     result TEXT NOT NULL DEFAULT '{}',
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS changelog_deliveries (
+                    day TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(day, target)
+                );
                 CREATE TABLE IF NOT EXISTS audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at REAL NOT NULL,
@@ -163,6 +172,8 @@ class WechatDesktopStore:
                     created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_rate_events_created ON rate_events(created_at);
+                CREATE INDEX IF NOT EXISTS idx_changelog_deliveries_updated
+                    ON changelog_deliveries(updated_at);
                 CREATE INDEX IF NOT EXISTS idx_conversation_history
                     ON conversation_history(conversation_id, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_history_source_event
@@ -641,6 +652,48 @@ class WechatDesktopStore:
             db.execute("UPDATE deliveries SET status=?,result=?,updated_at=? WHERE delivery_id=?",
                        (result.status.value, json.dumps(result.to_dict(), ensure_ascii=False), time.time(), delivery_id))
 
+    def claim_changelog(self, day: str, target: str) -> bool:
+        """按日期和稳定会话身份原子占位；正文变化或重启均不重放。"""
+        if date.fromisoformat(day).isoformat() != day or not target:
+            raise ValueError("invalid changelog delivery identity")
+        with self._lock, self._connect() as db:
+            inserted = db.execute(
+                "INSERT INTO changelog_deliveries(day,target,status,result,updated_at) "
+                "VALUES (?,?,'sending','{}',?) ON CONFLICT(day,target) DO NOTHING",
+                (day, target, time.time()),
+            )
+            return inserted.rowcount == 1
+
+    def finish_changelog(self, day: str, target: str, result: SendResult):
+        """只收尾仍在发送的占位，保留全部终态供诊断并禁止自动重试。"""
+        with self._lock, self._connect() as db:
+            db.execute(
+                "UPDATE changelog_deliveries SET status=?,result=?,updated_at=? "
+                "WHERE day=? AND target=? AND status='sending'",
+                (result.status.value, json.dumps(result.to_dict(), ensure_ascii=False),
+                 time.time(), day, target),
+            )
+
+    def release_changelog(self, day: str, target: str) -> bool:
+        """仅供 DeliveryBlocked 证明提交前被门禁拒绝时释放占位。"""
+        with self._lock, self._connect() as db:
+            deleted = db.execute(
+                "DELETE FROM changelog_deliveries WHERE day=? AND target=? AND status='sending'",
+                (day, target),
+            )
+            return deleted.rowcount == 1
+
+    def get_changelog_delivery(self, day: str, target: str) -> dict:
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM changelog_deliveries WHERE day=? AND target=?", (day, target),
+            ).fetchone()
+        if row is None:
+            return {}
+        delivery = dict(row)
+        delivery["result"] = json.loads(delivery["result"])
+        return delivery
+
     def delivery_outcome(self, event_ids: list[str], fallback: str) -> str:
         """最终回复和活跃发送保留不确定性；结束的辅助通知不改写任务终态。"""
         with self._lock, self._connect() as db:
@@ -944,9 +997,15 @@ class WechatDesktopStore:
         retention_days: int = 7,
         history_retention_days: int = 90,
     ):
-        cutoff = time.time() - max(1, int(retention_days)) * 86400
+        now = time.time()
+        cutoff = now - max(1, int(retention_days)) * 86400
         with self._lock, self._connect() as db:
             self._cleanup_source_ledger(db, cutoff)
+            # 每日报告去重至少保留 48 小时，短保留期也不能让当天被再次广播。
+            db.execute(
+                "DELETE FROM changelog_deliveries WHERE updated_at < ?",
+                (now - max(2, int(retention_days)) * 86400,),
+            )
             terminal_states = tuple(sorted(EVENT_TERMINALS))
             terminal_slots = ",".join("?" for _ in terminal_states)
             # DB 活跃任务和仍受批次保护的事件保留原文；UIA 的原保留期不变。

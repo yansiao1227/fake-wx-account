@@ -28,8 +28,11 @@ class DeliveryService:
              is_group: bool = False, content_type: str = "text",
              interim: bool = False, token: str = "",
              source_event_ids: list[str] | None = None,
-             authorized_target: ConversationTarget | None = None) -> SendResult:
+             authorized_target: ConversationTarget | None = None,
+             cancel_check: Callable[[], None] | None = None) -> SendResult:
         def check_cancelled():
+            if cancel_check is not None:
+                cancel_check()
             if self.is_stopped() or self.is_paused() or (token and not self.is_active(token)):
                 raise DeliveryBlocked("send cancelled, paused or expired")
             if not self.policy.allows_send(policy_target, is_group, content_type):
