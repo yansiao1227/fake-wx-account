@@ -140,13 +140,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model_api_retry_max_seconds": 10.0,
     "model_api_retry_jitter_seconds": 0.5,
 
-    # Agent 回复周期与工具调用进度通知。
+    # Agent 回复周期与 Jev 工具/技能决策进度通知。
     "reply_cycle_timeout_seconds": 180,
-    "agent_tool_notice_enabled": True,
+    "jev_decision_notice_enabled": True,
+    "jev_decision_notice_templates": [
+        "Jev 计划使用工具：{tools}；技能：{skills}",
+    ],
+    # 旧 Agent 通知配置仅兼容保留，生产流程不再发送主 Agent 的工具进度。
+    "agent_tool_notice_enabled": False,
     "agent_tool_notice_once_per_reply": True,
-    # 仅在 Agent 真正开始调用工具时通知；不要在 LLM 决策前提前猜工具。
+    # 遗留配置，仅兼容保留；附件解析前不再预发工具通知。
     "agent_preflight_notice_enabled": False,
-    # 用户看不懂的底层/内部工具不发微信进度通知。读取 SKILL.md 仍按 skill 通知。
+    # 遗留过滤/模板配置，仅旧通知兼容入口使用；Jev 清单完整展示所有工具与 skill。
     "agent_tool_notice_silent_tools": [
         "bash",
         "ls",

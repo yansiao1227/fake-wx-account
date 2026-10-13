@@ -3,16 +3,53 @@ from channel.wechat_desktop.models import WechatDesktopEvent
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.pipeline.prompts import (
     _format_agent_notice,
+    _format_jev_decision_notice,
     _format_failure_notice,
     _is_network_reply_error,
     _is_user_visible_tool_notice,
     _link_reading_instruction,
     _link_reading_urls,
+    _normalize_jev_notice_names,
     _preflight_tool_notice_data,
     _render_event_context_lines,
     _tool_notice_subject,
 )
 import pytest
+
+
+def test_jev_notice_names_are_cleaned_and_stably_deduplicated():
+    assert _normalize_jev_notice_names([" read ", "bash", "read", "web\nsearch", "`xlsx`", None]) == [
+        "read", "bash", "web search", "xlsx",
+    ]
+    assert _normalize_jev_notice_names("read") == []
+
+
+def test_jev_notice_lists_all_tools_and_skills_without_truncation():
+    tools = [f"tool_{index}_long_name" for index in range(15)]
+    notice = _format_jev_decision_notice([], tools + [tools[0]], ["pdf-reader", "xlsx", "pdf-reader"])
+    assert notice == "Jev 计划使用工具：" + "、".join(tools) + "；技能：pdf-reader、xlsx"
+
+
+@pytest.mark.parametrize("templates", [
+    [], ["我去处理一下"], ["计划：{tools}"],
+    ["Jev 工具（{tool_count}）：{tools:.3}；技能（{skill_count}）：{skills}"],
+])
+def test_jev_notice_custom_templates_always_include_full_lists(templates):
+    notice = _format_jev_decision_notice(templates, ["read", "bash"], ["xlsx", "pdf-reader"])
+    assert "Jev 计划使用工具：read、bash；技能：xlsx、pdf-reader" in notice
+
+
+def test_jev_notice_full_template_and_empty_category():
+    notice = _format_jev_decision_notice(
+        ["Jev 工具（{tool_count}）：{tools}；技能（{skill_count}）：{skills}"], [], ["xlsx"],
+    )
+    assert notice == "Jev 工具（0）：无；技能（1）：xlsx"
+
+
+@pytest.mark.parametrize("template", ["错误 {unknown}", "错误 {tools", "错误 {tools.missing}"])
+def test_jev_notice_invalid_template_falls_back_to_complete_plan(template):
+    notice = _format_jev_decision_notice([template], ["read"], [])
+    assert notice == "Jev 计划使用工具：read；技能：无"
 
 
 def test_network_reply_error_detection():

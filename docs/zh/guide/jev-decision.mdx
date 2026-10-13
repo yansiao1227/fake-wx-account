@@ -1,0 +1,98 @@
+---
+title: Jev 并行决策
+description: 通过现有 NewAPI 接入工具、技能推荐与完成检查
+---
+
+Jev 与主 Agent 的上下文准备和首轮生成并行。它只返回候选建议，
+工具参数和工具执行仍由主 Agent 负责。建议不匹配、概率不足、服务超时、
+凭据缺失或并发额度已满时，继续使用原有工具调用流程。
+
+## 配置与接口
+
+配置写在根 config.json 的 agent_decision，字段样例见
+config-template.json。这是跨通道 Agent 配置，不写入微信通道配置。
+模板默认关闭；启用时保留整段参数并把 enabled 改为 true。
+
+    {
+      "agent_decision": {
+        "enabled": true,
+        "model": "jev-1.13",
+        "request_timeout": 3.0,
+        "route_wait_seconds": 0.15,
+        "route_min_probability": 0.85,
+        "skill_min_probability": 0.85,
+        "max_skill_chars": 16000,
+        "completion_enabled": true,
+        "completion_wait_seconds": 0.4,
+        "completion_min_probability": 0.95
+      }
+    }
+
+先读取 ~/.cow/.env，再解析环境变量。默认复用成对的
+NEWAPI_API_BASE（也支持 NEWAPI_BASE_URL）和 NEWAPI_API_KEY，
+或 CUSTOM_API_BASE / CUSTOM_API_KEY，或当前选中的 custom provider 配置。
+也可使用专用 TYPESAFE_API_BASE / TYPESAFE_API_KEY；
+agent_decision.api_base / api_key 仅作可选回退，不要把生产密钥写入模板。
+不同网关的地址和密钥不会混合。
+
+请求地址是 NewAPI 根地址加 /typesafe/v1/systemone。现有地址末尾的
+OpenAI 兼容 /v1 会自动移除，完整 TypeSafe 地址也可以直接使用。
+请求体为 model、state、questions，不走 Chat Completions，也不启用长重试。
+
+## 并行行为
+
+- 每个运行拥有独立的只读决策任务和输入版本；迟到结果不进入其他运行。
+- 路由判断、每个工具是否必需及启用技能的相关性放在同一次请求中。
+  工具和技能都支持多选，工具计划包含后续必需步骤；首选工具用于排序。
+- 命中的技能携带正文、文件路径和相对资源根目录；预读额度不足时标记截断，
+  主模型仍需读取缺失部分。禁用、不可供模型调用或不在本轮过滤名单中的技能不会预读。
+- 尚未确定路由时，生成内容暂存为草稿。高概率工具建议到达且模型尚未提出
+  工具调用时，关闭当前流，带建议重新规划；草稿不会外发或写入会话历史。
+- 模型已有工具调用时保留它，不因旁路建议跳过或重复执行。
+- 工具执行后，完成检查与下一轮答复生成并行。只使用本轮工具证据，
+  明确发现遗漏时最多触发一次补充检查；不强制终止主模型选定的验证工具。
+- 工具证据被截断、超过保留窗口或完成检查输入超过大小限制时，
+  跳过独立完成判断，避免根据不完整片段误判遗漏。
+- 用户中途追加指令会使旧决策失效；取消、步数上限和失败保护仍按原流程处理。
+
+route_min_probability 和 completion_min_probability 比较的是返回的
+选项概率或 Noul 概率，不是 Choice 的 confidence 字段。
+概率门限应通过中文任务样本验证，类型安全不保证语义正确。
+Jev 只接收文本，图片判断依赖先前视觉/OCR 工具产生的文本证据。
+
+## 微信进度提示
+
+微信桌面通道在收到 Jev 工具路由后，发送一次计划汇总，完整列出其选择的
+工具和技能，名称经过去重。例如：
+
+> Jev 计划使用工具：web_search、bash；技能：report
+
+这份清单表示 Jev 的计划，实际执行仍由主 Agent 根据工具结果决定。
+主 Agent 开始执行工具、读取技能时不再另发进度提示，附件物化前也不再预发
+工具或技能提示。Jev 未启用、决策回退、普通直接答复或清单为空时不发此提示。
+
+开关 jev_decision_notice_enabled 与文案模板 jev_decision_notice_templates
+位于 channel/wechat_desktop/config.py。模板支持 tools、skills、tool_count
+和 skill_count；缺少工具或技能清单时会补齐完整名单。默认文案不显示数量，
+数量统计保留在日志和审计中，也可通过 tool_count、skill_count 自定义展示。
+工具清单包含内部执行工具，不沿用旧工具通知的静默名单。更改代码或配置后
+需要重启服务。
+
+## 观测
+
+Jev 日志独立写入 jev.log，位于 COW_DATA_DIR 指定目录，未指定时写入
+当前工作目录。控制台及 run.log 同时保留带 [Jev] 前缀的运行时间线；
+其他普通日志不会进入 jev.log。更改日志方式后需要重启服务。
+
+每条记录携带 run（当前输入的随机标识前 8 位）、stage（route 或 completion）
+和 status。start 表示决策开始，done 表示已取得有效结果，adopted 表示主 Agent
+采用建议，replan 表示撤回草稿重新规划；observed 表示查看结果后仍由主模型判断。
+fallback / skip / discarded 分别表示回退、跳过和丢弃迟到或失效结果。
+elapsed_ms 记录决策耗时；日志不包含用户正文、历史、工具证据、技能正文或密钥。
+
+运行事件 decision_route 提供推荐工具、技能及概率，decision_completion
+提供完成检查动作及概率；不包含请求正文或密钥。
+微信计划提示以 jev_decision_notice 写入发送审计，并保存到会话历史；
+与最终回复使用相同的来源、会话授权、黑名单及队列有效性校验。
+衡量收益时记录端到端耗时、主模型轮数、重规划次数和错误提前结束率。
+并行可以覆盖部分等待，但错误推荐导致的重规划也会增加耗时。

@@ -1,10 +1,10 @@
-"""事件生命周期诊断；只记录耗时，不决定持久化状态、重试或发送。"""
+"""事件生命周期诊断仅写日志文件；不决定持久化状态、重试或发送。"""
 
 from __future__ import annotations
 import threading
 import time
 from channel.wechat_desktop.models import WechatDesktopEvent
-from common.log import logger
+from common.log import file_logger
 
 
 class LifecycleRecorder:
@@ -76,7 +76,7 @@ class LifecycleRecorder:
                     lifecycle["send_result"] = send_result
 
     def finish(self, event_ids, terminal: str):
-        """结束生命周期并输出从发现到发送完成的阶段耗时。"""
+        """结束生命周期，将从发现到发送完成的阶段耗时写入文件。"""
         rows = []
         with self._lock:
             for event_id in event_ids:
@@ -92,7 +92,7 @@ class LifecycleRecorder:
                 value = lifecycle.get(field)
                 return "-" if value is None else str(max(0, int((value - detected) * 1000)))
 
-            logger.info(
+            file_logger.info(
                 "[WechatDesktop][lifecycle] "
                 "event_id=%s batch_id=%s conversation=%s terminal=%s "
                 "detected=0 materialized=%s queued=%s agent_started=%s "

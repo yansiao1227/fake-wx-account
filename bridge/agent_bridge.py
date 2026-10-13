@@ -216,6 +216,7 @@ class AgentLLMModel(LLMModel):
         """
         Call the model with streaming using COW's bot infrastructure
         """
+        stream = None
         try:
             if hasattr(self.bot, 'call_with_tools'):
                 # Use tool-enabled streaming call if available
@@ -275,6 +276,13 @@ class AgentLLMModel(LLMModel):
         except Exception as e:
             logger.error(f"AgentLLMModel call_stream error: {e}", exc_info=True)
             raise
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
     
     def _format_response(self, response):
         """Format Claude response to our expected format"""

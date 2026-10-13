@@ -2,7 +2,7 @@
 
 import logging
 from channel.wechat_desktop.models import WechatDesktopEvent
-from common.log import logger
+from common.log import file_logger, logger
 from channel.wechat_desktop.pipeline.lifecycle import LifecycleRecorder
 
 
@@ -29,7 +29,7 @@ def test_concurrent_finish_logs_once_and_late_marks_do_not_revive_record(monkeyp
     event = WechatDesktopEvent("message", "a", "Alice", "a", "Alice", "text", "hello")
     recorder.start(event)
     emitted = []
-    monkeypatch.setattr(logger, "info", lambda *args: emitted.append(args))
+    monkeypatch.setattr(file_logger, "info", lambda *args: emitted.append(args))
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(lambda _: recorder.finish([event.event_id], "completed"), range(12)))
     recorder.mark([event.event_id], "send_verified")
@@ -47,13 +47,20 @@ def test_lifecycle_summary_is_one_info_line_per_source_message():
         "message", "a", "Alice", "a", "Alice", "text", "hello"
     )
     records = []
+    console_records = []
 
     class Capture(logging.Handler):
-        def emit(self, record):
-            records.append(record.getMessage())
+        def __init__(self, target):
+            super().__init__()
+            self.target = target
 
-    handler = Capture()
-    logger.addHandler(handler)
+        def emit(self, record):
+            self.target.append(record.getMessage())
+
+    handler = Capture(records)
+    console_handler = Capture(console_records)
+    file_logger.addHandler(handler)
+    logger.addHandler(console_handler)
     try:
         recorder.start(event)
         recorder.mark(
@@ -67,7 +74,8 @@ def test_lifecycle_summary_is_one_info_line_per_source_message():
         recorder.mark([event.event_id], "agent_done")
         recorder.finish([event.event_id], "completed")
     finally:
-        logger.removeHandler(handler)
+        file_logger.removeHandler(handler)
+        logger.removeHandler(console_handler)
 
     lifecycle_lines = [
         line for line in records if line.startswith("[WechatDesktop][lifecycle]")
@@ -75,3 +83,6 @@ def test_lifecycle_summary_is_one_info_line_per_source_message():
     assert len(lifecycle_lines) == 1
     assert "event_id=" + event.event_id in lifecycle_lines[0]
     assert "attachment_resolve_count=1" in lifecycle_lines[0]
+    assert not any(
+        line.startswith("[WechatDesktop][lifecycle]") for line in console_records
+    )

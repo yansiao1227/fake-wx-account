@@ -8,7 +8,7 @@ _LOG_FORMAT = "[%(levelname)s][%(asctime)s][%(filename)s:%(lineno)d] - %(message
 _LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
 
-def _log_path():
+def _log_path(filename="run.log"):
     # Mirror config.get_data_root() without importing config (avoids a circular
     # import, since config imports this module). The desktop build sets
     # COW_DATA_DIR (e.g. ~/.cow); source deployments fall back to CWD.
@@ -16,18 +16,18 @@ def _log_path():
     if data_dir:
         data_dir = os.path.expanduser(data_dir)
         os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, "run.log")
-    return "run.log"
+        return os.path.join(data_dir, filename)
+    return filename
 
 
 def _make_formatter() -> logging.Formatter:
     return logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT)
 
 
-def _try_add_file_handler(log: logging.Logger) -> bool:
-    """Attach a FileHandler writing to run.log. Returns False if unwritable."""
+def _try_add_file_handler(log: logging.Logger, filename="run.log") -> bool:
+    """Attach a UTF-8 file handler. Returns False if unwritable."""
     try:
-        file_handle = logging.FileHandler(_log_path(), encoding="utf-8")
+        file_handle = logging.FileHandler(_log_path(filename), encoding="utf-8")
         file_handle.setFormatter(_make_formatter())
         log.addHandler(file_handle)
         return True
@@ -92,3 +92,18 @@ def _get_file_logger():
 logger = _get_logger()
 # 仅文件：会话扫描等高频诊断日志
 file_logger = _get_file_logger()
+
+
+def _get_jev_logger():
+    """Jev 单独落盘，同时经父 logger 保留控制台和运行时间线。"""
+    log = logging.getLogger("log.jev")
+    _clear_handlers(log)
+    log.setLevel(logging.INFO)
+    log.propagate = True
+    if not _try_add_file_handler(log, "jev.log"):
+        # 即使专用文件不可写，也继续通过父 logger 记录，不能影响 Agent。
+        log.addHandler(logging.NullHandler())
+    return log
+
+
+jev_logger = _get_jev_logger()

@@ -2,6 +2,7 @@
 
 import sqlite3
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,12 +59,11 @@ def change_source(cache, talker, local_id, change="delete"):
 
 def send_notice(channel, event, context, kind):
     item = ReplyQueueItem(event=event, source_event_ids=[event.event_id], token="")
-    if kind == "tool":
-        return channel._send_agent_tool_notice(context, {"tool_name": "web_search"})
-    if kind == "attachment":
-        # 只更改展示字段，原生签名和来源 ID 保持为读取时的快照。
-        event.reference = {"content_type": "image", "file_path": "synthetic-image.png"}
-        return channel._send_deferred_attachment_notice(item)
+    if kind == "jev":
+        return channel._send_jev_decision_notice(context, {
+            "route": "tools", "tools": ["web_search", "web_fetch"],
+            "skills": ["search"], "confidence": .99,
+        })
     if kind == "failure":
         return channel._send_agent_failure_notice(context=context)
     return channel._send_attachment_reference_prompt(item)
@@ -83,7 +83,7 @@ def test_final_reply_rejects_context_changed_during_reasoning(native_reply, kind
     assert context["wechat_desktop_queue_terminal"] == "skipped"
 
 
-@pytest.mark.parametrize("kind", ["tool", "attachment", "failure", "reference"])
+@pytest.mark.parametrize("kind", ["jev", "failure", "reference"])
 @pytest.mark.parametrize("local_id", [1, 2])
 def test_every_notice_revalidates_primary_and_context_sources(native_reply, kind, local_id):
     channel, _, talker, cache, _, event, context, gateway = native_reply
@@ -98,7 +98,7 @@ def test_every_notice_revalidates_primary_and_context_sources(native_reply, kind
     assert not event.task.failure_notice_sent
 
 
-@pytest.mark.parametrize("kind", ["tool", "attachment", "failure", "reference"])
+@pytest.mark.parametrize("kind", ["jev", "failure", "reference"])
 def test_valid_notice_preserves_authorized_current_target(native_reply, kind):
     channel, _, _, _, _, event, context, _ = native_reply
     submissions = []
@@ -114,8 +114,32 @@ def test_valid_notice_preserves_authorized_current_target(native_reply, kind):
     assert kwargs["source_event_ids"] == [event.event_id]
 
 
+@pytest.mark.parametrize("blocked_by", ["paused", "shadow_mode", "expired_token", "disabled"])
+def test_jev_notice_respects_runtime_send_guards(native_reply, blocked_by):
+    channel, _, _, _, _, event, context, gateway = native_reply
+    submissions = []
+    channel._deliver = lambda *args, **kwargs: submissions.append(args) or SendResult(SendStatus.SENT)
+    if blocked_by == "paused":
+        channel._service = SimpleNamespace(status=lambda: {"paused": True})
+    elif blocked_by == "shadow_mode":
+        channel.config["shadow_mode"] = True
+    elif blocked_by == "disabled":
+        channel.config["jev_decision_notice_enabled"] = False
+    else:
+        channel._reply_queue.enqueue(event)
+        item = channel._reply_queue.get()
+        context["wechat_desktop_queue_token"] = item.token
+        channel._reply_queue.expire(item.token)
+
+    assert send_notice(channel, event, context, "jev") is False
+
+    assert submissions == [] and gateway.client.ui_calls == []
+    assert channel._store._get_connection().execute(
+        "SELECT count(*) FROM conversation_history WHERE direction='outgoing'").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, ReplyType.IMAGE_URL,
-                                  "tool", "attachment", "failure", "reference"])
+                                  "jev", "failure", "reference"])
 @pytest.mark.parametrize("blocked_name", ["新名称", "Synthetic"])
 def test_current_contact_blacklist_uses_latest_name(native_reply, kind, blocked_name):
     channel, reader, talker, _, _, event, context, gateway = native_reply
@@ -142,7 +166,7 @@ def test_current_contact_blacklist_uses_latest_name(native_reply, kind, blocked_
         assert kwargs["authorized_target"] == ConversationTarget(event.conversation_id, "新名称", False)
 
 
-@pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, "tool", "failure", "reference"])
+@pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, "jev", "failure", "reference"])
 def test_current_backend_group_type_controls_policy(native_reply, kind):
     channel, _, _, _, _, event, context, _ = native_reply
     channel._driver.resolve_send_target = lambda identity: TargetResolution(
@@ -198,7 +222,7 @@ def test_dispatch_snapshot_cannot_be_erased_after_context_is_used(native_reply):
     assert submissions == [] and context["wechat_desktop_queue_terminal"] == "skipped"
 
 
-@pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, "tool", "failure"])
+@pytest.mark.parametrize("kind", [ReplyType.TEXT, ReplyType.IMAGE, "jev", "failure"])
 def test_missing_primary_event_never_authorizes_automatic_reply_or_notice(native_reply, kind):
     channel, _, _, _, _, event, context, gateway = native_reply
     context["msg"] = None

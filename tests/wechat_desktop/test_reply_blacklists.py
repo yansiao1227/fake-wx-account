@@ -98,14 +98,14 @@ def test_private_blacklist_does_not_suppress_group_member_with_same_name(store):
     assert scheduled == [event]
 
 
-@pytest.mark.parametrize("notice", ["tool", "failure"])
+@pytest.mark.parametrize("notice", ["jev", "failure"])
 @pytest.mark.parametrize("group", [False, True])
 @pytest.mark.parametrize("blocked", [False, True])
-def test_blacklist_is_rechecked_before_tool_and_failure_notices(store, notice, group, blocked):
+def test_blacklist_is_rechecked_before_jev_and_failure_notices(store, notice, group, blocked):
     channel = _bare_wechat_channel()
     channel.config = load_wechat_desktop_config({
         "shadow_mode": False,
-        "agent_tool_notice_templates": ["正在调用 {tool_name}"],
+        "jev_decision_notice_templates": ["Jev 计划使用工具：{tools}；skill：{skills}"],
         "agent_failure_notice_templates": ["请重新尝试"],
     })
     channel._store = store
@@ -140,8 +140,11 @@ def test_blacklist_is_rechecked_before_tool_and_failure_notices(store, notice, g
     blocked_key = "auto_reply_group_blacklist" if (group if blocked else not group) else "auto_reply_private_blacklist"
     channel.config[blocked_key] = [event.conversation_name]
 
-    if notice == "tool":
-        sent = AgentReplyCoordinator(channel).send_tool_notice(context, {"tool_name": "web_search"})
+    if notice == "jev":
+        sent = AgentReplyCoordinator(channel).send_decision_notice(context, {
+            "route": "tools", "tools": ["web_search", "web_fetch"],
+            "skills": ["search"], "confidence": .99,
+        })
     else:
         sent = channel._send_agent_failure_notice(context=context, reason="合成失败")
 
