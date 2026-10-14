@@ -42,6 +42,17 @@ class WechatDesktopSendMixin:
         """生成审计用摘要，避免在审计记录里重复保存完整正文。"""
         return hashlib.sha256(str(content or "").encode("utf-8")).hexdigest()
 
+    def _record_send_blocked(self, target: str, content, content_type: str, reason: str):
+        """拒绝发送也记录明确原因，避免模型完成后无声丢弃回复。"""
+        logger.warning(
+            "[WechatDesktop] reply send blocked: target=%s type=%s reason=%s",
+            target, content_type, reason,
+        )
+        self._trace("12-send-blocked", "target=%s type=%s reason=%s", target, content_type, reason)
+        self._store.audit(
+            f"send_{content_type}", target, "blocked", self._content_hash(content), detail=reason,
+        )
+
     def send(self, reply: Reply, context: Context):
         """ChatChannel 发送入口；所有安全判断集中在 ``_send_reply_impl``。"""
         return self._send_reply_impl(reply, context)
@@ -483,8 +494,9 @@ class WechatDesktopSendMixin:
                         context["wechat_desktop_queue_terminal"] = SendResult.from_backend(result).terminal
                         return
                     raise RuntimeError(str(result.get("message") or "send failed"))
-                except DeliveryBlocked:
+                except DeliveryBlocked as exc:
                     context["wechat_desktop_queue_terminal"] = "skipped"
+                    self._record_send_blocked(target_name, reply_text, "text", str(exc))
                     return
                 except Exception as exc:
                     self._mark_lifecycle(
@@ -500,6 +512,10 @@ class WechatDesktopSendMixin:
                         exc,
                     )
             context["wechat_desktop_queue_terminal"] = "failed" if can_auto else "skipped"
+            if not can_auto:
+                reason = "paused" if paused else "shadow_mode" if self.config.get("shadow_mode", True) else "reply_policy"
+                self._record_send_blocked(target_name, reply_text, "text", reason)
+                return
             self._store.audit(
                 "send_text",
                 target_name,
@@ -565,8 +581,9 @@ class WechatDesktopSendMixin:
                         "[WechatDesktop] automatic image send returned unsuccessful: %s",
                         result,
                     )
-                except DeliveryBlocked:
+                except DeliveryBlocked as exc:
                     context["wechat_desktop_queue_terminal"] = "skipped"
+                    self._record_send_blocked(target_name, reply.content, "image", str(exc))
                     return
                 except Exception as exc:
                     logger.warning(
@@ -585,6 +602,14 @@ class WechatDesktopSendMixin:
                     str(reply.content or "")[:200],
                 )
             context["wechat_desktop_queue_terminal"] = "failed" if can_auto else "skipped"
+            if not can_auto:
+                reason = (
+                    "paused" if paused else "shadow_mode" if self.config.get("shadow_mode", True)
+                    else "auto_send_images_disabled" if not self.config.get("auto_send_images", False)
+                    else "reply_policy"
+                )
+                self._record_send_blocked(target_name, reply.content, "image", reason)
+                return
             self._store.audit(
                 "send_image",
                 target_name,

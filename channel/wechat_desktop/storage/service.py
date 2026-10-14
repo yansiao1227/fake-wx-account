@@ -7,6 +7,7 @@ from typing import Callable, Optional
 from channel.wechat_desktop.config import DEFAULT_CONFIG
 from channel.wechat_desktop.storage.store import WechatDesktopStore
 from common.utils import expand_path
+from common.log import logger
 from config import conf
 
 
@@ -52,6 +53,11 @@ class WechatDesktopService:
             "account_binding": {},
             "db_read_metadata": {},
         }
+        if self._status["paused"]:
+            logger.warning(
+                "[WechatDesktop] 发送已暂停：已恢复上次保存的暂停状态；"
+                "请在控制台点击“恢复接管”后恢复发送（paused=True）"
+            )
 
     def set_agent_executor(self, executor: Optional[Callable]):
         with self._lock:
@@ -84,9 +90,18 @@ class WechatDesktopService:
 
     def set_paused(self, paused: bool):
         paused = bool(paused)
-        self.store.set_state("paused", paused)
-        self.update_status(paused=paused)
-        return self.status()
+        with self._lock:
+            previous = self._status["paused"]
+            self.store.set_state("paused", paused)
+            self._status["paused"] = paused
+            status = dict(self._status)
+        if previous != paused:
+            logger.info(
+                "[WechatDesktop] %s（paused=%s）",
+                "发送已暂停" if paused else "接管已恢复，允许发送回复",
+                paused,
+            )
+        return status
 
 _service = None
 _service_lock = threading.Lock()

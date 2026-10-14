@@ -9,7 +9,7 @@ from channel.wechat_desktop.uia.attachments import WechatAttachmentReader
 from channel.wechat_desktop.uia.chat_record_reader import WechatChatRecordReader
 from channel.wechat_desktop.text import split_message_text
 from channel.wechat_desktop.send_control import (
-    wait_send_delay,
+    check_send_allowed, wait_send_delay,
 )
 import hashlib
 import ctypes
@@ -45,6 +45,7 @@ from channel.wechat_desktop.conversation import (
 from channel.wechat_desktop.uia.controls import (
     SESSION_PREFIX,
     MESSAGE_LIST_ID,
+    INPUT_ID,
     HISTORY_LIST_ID,
     HISTORY_WINDOW_CLASS,
     MENTION_MARKERS,
@@ -317,7 +318,7 @@ class WechatUiaClient:
                 )
             except Exception:
                 foreground_process_id = 0
-            if int(foreground_process_id) == int(process_id):
+            if int(foreground_process_id) == int(process_id) and not win32gui.IsIconic(hwnd):
                 return False
 
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
@@ -425,23 +426,41 @@ class WechatUiaClient:
             return False
         return False
 
+    def _has_chat_controls(self) -> bool:
+        """系统标题栏不代表 Qt 已暴露微信控件，须看到真实聊天结构。"""
+        with self.operation_lock, self._uia_root() as root:
+            return any(
+                _text(control.AutomationId).startswith(SESSION_PREFIX)
+                or _text(control.AutomationId) in {MESSAGE_LIST_ID, INPUT_ID}
+                for control in self._walk(root)
+            )
+
+    def _restore_accessibility(self, hwnd: int) -> bool:
+        from channel.wechat_desktop.uia.accessibility import restore_accessibility
+
+        return restore_accessibility(
+            hwnd, probe=self._has_chat_controls,
+            wait=lambda: self._paced_wait("uia_focus_settle_ms_min", "uia_focus_settle_ms_max"),
+        )
+
     def _recover_empty_tree(self, hwnd: int) -> bool:
-        try:
-            if self.probe_tree() > 0:
-                return False
-        except Exception:
+        if self._has_chat_controls():
             return False
         attempts = max(0, min(int(self.config.get("uia_recovery_attempts", 3)), 3))
         settle = max(0, min(int(self.config.get("uia_recovery_settle_ms", 500)), 3000))
         for _ in range(attempts):
+            check_send_allowed()
             self._click_taskbar_button()
+            self.ensure_foreground_window()
             if settle:
                 if self._stop_event.wait(settle / 1000.0):
                     raise RuntimeError("WeChat UI Automation is stopping")
-            if self.probe_tree() > 0:
+            if self._has_chat_controls():
                 return True
+        if attempts and self._restore_accessibility(hwnd):
+            return True
         raise RuntimeError(
-            f"WeChat UI Automation tree remained empty after {attempts} recovery attempts"
+            f"WeChat UI Automation chat controls remained unavailable after {attempts} recovery attempts"
         )
 
     def _read_visible_owner_sidebar(self, root) -> str:

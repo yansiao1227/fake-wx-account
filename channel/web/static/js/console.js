@@ -6981,6 +6981,26 @@ function stopWechatDesktopPoll() {
     }
 }
 
+function buildWechatDesktopSendingBadges(status) {
+    const zh = currentLang === 'zh' || currentLang === 'zh-Hant';
+    let badges = '';
+    if (status.paused) {
+        badges += `<span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">${zh ? '发送已暂停' : 'Sending paused'}</span>`;
+    }
+    if (status.shadow_mode) {
+        badges += `<span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">${zh ? '影子模式：不发送' : 'Shadow mode: no sending'}</span>`;
+    }
+    return badges;
+}
+
+function buildWechatDesktopChannelStatus(status) {
+    const zh = currentLang === 'zh' || currentLang === 'zh-Hant';
+    const dotClass = status.paused ? 'bg-red-500' : status.shadow_mode ? 'bg-amber-400' : 'bg-primary-400';
+    return `<span class="w-2 h-2 rounded-full ${dotClass}"></span>
+        <span class="text-xs text-slate-500 dark:text-slate-400">${zh ? '登录状态' : 'Login status'}: ${escapeHtml(status.login_status || 'unknown')}</span>
+        ${buildWechatDesktopSendingBadges(status)}`;
+}
+
 function loadWechatDesktopPanel() {
     const panel = document.getElementById('wechat-desktop-panel');
     const statusEl = document.getElementById('wechat-desktop-status');
@@ -6989,6 +7009,8 @@ function loadWechatDesktopPanel() {
         if (statusData.status !== 'success') return;
         panel.classList.remove('hidden');
         const s = statusData.desktop || {};
+        const channelStatusEl = document.getElementById('wechat-desktop-channel-status');
+        if (channelStatusEl) channelStatusEl.innerHTML = buildWechatDesktopChannelStatus(s);
         const zh = currentLang === 'zh' || currentLang === 'zh-Hant';
         const stateText = escapeHtml(s.login_status || 'unknown');
         const modeText = escapeHtml(s.mode || 'unavailable');
@@ -7007,10 +7029,9 @@ function loadWechatDesktopPanel() {
                     <div class="flex items-center gap-2">
                         <i class="fas fa-desktop text-emerald-500"></i>
                         <h3 class="font-semibold text-slate-800 dark:text-slate-100">${zh ? '桌面微信自动化' : 'Desktop WeChat automation'}</h3>
-                        ${s.shadow_mode ? `<span class="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300">${zh ? '影子模式' : 'Shadow mode'}</span>` : ''}
                     </div>
                     <div class="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
-                        <span>${zh ? '状态' : 'Status'}: ${stateText}</span>
+                        <span class="inline-flex flex-wrap items-center gap-2">${zh ? '登录状态' : 'Login status'}: ${stateText}${buildWechatDesktopSendingBadges(s)}</span>
                         <span>${zh ? '观测' : 'Observation'}: ${modeText}</span>
                         <span>${zh ? '微信账号' : 'WeChat account'}: ${accountText}</span>
                         <span>UIA: ${escapeHtml(uiaText)}</span>
@@ -7077,6 +7098,9 @@ function renderActiveChannels() {
             statusDot = 'bg-primary-400';
             statusText = `<span class="text-xs text-primary-500">${t('channels_connected')}</span>`;
         }
+        const statusHtml = ch.name === 'wechat_desktop'
+            ? `<span id="wechat-desktop-channel-status" class="inline-flex flex-wrap items-center gap-2">${buildWechatDesktopChannelStatus(ch.desktop_status || {})}</span>`
+            : `<span class="w-2 h-2 rounded-full ${statusDot}"></span>${statusText}`;
 
         card.innerHTML = `
             <div class="flex items-center gap-4${hasFields || weixinWaiting ? ' mb-5' : ''}">
@@ -7086,8 +7110,7 @@ function renderActiveChannels() {
                 <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2">
                         <span class="font-semibold text-slate-800 dark:text-slate-100">${escapeHtml(label)}</span>
-                        <span class="w-2 h-2 rounded-full ${statusDot}"></span>
-                        ${statusText}
+                        ${statusHtml}
                     </div>
                     <p class="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono">${escapeHtml(ch.name)}</p>
                 </div>

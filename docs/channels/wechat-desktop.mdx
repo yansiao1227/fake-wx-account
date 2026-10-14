@@ -7,6 +7,8 @@ The `wechat_desktop` channel uses the `db_uia` backend on Windows. Local encrypt
 
 The implementation targets WeChat **4.1.9.30** and the workstation's **Python 3.13.11 x64** Conda environment. Database access is read-only; it does not modify WeChat's process memory or original databases. Only data already synchronized to this computer is available.
 
+If UIA exposes an empty tree during sending or necessary attachment actions, the channel first restores the window. As a fallback, it enables the Qt accessibility boolean only for the verified 4.1.9.30 DLL build. Version, file fingerprint, live instructions, and window identity must match; failed recovery rolls back the flag without modifying the DLL, code pages, or databases.
+
 ## Architecture
 
 | Component | Responsibility |

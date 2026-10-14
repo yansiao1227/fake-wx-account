@@ -1,0 +1,10 @@
+微信 Qt 无障碍恢复思路参考 wechatauto-replica：
+https://github.com/fanyuantaier/wechatauto-replica
+固定提交：19a31e3b3cdae9f4ce8cc1813fcbaad66e5901b8
+参考文件：wechatauto/uia_driver.py（Apache License 2.0）
+许可证全文见 ../db/UPSTREAM_LICENSE.txt。
+
+本项目自行实现固定 4.1.9.30 构建的版本、DLL SHA256、运行态指令、
+窗口与进程校验。仅在发送或已授权附件操作无法恢复 UIA 时启用一个
+无障碍布尔字节；失败回滚。不扫描或套用其他版本地址，不修改 DLL、
+代码页、数据库或注册表。

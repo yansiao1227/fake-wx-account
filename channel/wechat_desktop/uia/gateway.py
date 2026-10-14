@@ -6,6 +6,7 @@ import threading
 from contextlib import contextmanager
 from typing import Callable, Optional
 
+from common.log import logger
 from channel.wechat_desktop.contracts import ConversationTarget, SendResult, SendStatus
 from channel.wechat_desktop.conversation import conversation_header_matches_target
 from channel.wechat_desktop.models import ConversationInfo, HeaderInfo, OwnerInfo
@@ -19,6 +20,10 @@ from channel.wechat_desktop.uia.operations import (
     WechatSendOperations,
     resolve_conversation_selector,
 )
+
+
+class WechatUiaRecoveryError(RuntimeError):
+    code = "uia_target_lookup_recovery_failed"
 
 
 class _UiaPriorityCoordinator:
@@ -205,6 +210,17 @@ class WechatUiaGateway:
                 return False
             return WechatConversationSearchOperations(self.client).ensure_conversation_visible(
                 display_name, is_group=is_group, expected_pid=expected_pid)
+
+    def prepare_target_lookup(self) -> None:
+        """可信目标的实际操作阶段才允许激活并恢复空 UIA 树。"""
+        with self.operation():
+            try:
+                self.client.focus_window()
+            except SendCancelled:
+                raise
+            except Exception as exc:
+                logger.warning("[WechatDesktop] UIA target lookup recovery failed: %s", exc)
+                raise WechatUiaRecoveryError("微信 UIA 会话控件恢复失败") from exc
 
     def read_current_title(self) -> HeaderInfo:
         with self.operation():

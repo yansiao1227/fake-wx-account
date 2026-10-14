@@ -1,11 +1,13 @@
 """只模拟窗口与进程 API，验证微信主窗口识别不访问真实桌面。"""
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 
 from channel.wechat_desktop.uia.client import WechatUiaClient, parse_session_accessible_name
+from .helpers import GeometryControl
 
 
 class FakeProcess:
@@ -308,9 +310,120 @@ def test_session_preview_without_sender_prefix_is_not_marked_as_incoming_sender(
 
 def test_white_tree_recovery_stops_after_tree_returns(monkeypatch):
     client = WechatUiaClient({"uia_recovery_attempts": 3, "uia_recovery_settle_ms": 0})
-    probes = iter([0, 0, 12])
+    empty = GeometryControl((0, 0, 1000, 800))
+    ready = GeometryControl((0, 0, 1000, 800), children=[
+        GeometryControl((0, 0, 300, 80), automation_id="session_item_Alice")])
+    trees = iter([empty, empty, ready])
     clicks = []
-    monkeypatch.setattr(client, "probe_tree", lambda: next(probes))
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(next(trees)))
     monkeypatch.setattr(client, "_click_taskbar_button", lambda: clicks.append(1) or True)
+    monkeypatch.setattr(client, "ensure_foreground_window", lambda: True)
+    monkeypatch.setattr(client, "_restore_accessibility", lambda hwnd: pytest.fail("树已恢复不能开启额外恢复"), raising=False)
     assert client._recover_empty_tree(123) is True
     assert len(clicks) == 2
+
+
+@pytest.mark.parametrize("automation_id", ["session_item_Alice", "chat_message_list", "chat_input_field"])
+def test_recovery_accepts_real_wechat_structure(monkeypatch, automation_id):
+    client = WechatUiaClient({"uia_recovery_attempts": 3, "uia_recovery_settle_ms": 0})
+    ready = GeometryControl((0, 0, 1000, 800), children=[
+        GeometryControl((0, 0, 300, 80), automation_id=automation_id)])
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(ready))
+    monkeypatch.setattr(client, "_click_taskbar_button", lambda: pytest.fail("正常微信树不能触发恢复"))
+    monkeypatch.setattr(client, "_restore_accessibility", lambda hwnd: pytest.fail("正常微信树不能开启额外恢复"), raising=False)
+
+    assert client._recover_empty_tree(123) is False
+
+
+def test_system_window_frame_does_not_finish_recovery(monkeypatch):
+    client = WechatUiaClient({"uia_recovery_attempts": 3, "uia_recovery_settle_ms": 0})
+    frame = GeometryControl((0, 0, 1000, 800), children=[
+        GeometryControl((0, 0, 1000, 30), "微信", automation_id="TitleBar"),
+        GeometryControl((900, 0, 1000, 30), "关闭", automation_id="Close"),
+    ])
+    ready = GeometryControl((0, 0, 1000, 800), children=[
+        GeometryControl((0, 0, 300, 80), automation_id="session_item_Alice")])
+    trees = iter([frame, frame, ready])
+    clicks = []
+    foregrounds = []
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(frame))
+    assert client.probe_tree() == 2  # 诊断计数照常报告系统节点。
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(next(trees)))
+    monkeypatch.setattr(client, "_click_taskbar_button", lambda: clicks.append(1) or True)
+    monkeypatch.setattr(client, "ensure_foreground_window", lambda: foregrounds.append(1) or True)
+    monkeypatch.setattr(client, "_restore_accessibility", lambda hwnd: pytest.fail("树已恢复不能开启额外恢复"), raising=False)
+
+    assert client._recover_empty_tree(123) is True
+    assert len(clicks) == len(foregrounds) == 2
+
+
+def test_frame_only_recovery_is_bounded_to_three_attempts(monkeypatch):
+    client = WechatUiaClient({"uia_recovery_attempts": 99, "uia_recovery_settle_ms": 0})
+    frame = GeometryControl((0, 0, 1000, 800), children=[
+        GeometryControl((0, 0, 1000, 30), "微信", automation_id="TitleBar")])
+    clicks = []
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(frame))
+    monkeypatch.setattr(client, "_click_taskbar_button", lambda: clicks.append(1) or True)
+    monkeypatch.setattr(client, "ensure_foreground_window", lambda: True)
+    monkeypatch.setattr(client, "_restore_accessibility", lambda hwnd: False, raising=False)
+
+    with pytest.raises(RuntimeError, match="chat controls remained unavailable after 3"):
+        client._recover_empty_tree(123)
+    assert len(clicks) == 3
+
+
+def test_frame_only_tree_uses_accessibility_recovery_after_standard_attempts(monkeypatch):
+    client = WechatUiaClient({"uia_recovery_attempts": 99, "uia_recovery_settle_ms": 0})
+    frame = GeometryControl((0, 0, 1000, 800), children=[
+        GeometryControl((0, 0, 1000, 30), "微信", automation_id="TitleBar")])
+    events = []
+    monkeypatch.setattr(client, "_uia_root", lambda: nullcontext(frame))
+    monkeypatch.setattr(client, "_click_taskbar_button", lambda: events.append("taskbar") or True)
+    monkeypatch.setattr(client, "ensure_foreground_window", lambda: events.append("foreground") or True)
+    monkeypatch.setattr(client, "_restore_accessibility", lambda hwnd: events.append(("accessibility", hwnd)) or True, raising=False)
+
+    assert client._recover_empty_tree(123) is True
+
+    assert events == ["taskbar", "foreground"] * 3 + [("accessibility", 123)]
+
+
+def test_client_accessibility_recovery_passes_structural_probe_and_pacing(monkeypatch):
+    from channel.wechat_desktop.uia import accessibility
+
+    client = WechatUiaClient({})
+    calls = []
+    monkeypatch.setattr(client, "_has_chat_controls", lambda: calls.append("probe") or True)
+    monkeypatch.setattr(client, "_paced_wait", lambda *args: calls.append("wait"))
+
+    def restore(hwnd, *, probe, wait):
+        assert hwnd == 123
+        wait()
+        assert probe() is True
+        return True
+
+    monkeypatch.setattr(accessibility, "restore_accessibility", restore)
+
+    assert client._restore_accessibility(123) is True
+    assert calls == ["wait", "probe"]
+
+
+@pytest.mark.parametrize("minimized", [True, False])
+def test_same_process_foreground_restores_minimized_main_window(monkeypatch, minimized):
+    client = WechatUiaClient({})
+    actions = []
+    monkeypatch.setattr(client, "_require_windows", lambda: None)
+    monkeypatch.setattr(client, "_window", lambda: (123, 42))
+    monkeypatch.setattr(client, "_paced_wait", lambda *args: None)
+    monkeypatch.setitem(sys.modules, "win32api", SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "win32con", SimpleNamespace(SW_RESTORE=9))
+    monkeypatch.setitem(sys.modules, "win32gui", SimpleNamespace(
+        GetForegroundWindow=lambda: 123,
+        IsIconic=lambda hwnd: minimized,
+        ShowWindow=lambda hwnd, command: actions.append(("restore", hwnd, command)),
+        SetForegroundWindow=lambda hwnd: actions.append(("foreground", hwnd)),
+    ))
+    monkeypatch.setitem(sys.modules, "win32process", SimpleNamespace(
+        GetWindowThreadProcessId=lambda hwnd: (1, 42)))
+
+    assert client.ensure_foreground_window() is minimized
+    assert actions == ([("restore", 123, 9), ("foreground", 123)] if minimized else [])

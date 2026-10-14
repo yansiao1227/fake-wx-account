@@ -117,7 +117,17 @@ class DatabaseUiaTargetBinder:
                 if failure:
                     return failure
                 self._verify_account(reader, gateway)
-                matches = [row for row in gateway.list_conversations()
+                rows = gateway.list_conversations()
+                if not rows:
+                    # Qt 可能只暴露空根或系统标题栏。此时须先恢复 UIA，
+                    # 不能在 verify_target 聚焦前把目标误判为不存在。
+                    lookup_epoch = self._source.session_epoch
+                    gateway.prepare_target_lookup()
+                    self._require_epoch(lookup_epoch)
+                    self._require_epoch(session_epoch)
+                    self._verify_account(reader, gateway)
+                    rows = gateway.list_conversations()
+                matches = [row for row in rows
                            if self._titles_match(row.conversation_title, contact["display_name"],
                                                  is_group=contact["is_group"])]
                 if len(matches) > 1:
@@ -128,11 +138,16 @@ class DatabaseUiaTargetBinder:
                     if contact["conversation_id"] in self._bindings:
                         return TargetResolution(TargetStatus.STALE, reason="已绑定的目标会话不再可见")
                     search = getattr(gateway, "ensure_conversation_visible", None)
-                    if not callable(search) or not search(
-                            contact["display_name"], is_group=contact["is_group"],
-                            expected_pid=reader.binding.pid):
-                        return TargetResolution(TargetStatus.NOT_FOUND, reason="目标会话当前未出现在微信会话列表")
+                    search_epoch = self._source.session_epoch
+                    searched = callable(search) and search(
+                        contact["display_name"], is_group=contact["is_group"],
+                        expected_pid=reader.binding.pid)
+                    self._require_epoch(search_epoch)
                     self._require_epoch(session_epoch)
+                    if not searched:
+                        if not rows:
+                            return TargetResolution(TargetStatus.STALE, reason="uia_conversation_list_unavailable")
+                        return TargetResolution(TargetStatus.NOT_FOUND, reason="目标会话当前未出现在微信会话列表")
                     reader.refresh()
                     searched_contact, failure = self._trusted_database_target(reader, conversation)
                     if failure:
@@ -140,12 +155,15 @@ class DatabaseUiaTargetBinder:
                     if searched_contact != contact:
                         return TargetResolution(TargetStatus.STALE, reason="搜索期间数据库目标身份已变化")
                     self._verify_account(reader, gateway)
-                    matches = [row for row in gateway.list_conversations()
+                    rows = gateway.list_conversations()
+                    matches = [row for row in rows
                                if self._titles_match(row.conversation_title, contact["display_name"],
                                                      is_group=contact["is_group"])]
                     if len(matches) > 1:
                         return TargetResolution(TargetStatus.AMBIGUOUS, reason="搜索后微信界面存在多个同名会话")
                     if not matches:
+                        if not rows:
+                            return TargetResolution(TargetStatus.STALE, reason="uia_conversation_list_unavailable")
                         return TargetResolution(TargetStatus.NOT_FOUND, reason="搜索后目标会话仍不可见")
                 row = matches[0]
                 if not row.runtime_id:

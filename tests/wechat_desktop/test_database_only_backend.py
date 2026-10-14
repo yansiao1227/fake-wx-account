@@ -91,6 +91,7 @@ def test_channel_startup_starts_database_pipeline_and_changelog_without_uia(monk
     channel._service = SimpleNamespace(
         update_status=lambda **_kwargs: None,
         set_agent_executor=lambda _executor: None,
+        status=lambda: {"paused": False},
     )
     channel._materialization_active = threading.Event()
     channel.report_startup_success = lambda: None

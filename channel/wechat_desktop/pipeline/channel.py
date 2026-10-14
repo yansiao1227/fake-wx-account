@@ -241,13 +241,18 @@ class WechatDesktopChannel(
         if self._changelog_thread is not None:
             self._changelog_thread.start()
         self.report_startup_success()
+        paused = bool(self._service.status().get("paused"))
         logger.info(
-            "[WechatDesktop] Channel started in %s mode",
-            "shadow" if self.config.get("shadow_mode", True) else "active",
+            "[WechatDesktop] Channel started in %s mode (paused=%s shadow_mode=%s)",
+            "paused" if paused else "shadow" if self.config.get("shadow_mode", True) else "active",
+            paused,
+            bool(self.config.get("shadow_mode", True)),
         )
         self._trace(
             "00-startup",
-            "backend=db_uia poll_seconds=%s group_mode=%s private_blacklist=%s group_blacklist=%s",
+            "backend=db_uia paused=%s shadow_mode=%s poll_seconds=%s group_mode=%s private_blacklist=%s group_blacklist=%s",
+            paused,
+            bool(self.config.get("shadow_mode", True)),
             self.config["db_poll_interval_seconds"],
             self.config.get("group_reply_mode"),
             list(self.config["auto_reply_private_blacklist"]),

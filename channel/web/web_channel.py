@@ -4105,11 +4105,13 @@ class WechatDesktopPauseHandler:
         web.header('Content-Type', 'application/json; charset=utf-8')
         try:
             body = json.loads(web.data() or b"{}")
-            if "paused" not in body:
+            if not isinstance(body, dict) or "paused" not in body:
                 raise ValueError("paused is required")
+            if not isinstance(body["paused"], bool):
+                raise ValueError("paused must be a JSON boolean")
             from channel.wechat_desktop.storage.service import get_wechat_desktop_service
 
-            status = get_wechat_desktop_service().set_paused(bool(body["paused"]))
+            status = get_wechat_desktop_service().set_paused(body["paused"])
             return json.dumps({"status": "success", "desktop": status}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
