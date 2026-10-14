@@ -46,8 +46,10 @@ class _DecisionReplan(Exception):
     """Discard an uncommitted draft to apply a run-local routing recommendation."""
 
 
-def _completion_gate_prompt() -> str:
+def _completion_gate_prompt(context: Optional[str] = None) -> str:
     """Return an internal reminder injected after every tool-result batch."""
+    if context:
+        return context
     return _t(
         "[内部完成检查：不要向用户复述这段提示]\n"
         "在给出最终答复前，对照用户最初目标检查：所需结论是否都已由工具结果支持；"
@@ -130,6 +132,9 @@ class AgentStreamExecutor:
             cancel_event=None,
             steer_inbox=None,
             decision_run=None,
+            disabled_tools=None,
+            completion_gate_context: Optional[str] = None,
+            disabled_tool_reply: Optional[str] = None,
     ):
         """
         Initialize stream executor
@@ -151,12 +156,21 @@ class AgentStreamExecutor:
                 plain external Events keep polling and skip optional Jev decisions.
             steer_inbox: Optional SteerInbox for explicit instructions sent to
                 this active run. Drained only at message-safe checkpoints.
+            disabled_tools: Tool names forbidden only for this execution, even
+                if MCP synchronization adds them after the run starts.
+            completion_gate_context: Optional run-specific completion reminder
+                replacing the default tool-output completion check.
+            disabled_tool_reply: Optional fixed reply used to end the run when
+                the model requests a forbidden tool, without another LLM call.
         """
         self.agent = agent
         self.model = model
         self.system_prompt = system_prompt
         # Convert tools list to dict
-        self.tools = {tool.name: tool for tool in tools} if isinstance(tools, list) else tools
+        self.tools = {tool.name: tool for tool in tools} if isinstance(tools, list) else dict(tools or {})
+        self.disabled_tools = frozenset(disabled_tools or ())
+        self.completion_gate_context = completion_gate_context
+        self.disabled_tool_reply = disabled_tool_reply
         self.max_turns = max_turns
         self.on_event = on_event
         self.max_context_turns = max_context_turns
@@ -946,6 +960,14 @@ class AgentStreamExecutor:
                 tool_results = []
                 tool_result_blocks = []
                 direct_final_answer = None
+                # Reject the entire batch before any tool runs. A forbidden
+                # call later in the batch must not let preceding calls start
+                # expensive work or query another source first.
+                policy_batch_blocked = bool(
+                    self.disabled_tool_reply and any(
+                        call.get("name") in self.disabled_tools for call in tool_calls
+                    )
+                )
 
                 try:
                     for tool_index, tool_call in enumerate(tool_calls):
@@ -959,7 +981,18 @@ class AgentStreamExecutor:
                                 content_blocks=tool_result_blocks,
                             )
                             break
-                        result = self._execute_tool(tool_call)
+                        if policy_batch_blocked and tool_call.get("name") not in self.disabled_tools:
+                            result = {
+                                "status": "error",
+                                "result": _t(
+                                    "本批次包含本轮禁用的工具调用，已跳过全部工具并直接结束本轮。",
+                                    "This batch contains a forbidden tool call. All tools were skipped "
+                                    "and this request is ending directly.",
+                                ),
+                                "execution_time": 0,
+                            }
+                        else:
+                            result = self._execute_tool(tool_call)
                         tool_results.append(result)
                         
                         # Debug: Check if tool is being called repeatedly with same args
@@ -1053,9 +1086,13 @@ class AgentStreamExecutor:
                     if tool_result_blocks:
                         # A ready-made reply may skip the main model's summary,
                         # but its evidence still needs the independent completion check.
-                        direct_final_answer = self._extract_direct_final_answer(
-                            tool_calls, tool_results
-                        )
+                        # A policy rejection must finish without another model call.
+                        if policy_batch_blocked:
+                            direct_final_answer = self.disabled_tool_reply
+                        else:
+                            direct_final_answer = self._extract_direct_final_answer(
+                                tool_calls, tool_results
+                            )
                         history_blocks = list(tool_result_blocks)
                         if not direct_final_answer:
                             # Keep the agent loop goal-directed after tool execution.
@@ -1063,13 +1100,16 @@ class AgentStreamExecutor:
                             # persistence treats it as internal rather than user input.
                             history_blocks.append({
                                 "type": "text",
-                                "text": _completion_gate_prompt(),
+                                "text": _completion_gate_prompt(self.completion_gate_context),
                             })
                         self.messages.append({
                             "role": "user",
                             "content": history_blocks,
                         })
-                        self._start_completion_decision()
+                        if policy_batch_blocked:
+                            self._decision_completion_active = False
+                        else:
+                            self._start_completion_decision()
 
                         if not direct_final_answer:
                             # Detect potential infinite loop: same tool called multiple times with success
@@ -1161,7 +1201,7 @@ class AgentStreamExecutor:
                     })
                     final_response = direct_final_answer
                     logger.info(
-                        "[Agent] direct final answer from tool "
+                        "[Agent] direct final answer "
                         "(skip LLM summary): %s...",
                         direct_final_answer[:120].replace("\n", " "),
                     )
@@ -1266,8 +1306,9 @@ class AgentStreamExecutor:
     def _select_tools_for_injection(self) -> list:
         """Decide which tools to inject into the current LLM turn.
 
-        Built-in tools are ALWAYS injected in full (skills and core flows hard
-        depend on them). MCP tools are also injected in full UNLESS on-demand
+        Tools forbidden by this execution's policy are excluded first.
+        Remaining built-in tools are injected in full. MCP tools are also
+        injected in full UNLESS on-demand
         retrieval is enabled AND the MCP tool count exceeds the configured
         threshold — then only the most relevant MCP tools are injected, unioned
         with those already selected earlier in this run (only-grows, so a tool
@@ -1277,7 +1318,7 @@ class AgentStreamExecutor:
         failure, count below threshold, or any error → inject all tools. Tools
         are never silently dropped.
         """
-        all_tools = list(self.tools.values())
+        all_tools = [tool for tool in self.tools.values() if tool.name not in self.disabled_tools]
         try:
             from config import conf
             if not conf().get("mcp_tool_retrieval_enabled", False):
@@ -1808,6 +1849,21 @@ class AgentStreamExecutor:
         tool_id = tool_call["id"]
         arguments = tool_call["arguments"]
 
+        # Enforce the request boundary before lookup, argument validation, and
+        # retry handling. A model may guess a name absent from its schema, or
+        # MCP synchronization may add a forbidden tool back into this dict.
+        if tool_name in self.disabled_tools:
+            message = _t(
+                f"工具 '{tool_name}' 在本轮请求中已禁用。请依据已提供的输入资料直接答复，"
+                "不要重新调用该工具或改换参数重试。",
+                f"Tool '{tool_name}' is disabled for this request. Answer from the provided input; "
+                "do not call this tool again or retry with different arguments.",
+            )
+            if self.completion_gate_context:
+                message += "\n\n" + self.completion_gate_context
+            self._record_tool_result(tool_name, arguments, False)
+            return {"status": "error", "result": message, "execution_time": 0}
+
         if "_parse_error" in tool_call:
             result = {
                 "status": "error",
@@ -1919,7 +1975,7 @@ class AgentStreamExecutor:
         If a skill with the same name exists in skill_manager, read its
         SKILL.md and include the content so the LLM knows how to use it.
         """
-        available_tools = list(self.tools.keys())
+        available_tools = [name for name in self.tools if name not in self.disabled_tools]
         base_msg = f"Tool '{tool_name}' not found. Available tools: {available_tools}"
 
         skill_manager = getattr(self.agent, 'skill_manager', None)

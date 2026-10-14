@@ -180,49 +180,74 @@ def test_control_events_bypass_private_aggregation():
     assert routed == [("control", cancel), ("control", steer)]
 
 
-def test_standalone_image_and_share_card_are_observed_while_file_is_materialized():
+@pytest.mark.parametrize("source_type", ["private", "group"])
+@pytest.mark.parametrize("content_type", ["image", "file", "share_card", "chat_record", "app_message"])
+def test_standalone_special_messages_are_received_without_reply(source_type, content_type):
     channel = _bare_wechat_channel()
+    channel.config = {}
     routed = []
     processed = []
     finished = []
     channel._store = PipelineStoreStub(
-        mark_event_processed=lambda event_id, *args: processed.append(event_id)
+        mark_event_processed=lambda event_id, *args: processed.append((event_id, *args))
     )
+    channel._policy = SimpleNamespace(is_blocked=lambda *args: False, group_triggered=lambda event: True)
     channel._trace = lambda *_args, **_kwargs: None
     channel._finish_lifecycle = (
         lambda event_ids, terminal: finished.append((event_ids, terminal))
     )
-    channel._defer_private_event = lambda event: routed.append(("private", event))
+    channel._defer_private_event = lambda event: pytest.fail("原特殊消息不能进入私聊回复聚合")
     channel._submit_materialization = lambda events: routed.append(
         ("materialize", events)
     )
-    image = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "image", "image.png"
+    channel._dispatch_message = lambda *args: pytest.fail("原特殊消息不能启动 Agent")
+    channel._deliver = lambda *args, **kwargs: pytest.fail("原特殊消息不能发送回复")
+    channel._driver = SimpleNamespace(
+        materialize_event=lambda *args: pytest.fail("扫描不能读取合并记录或打开图片")
     )
-    file_event = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "file", "report.pdf"
+    event = WechatDesktopEvent(
+        "message", "a", "Alice", "a", "Alice", content_type, "原附件",
+        source_type=source_type, is_group=source_type == "group",
+        source_message_id="synthetic-source", direction="incoming", receipt_phase="live",
     )
-    share = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "share_card", "[链接]标题"
+    if content_type == "app_message":
+        event.attachment_status = "native_xml_unavailable"
+
+    channel._process_received_event(event)
+
+    if content_type == "file":
+        # 保留独立文件下载缓存分支；缓存消费者不把该批次交给回复队列。
+        assert routed == [("materialize", [event])]
+        assert processed == finished == []
+    else:
+        assert routed == []
+        assert processed == [(event.event_id, "observed", "standalone_attachment")]
+        assert finished == [([event.event_id], "observed")]
+
+
+@pytest.mark.parametrize("source_type", ["private", "group"])
+@pytest.mark.parametrize("reference_type", ["image", "file", "share_card", "chat_record"])
+def test_explicit_special_message_references_enter_reply_flow(source_type, reference_type):
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._policy = SimpleNamespace(is_blocked=lambda *args: False, group_triggered=lambda event: True)
+    channel._trace = lambda *args, **kwargs: None
+    channel._store = PipelineStoreStub(
+        mark_event_processed=lambda *args: pytest.fail("明确引用不能被当成原附件忽略")
     )
-    text = WechatDesktopEvent(
-        "message", "a", "Alice", "a", "Alice", "text", "说明"
+    routed = []
+    channel._defer_private_event = lambda event: routed.append(("private", event))
+    channel._submit_materialization = lambda events: routed.append(("group", events))
+    event = WechatDesktopEvent(
+        "message", "a", "Alice", "other", "Bob", "text", "请读取我引用的消息",
+        source_type=source_type, is_group=source_type == "group",
+        source_message_id="synthetic-question", direction="incoming", receipt_phase="live",
+        reference={"content_type": reference_type, "source_message_id": "original-message"},
     )
 
-    channel._route_reply_event(image)
-    channel._route_reply_event(share)
-    channel._route_reply_event(file_event)
-    channel._route_reply_event(text)
+    channel._process_received_event(event)
 
-    assert routed == [
-        ("materialize", [file_event]),
-        ("private", text),
-    ]
-    assert processed == [image.event_id, share.event_id]
-    assert finished == [
-        ([image.event_id], "observed"),
-        ([share.event_id], "observed"),
-    ]
+    assert routed == ([("group", [event])] if event.is_group else [("private", event)])
 
 
 def test_materialized_batch_keeps_all_source_event_ids():
@@ -314,6 +339,36 @@ def test_standalone_file_batch_is_cache_only():
 
     assert materialized.task.cache_only is True
     assert materialized.task.attachment_reference_required is False
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_standalone_file_cache_worker_never_enqueues_reply(cached):
+    channel = _bare_wechat_channel()
+    channel.config = {}
+    channel._stop_event = threading.Event()
+    channel._materialize_queue = queue.Queue()
+    event = WechatDesktopEvent("message", "a", "Alice", "a", "Alice", "file", "report.pdf")
+    event.task.cache_only = True
+    event.task.file_cache_results = {event.event_id: cached}
+    channel._materialize_queue.put([event])
+    channel._materialize_batch = lambda events: events[0]
+    channel._enqueue_reply_event = lambda event: pytest.fail("原文件缓存结束不能交给回复 FIFO")
+    channel._trace = lambda *args, **kwargs: None
+    processed, finished = [], []
+    channel._store = PipelineStoreStub(mark_event_processed=lambda *args: processed.append(args))
+
+    def finish(event_ids, terminal):
+        finished.append((event_ids, terminal))
+        channel._stop_event.set()
+
+    channel._finish_lifecycle = finish
+
+    channel._consume_materialization_queue()
+
+    state = "cached" if cached else "observed"
+    reason = "" if cached else "attachment_unavailable"
+    assert processed == [(event.event_id, state, reason)]
+    assert finished == [([event.event_id], state)]
 
 
 def test_non_reference_attachment_question_requires_quote():

@@ -45,6 +45,12 @@ def install_window_api(monkeypatch, windows):
             raise OSError("模拟进程模块查询失败")
         return process.window.get("exe", "")
 
+    def window_title(hwnd):
+        window = by_handle[hwnd]
+        if window.get("title_error"):
+            raise OSError("模拟窗口标题查询失败")
+        return window.get("title", "微信")
+
     monkeypatch.setattr(WechatUiaClient, "_require_windows", staticmethod(lambda: None))
     monkeypatch.setitem(
         sys.modules,
@@ -63,6 +69,7 @@ def install_window_api(monkeypatch, windows):
             EnumWindows=enum_windows,
             IsWindowVisible=lambda hwnd: by_handle[hwnd].get("visible", True),
             GetClassName=lambda hwnd: by_handle[hwnd]["class"],
+            GetWindowText=window_title,
         ),
     )
     monkeypatch.setitem(
@@ -116,6 +123,122 @@ def test_non_wechat_unqueryable_qt_window_does_not_block_wechat(monkeypatch):
     client = WechatUiaClient.__new__(WechatUiaClient)
 
     assert client._window() == (101, 201)
+
+
+@pytest.mark.parametrize("main_title", ["微信", "WeChat", " WECHAT "])
+@pytest.mark.parametrize(
+    "auxiliary_title",
+    [
+        "图片和视频",
+        "Images and Videos",
+        "设置",
+        "聊天记录",
+        "WeChat - Images and Videos",
+        "Weixin",
+        "",
+    ],
+)
+def test_same_process_qt_auxiliary_window_does_not_block_main_window(
+    monkeypatch, main_title, auxiliary_title
+):
+    install_window_api(
+        monkeypatch,
+        [
+            {
+                "hwnd": 101,
+                "pid": 201,
+                "class": "Qt51514QWindowIcon",
+                "exe": "Weixin.exe",
+                "title": main_title,
+            },
+            {
+                "hwnd": 102,
+                "pid": 201,
+                "class": "Qt51514QWindowIcon",
+                "exe": "Weixin.exe",
+                "title": auxiliary_title,
+            },
+        ],
+    )
+    client = WechatUiaClient.__new__(WechatUiaClient)
+
+    assert client.get_owner_window_handle() == 101
+    assert client.get_owner_window_process_id() == 201
+
+
+def test_hidden_reused_image_viewer_does_not_change_owner_window(monkeypatch):
+    viewer = {
+        "hwnd": 102,
+        "pid": 201,
+        "class": "Qt51514QWindowIcon",
+        "exe": "Weixin.exe",
+        "title": "图片和视频",
+        "visible": False,
+    }
+    install_window_api(
+        monkeypatch,
+        [
+            {
+                "hwnd": 101,
+                "pid": 201,
+                "class": "Qt51514QWindowIcon",
+                "exe": "Weixin.exe",
+                "title": "微信",
+            },
+            viewer,
+        ],
+    )
+    client = WechatUiaClient.__new__(WechatUiaClient)
+
+    assert client._window() == (101, 201)
+    viewer["visible"] = True
+    assert client._window() == (101, 201)
+    viewer["visible"] = False
+    assert client._window() == (101, 201)
+
+
+@pytest.mark.parametrize(
+    ("native_class", "selected"), [("Qt51514QWindowIcon", False), ("mmui::MainWindow", True)]
+)
+def test_unqueryable_title_requires_unique_main_window_class(monkeypatch, native_class, selected):
+    install_window_api(
+        monkeypatch,
+        [
+            {
+                "hwnd": 101,
+                "pid": 201,
+                "class": native_class,
+                "exe": "Weixin.exe",
+                "title_error": True,
+            }
+        ],
+    )
+
+    assert WechatUiaClient._enumerate_main_windows() == ([(101, 201)] if selected else [])
+
+
+def test_new_real_main_window_is_rechecked_after_owner_discovery(monkeypatch):
+    second_main = {
+        "hwnd": 102,
+        "pid": 202,
+        "class": "Qt51514QWindowIcon",
+        "exe": "Weixin.exe",
+        "title": "WeChat",
+        "visible": False,
+    }
+    install_window_api(
+        monkeypatch,
+        [
+            {"hwnd": 101, "pid": 201, "class": "mmui::MainWindow", "exe": "Weixin.exe"},
+            second_main,
+        ],
+    )
+    client = WechatUiaClient.__new__(WechatUiaClient)
+
+    assert client.get_owner_window_handle() == 101
+    second_main["visible"] = True
+    with pytest.raises(RuntimeError, match="Exactly one.*found 2"):
+        client.get_owner_window_handle()
 
 
 def test_two_real_wechat_windows_are_still_rejected(monkeypatch):

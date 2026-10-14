@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 
 from channel.wechat_desktop.contracts import ConversationTarget, TargetResolution, TargetStatus
-from channel.wechat_desktop.conversation import conversation_titles_match
+from channel.wechat_desktop.conversation import conversation_header_matches_target, conversation_titles_match
 from channel.wechat_desktop.db.errors import DatabaseReadError
 from channel.wechat_desktop.send_control import SendNotSubmitted
 
@@ -123,7 +123,30 @@ class DatabaseUiaTargetBinder:
                 if len(matches) > 1:
                     return TargetResolution(TargetStatus.AMBIGUOUS, reason="微信界面存在多个同名会话")
                 if not matches:
-                    return TargetResolution(TargetStatus.NOT_FOUND, reason="目标会话当前未出现在微信会话列表")
+                    # 搜索只帮助首次定位唯一可信身份。旧 RuntimeId 消失时不可
+                    # 搜索另一个同名对象替代既有绑定。
+                    if contact["conversation_id"] in self._bindings:
+                        return TargetResolution(TargetStatus.STALE, reason="已绑定的目标会话不再可见")
+                    search = getattr(gateway, "ensure_conversation_visible", None)
+                    if not callable(search) or not search(
+                            contact["display_name"], is_group=contact["is_group"],
+                            expected_pid=reader.binding.pid):
+                        return TargetResolution(TargetStatus.NOT_FOUND, reason="目标会话当前未出现在微信会话列表")
+                    self._require_epoch(session_epoch)
+                    reader.refresh()
+                    searched_contact, failure = self._trusted_database_target(reader, conversation)
+                    if failure:
+                        return failure
+                    if searched_contact != contact:
+                        return TargetResolution(TargetStatus.STALE, reason="搜索期间数据库目标身份已变化")
+                    self._verify_account(reader, gateway)
+                    matches = [row for row in gateway.list_conversations()
+                               if self._titles_match(row.conversation_title, contact["display_name"],
+                                                     is_group=contact["is_group"])]
+                    if len(matches) > 1:
+                        return TargetResolution(TargetStatus.AMBIGUOUS, reason="搜索后微信界面存在多个同名会话")
+                    if not matches:
+                        return TargetResolution(TargetStatus.NOT_FOUND, reason="搜索后目标会话仍不可见")
                 row = matches[0]
                 if not row.runtime_id:
                     return TargetResolution(TargetStatus.STALE, reason="目标会话缺少稳定 RuntimeId")
@@ -163,6 +186,55 @@ class DatabaseUiaTargetBinder:
         if authorized_target is not None and result.target != authorized_target:
             raise SendNotSubmitted("attachment_target_changed")
         return result.target
+
+    def require_attachment_target_passive(self, conversation, *, session_epoch, authorized_target,
+                                          window_identity, validate_source=None):
+        """复核已经授权的附件绑定；绝不聚焦、搜索或重新定位会话。
+
+        validate_source 在同一 reader_session 执行完整原生来源校验后
+        复用刚刷新的快照，避免一个原子校验段重复探测所有数据库。
+        """
+        gateway = self._gateway_provider()
+        with gateway.operation(reply=False), self._lock, self._source.reader_session() as reader:
+            self._require_epoch(session_epoch)
+            self._sync_session_epoch()
+            if validate_source is not None:
+                valid, reason = validate_source()
+                if not valid:
+                    raise SendNotSubmitted(reason)
+            else:
+                reader.refresh()
+            contact, failure = self._trusted_database_target(reader, conversation)
+            if failure:
+                raise SendNotSubmitted(failure.reason)
+            target = ConversationTarget(contact["conversation_id"], contact["display_name"], contact["is_group"])
+            if target != authorized_target:
+                raise SendNotSubmitted("attachment_target_changed")
+            previous = self._bindings.get(target.conversation_id)
+            if not previous:
+                raise SendNotSubmitted("attachment_binding_unavailable")
+            self._verify_account(reader, gateway)
+            window = gateway.inspect_window_identity()
+            if not window or not window[0] or window != window_identity or window[1] != reader.binding.pid:
+                raise SendNotSubmitted("attachment_target_changed")
+            matches = [row for row in gateway.list_conversations()
+                       if self._titles_match(row.conversation_title, target.display_name, is_group=target.is_group)]
+            if len(matches) != 1 or not matches[0].runtime_id:
+                raise SendNotSubmitted("attachment_target_changed")
+            row = matches[0]
+            binding = (row.runtime_id, row.conversation_title, reader.account_id, reader.binding.pid, window)
+            if binding != previous:
+                raise SendNotSubmitted("attachment_target_changed")
+            selector = gateway.inspect_attachment_binding(target.conversation_id)
+            if selector != (row.runtime_id, row.conversation_title):
+                raise SendNotSubmitted("attachment_target_changed")
+            if not conversation_header_matches_target(gateway.read_current_title(), target.display_name,
+                                                       is_group=target.is_group):
+                raise SendNotSubmitted("attachment_target_changed")
+            self._require_epoch(session_epoch)
+            if gateway.inspect_window_identity() != window:
+                raise SendNotSubmitted("attachment_target_changed")
+            return target
 
     def current_conversation(self):
         gateway = self._gateway_provider()

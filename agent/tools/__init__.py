@@ -4,6 +4,7 @@ from agent.tools.tool_manager import ToolManager
 
 # Import file operation tools
 from agent.tools.read.read import Read
+from agent.tools.pdf_ocr.pdf_ocr import PdfOcr
 from agent.tools.write.write import Write
 from agent.tools.edit.edit import Edit
 from agent.tools.bash.bash import Bash
@@ -171,6 +172,7 @@ __all__ = [
     'BaseTool',
     'ToolManager',
     'Read',
+    'PdfOcr',
     'Write',
     'Edit',
     'Bash',

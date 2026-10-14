@@ -12,8 +12,8 @@ from .test_db_reader import table
 from .test_db_uia_attachment_bridge import bridge, observe_target, reference_xml
 
 
-def share_quote(url="https://example.invalid/article?token=synthetic&source=quote"):
-    share = ("<msg><appmsg><type>5</type><title>synthetic article</title>"
+def share_quote(url="https://example.invalid/article?token=synthetic&source=quote", *, subtype=5):
+    share = (f"<msg><appmsg><type>{subtype}</type><title>synthetic article</title>"
              f"<url>{escape(url)}</url></appmsg></msg>")
     return reference_xml(49, escape(share))
 
@@ -25,9 +25,10 @@ def forbid_ui(instance, monkeypatch):
 
 
 @pytest.mark.parametrize("bottom", [True, False, None])
-def test_native_share_link_routes_to_agent_without_visible_bubble(bridge, monkeypatch, bottom):
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_native_share_link_routes_to_agent_without_visible_bubble(bridge, monkeypatch, bottom, subtype):
     instance, _, _, client, _, _ = bridge
-    event = observe_target(bridge, share_quote())
+    event = observe_target(bridge, share_quote(subtype=subtype))
     client.bottom = bottom
     client.messages = []
     forbid_ui(instance, monkeypatch)
@@ -35,6 +36,8 @@ def test_native_share_link_routes_to_agent_without_visible_bubble(bridge, monkey
     result, count = instance.materialize_event(event)
 
     assert count == 0
+    assert result.reference["content_type"] == "share_card"
+    assert result.reference["native_app_type"] == subtype
     assert result.reference["url"] == "https://example.invalid/article?token=synthetic&source=quote"
     assert result.reference["fetch_status"] == "pending_tool"
     assert result.reference["fetch_source"] == "agent_tools"
@@ -46,13 +49,14 @@ def test_native_share_link_routes_to_agent_without_visible_bubble(bridge, monkey
     assert identity == (result.fingerprint(), result.content_signature, result.source_message_id)
 
 
-def test_changed_native_share_payload_cannot_be_read_as_trusted_link(bridge, monkeypatch):
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_changed_native_share_payload_cannot_be_read_as_trusted_link(bridge, monkeypatch, subtype):
     instance, reader, _, client, _, talker = bridge
-    event = observe_target(bridge, share_quote())
+    event = observe_target(bridge, share_quote(subtype=subtype))
     cache = reader.caches["message/message_0.db"]
     with sqlite3.connect(cache.path) as conn:
         conn.execute(f'UPDATE "{table(talker)}" SET message_content=? WHERE local_id=2',
-                     (share_quote("https://example.invalid/replaced"),))
+                     (share_quote("https://example.invalid/replaced", subtype=subtype),))
     cache.changed = True
     forbid_ui(instance, monkeypatch)
 
@@ -63,9 +67,10 @@ def test_changed_native_share_payload_cannot_be_read_as_trusted_link(bridge, mon
     assert client.focus_count == 0 and client.downloads == []
 
 
-def test_account_epoch_change_prevents_link_dispatch(bridge, monkeypatch):
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_account_epoch_change_prevents_link_dispatch(bridge, monkeypatch, subtype):
     instance = bridge[0]
-    event = observe_target(bridge, share_quote())
+    event = observe_target(bridge, share_quote(subtype=subtype))
     original_validate = instance.source.validate_event
 
     def validate_and_change_epoch(candidate):
@@ -81,9 +86,10 @@ def test_account_epoch_change_prevents_link_dispatch(bridge, monkeypatch):
     assert result.reference["resolution_error"] == "account_binding_changed"
 
 
-def test_existing_browser_body_does_not_need_second_window_read(bridge, monkeypatch):
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_existing_browser_body_does_not_need_second_window_read(bridge, monkeypatch, subtype):
     instance = bridge[0]
-    event = observe_target(bridge, share_quote())
+    event = observe_target(bridge, share_quote(subtype=subtype))
     event.reference["browser_content"] = "synthetic readable article body"
     forbid_ui(instance, monkeypatch)
 
@@ -94,17 +100,19 @@ def test_existing_browser_body_does_not_need_second_window_read(bridge, monkeypa
     assert result.reference["browser_content"] == "synthetic readable article body"
 
 
-def test_missing_share_url_still_requires_safe_uia_materialization(bridge):
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_missing_share_url_still_requires_safe_uia_materialization(bridge, subtype):
     event = observe_target(bridge, reference_xml(
-        49, "&lt;msg&gt;&lt;appmsg&gt;&lt;type&gt;5&lt;/type&gt;"
+        49, f"&lt;msg&gt;&lt;appmsg&gt;&lt;type&gt;{subtype}&lt;/type&gt;"
             "&lt;title&gt;synthetic article&lt;/title&gt;&lt;/appmsg&gt;&lt;/msg&gt;"))
 
     assert WechatDesktopMaterializeMixin._has_referenced_attachment(event)
 
 
-def test_failed_browser_status_does_not_upgrade_body_to_success(bridge, monkeypatch):
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_failed_browser_status_does_not_upgrade_body_to_success(bridge, monkeypatch, subtype):
     instance = bridge[0]
-    event = observe_target(bridge, share_quote())
+    event = observe_target(bridge, share_quote(subtype=subtype))
     event.reference.update(browser_content="synthetic access failure", browser_status="error")
     forbid_ui(instance, monkeypatch)
 
@@ -114,8 +122,9 @@ def test_failed_browser_status_does_not_upgrade_body_to_success(bridge, monkeypa
     assert result.reference["browser_status"] == "error" and not result.reference["resolved"]
 
 
-def test_source_invalid_task_is_not_dispatched_to_agent(bridge):
-    event = observe_target(bridge, share_quote())
+@pytest.mark.parametrize("subtype", [4, 5])
+def test_source_invalid_task_is_not_dispatched_to_agent(bridge, subtype):
+    event = observe_target(bridge, share_quote(subtype=subtype))
     event.reference["fetch_status"] = "source_invalid"
     channel = SimpleNamespace(_compose_context=lambda *args, **kwargs: pytest.fail("来源失效不交Agent"))
 

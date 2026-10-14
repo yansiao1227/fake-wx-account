@@ -8,6 +8,7 @@ import time
 
 from bridge.context import ContextType
 from channel.wechat_desktop.models import WechatDesktopEvent, WechatDesktopMessage
+from channel.wechat_desktop.references import standalone_attachment_requires_reference
 from common.log import logger
 
 
@@ -192,20 +193,17 @@ class WechatDesktopScanMixin:
     def _route_reply_event(self, event: WechatDesktopEvent):
         """按事件形态选择最早可安全执行的下一阶段。
 
-        控制命令直接交给 Agent；独立图片只登记身份，独立文件只做缓存；群聊不
+        控制命令直接交给 Agent；独立图片、卡片和记录只登记身份，独立文件只做缓存；群聊不
         聚合；普通私聊进入滑动窗口。引用附件必须保留当前消息，稍后再物化。
         """
         if self._is_control_event(event):
             self._dispatch_control_event(event)
             return
-        if event.content_type == "image" and not event.reference:
-            self._ignore_standalone_attachment(event)
-            return
-        if event.content_type == "share_card" and not event.reference:
-            self._ignore_standalone_attachment(event)
-            return
         if event.content_type == "file" and not event.reference:
             self._submit_materialization([event])
+            return
+        if standalone_attachment_requires_reference(event):
+            self._ignore_standalone_attachment(event)
             return
         if event.is_group:
             self._submit_materialization([event])
@@ -213,7 +211,7 @@ class WechatDesktopScanMixin:
         self._defer_private_event(event)
 
     def _ignore_standalone_attachment(self, event: WechatDesktopEvent):
-        """登记孤立图片但不主动分析，等待后续文字明确引用或提问。"""
+        """登记特殊原消息但不主动分析或提示，等待后续消息明确引用。"""
         self._store.mark_event_processed(event.event_id, "observed", "standalone_attachment")
         self._trace(
             "09-attachment-observed",

@@ -7,6 +7,10 @@ from copy import deepcopy
 from pathlib import Path
 from bridge.context import Context, ContextType
 from channel.wechat_desktop.config import DEFAULT_CONFIG
+from channel.wechat_desktop.references import (
+    chat_record_ready, event_chat_record, event_native_xml_unavailable,
+    standalone_attachment_requires_reference,
+)
 from channel.wechat_desktop.pipeline.prompts import (
     DEFAULT_BOT_MENTION_ALIASES,
     _format_agent_notice,
@@ -80,9 +84,17 @@ class AgentReplyCoordinator:
         的指令。返回 ``True`` 表示已成功交给 Agent，最终发送状态由回调完成。
         """
         channel = self.channel
+        if standalone_attachment_requires_reference(event):
+            return False
         if (event.task.source_invalid or event.attachment_status == "source_invalid"
                 or str((event.reference or {}).get("fetch_status") or "").lower() == "source_invalid"):
             # 来源失效的任务不交给 Agent，避免其依据旧 URL 发起工具读取。
+            return False
+        if event_native_xml_unavailable(event):
+            return False
+        record = event_chat_record(event)
+        if record is not None and not chat_record_ready(record):
+            # FIFO 已负责一次提示终结；其他调用入口也不能把标题交给 Agent 补正文。
             return False
         if event.source_message_id:
             validation = channel._driver.validate_reply_target(event)
@@ -232,11 +244,20 @@ class AgentReplyCoordinator:
             wechat_desktop_source_type=event.source_type,
             wechat_desktop_auto_reply=True,
             wechat_desktop_user_message=user_message,
-            wechat_desktop_is_reference=bool(event.reference),
+            wechat_desktop_is_reference=bool(event.reference) or record is not None,
+            wechat_desktop_chat_record=record is not None,
+            wechat_desktop_disabled_tools=list(channel.config.get(
+                "chat_record_disabled_tools", DEFAULT_CONFIG["chat_record_disabled_tools"],
+            )) if record is not None else [],
+            wechat_desktop_disabled_tool_reply=channel.config.get(
+                "chat_record_tool_policy_reply", DEFAULT_CONFIG["chat_record_tool_policy_reply"],
+            ) if record is not None else "",
             wechat_desktop_input_artifact_paths=list(dict.fromkeys(
                 str(path) for path in (
                     event.content if event.content_type in {"image", "file"} else "",
                     (event.reference or {}).get("file_path", ""),
+                    *((record or {}).get("media_evidence") or {}).get("evidence_paths", []),
+                    *((record or {}).get("media_evidence") or {}).get("image_evidence_paths", []),
                 ) if path
             )),
             wechat_desktop_session_max_turns=channel.config.get(

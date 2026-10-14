@@ -4,6 +4,8 @@ uiautomation==2.0.29
 zstandard==0.25.0
 pywin32>=312
 rapidocr>=3.9.2
+# PDF OCR: render scanned attachment pages locally before RapidOCR recognition.
+PyMuPDF>=1.26.0,<2
 onnxruntime>=1.18.0,<1.19; python_version < "3.13"
 onnxruntime>=1.23.1,<2; python_version >= "3.13"
 protobuf>=4.25.8,<5; python_version < "3.13"

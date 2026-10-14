@@ -254,7 +254,7 @@ def test_image_bubble_is_captured_to_tmp(monkeypatch, tmp_path):
         bounds=(-50, 100, 150, 260),
     )
 
-    image_path = WechatUiaClient({}).fetch_message_image(message, tmp_path)
+    image_path = WechatUiaClient({}).fetch_message_image(message, tmp_path, prefer_viewer=False)
 
     assert captures == [((-50, 100, 150, 260), True)]
     assert Path(image_path).parent == tmp_path

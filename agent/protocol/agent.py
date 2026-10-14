@@ -102,7 +102,7 @@ class Agent:
             logger.warning(f"Failed to build skills prompt: {e}")
             return ""
     
-    def get_full_system_prompt(self, skill_filter=None) -> str:
+    def get_full_system_prompt(self, skill_filter=None, disabled_tools=None) -> str:
         """
         Build the complete system prompt from scratch every time.
 
@@ -124,8 +124,9 @@ class Agent:
             except Exception:
                 lang = "zh"
             builder = PromptBuilder(workspace_dir=self.workspace_dir or "", language=lang)
+            disabled_names = frozenset(disabled_tools or ())
             full = builder.build(
-                tools=self.tools,
+                tools=[tool for tool in self.tools if tool.name not in disabled_names],
                 context_files=context_files,
                 skill_manager=self.skill_manager,
                 memory_manager=self.memory_manager,
@@ -380,7 +381,9 @@ class Agent:
         return action
 
     def run_stream(self, user_message: str, on_event=None, clear_history: bool = False,
-                   skill_filter=None, cancel_event=None, steer_inbox=None) -> str:
+                   skill_filter=None, cancel_event=None, steer_inbox=None,
+                   disabled_tools=None, completion_gate_context=None,
+                   disabled_tool_reply=None) -> str:
         """
         Execute single agent task with streaming (based on tool-call)
 
@@ -405,6 +408,9 @@ class Agent:
                 (tool_use/tool_result pairs preserved).
             steer_inbox: Optional SteerInbox drained at safe checkpoints. New
                 instructions guide this run without entering the normal queue.
+            disabled_tools: Tool names forbidden only for this request.
+            completion_gate_context: Optional request-specific completion check.
+            disabled_tool_reply: Optional fixed reply after a forbidden call.
 
         Returns:
             Final response text
@@ -426,6 +432,7 @@ class Agent:
         if not self.model:
             raise ValueError("No model available for agent")
 
+        disabled_names = frozenset(disabled_tools or ())
         # Create a copy of messages for this execution to avoid concurrent modification
         # Record the original length to track which messages are new
         with self.messages_lock:
@@ -448,7 +455,9 @@ class Agent:
                     self.skill_manager.refresh_skills()
                 from agent.decision.runtime import DecisionRun
                 decision_run = DecisionRun.start(
-                    user_message, self.tools, self.skill_manager, messages_copy,
+                    user_message,
+                    [tool for tool in self.tools if tool.name not in disabled_names],
+                    self.skill_manager, messages_copy,
                     settings, skill_filter=skill_filter,
                 )
             except Exception as exc:
@@ -456,7 +465,25 @@ class Agent:
                                    type(exc).__name__)
 
         try:
-            full_system_prompt = self.get_full_system_prompt(skill_filter=skill_filter)
+            if disabled_names:
+                full_system_prompt = self.get_full_system_prompt(
+                    skill_filter=skill_filter, disabled_tools=disabled_names,
+                )
+                # Also override cached prompts or skill text that still mentions
+                # forbidden tools. This suffix belongs to this run, never the Agent.
+                from common.i18n import t as _t
+                full_system_prompt += "\n\n" + _t(
+                    "[本轮工具约束，优先于工具目录和技能提示]\n"
+                    f"本轮禁用工具：{', '.join(sorted(disabled_names))}。"
+                    "不得调用这些工具，也不得改换参数重试。",
+                    "[Tool policy for this request; overrides tool catalogs and skill hints.]\n"
+                    f"Disabled tools: {', '.join(sorted(disabled_names))}. "
+                    "Do not call them or retry them with different arguments.",
+                )
+            else:
+                full_system_prompt = self.get_full_system_prompt(skill_filter=skill_filter)
+            if completion_gate_context:
+                full_system_prompt += "\n\n" + completion_gate_context
         except Exception:
             if decision_run is not None:
                 decision_run.close()
@@ -476,6 +503,9 @@ class Agent:
                 cancel_event=cancel_event,
                 steer_inbox=steer_inbox,
                 decision_run=decision_run,
+                disabled_tools=disabled_names,
+                completion_gate_context=completion_gate_context,
+                disabled_tool_reply=disabled_tool_reply,
             )
             response = executor.run_stream(user_message)
         except Exception:

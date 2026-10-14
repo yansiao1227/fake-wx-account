@@ -99,7 +99,7 @@ def test_strict_file_can_use_native_save_as_of_the_same_bubble(monkeypatch, tmp_
     saved = tmp_path / "saved-from-bubble.pdf"
     calls = []
 
-    def save_as(item, content, target_root, timeout):
+    def save_as(item, content, target_root, timeout, **kwargs):
         calls.append(item)
         saved.write_bytes(b"saved from selected bubble")
         return str(saved)
@@ -107,6 +107,41 @@ def test_strict_file_can_use_native_save_as_of_the_same_bubble(monkeypatch, tmp_
     monkeypatch.setattr(client, "_save_control_file_as", save_as)
     assert client.fetch_message_file(message, tmp_path / "out", allow_filename_cache=False) == str(saved)
     assert calls == [control]
+
+
+def test_native_reference_saves_once_without_starting_external_file_preview(monkeypatch, tmp_path):
+    client, message, control, state = bound_file_client(monkeypatch, timeout=2, save_as=True)
+    saved = tmp_path / "saved-from-bubble.pdf"
+    actions = []
+
+    def save_as(item, content, target_root, timeout, **kwargs):
+        assert item is control
+        saved.write_bytes(b"saved from exact native reference")
+        actions.append("saved")
+        assert kwargs["on_file_materialized"](str(saved)) is True
+        return str(saved)
+
+    def accept(path):
+        assert Path(path).read_bytes() == b"saved from exact native reference"
+        actions.append("accepted")
+        return True
+
+    monkeypatch.setattr(client, "_save_control_file_as", save_as)
+    result = client.fetch_message_file(message, tmp_path / "out", allow_filename_cache=False,
+                                       on_file_materialized=accept)
+    assert result == str(saved)
+    assert state.copies == 0
+    assert actions == ["saved", "accepted"]
+
+
+def test_failed_native_save_as_does_not_loop_or_open_external_preview(monkeypatch, tmp_path):
+    client, message, control, state = bound_file_client(monkeypatch, timeout=2, save_as=True)
+    saved_calls = []
+    monkeypatch.setattr(client, "_save_control_file_as", lambda *args, **kwargs: saved_calls.append(args) or "")
+    result = client.fetch_message_file(message, tmp_path / "out", allow_filename_cache=False,
+                                       on_file_materialized=lambda path: pytest.fail("未取得文件不能重签来源"))
+    assert result == ""
+    assert len(saved_calls) == 1 and state.copies == 0
 
 
 @pytest.mark.parametrize("change", ["title", "window", "process"])
@@ -319,6 +354,17 @@ def test_strict_viewer_context_change_closes_only_its_viewer_without_restoring_o
     monkeypatch.setattr(client, "_left_click_point", lambda point: calls.append(("activate", point)))
     monkeypatch.setattr(client, "_paced_wait", lambda *_args: None)
     monkeypatch.setattr(client, "_find_opened_image_viewer", lambda *_args: 200)
+    identity = (200, 42, "图片和视频", "Qt51514QWindowIcon")
+    uia_identity = ("mmui::XView", "PreviewWindow_synthetic_0_0")
+
+    def verified_wait(*args, **kwargs):
+        kwargs["observation"].update(native_identity=identity, verified_identity=identity, uia_identity=uia_identity)
+        return 200
+
+    monkeypatch.setattr(client._image_viewer, "_wait_opened_image_viewer", verified_wait)
+    monkeypatch.setattr(client._image_viewer, "_native_image_viewer_identity", lambda *args: identity)
+    monkeypatch.setattr(client._image_viewer, "_image_viewer_uia_identity", lambda *args: uia_identity)
+    monkeypatch.setattr(win32gui, "GetForegroundWindow", lambda: 200)
     monkeypatch.setattr(win32gui, "GetWindowRect", lambda _hwnd: (0, 0, 50, 50))
 
     def capture(**kwargs):
@@ -326,7 +372,14 @@ def test_strict_viewer_context_change_closes_only_its_viewer_without_restoring_o
         return Image.new("RGB", (50, 50), "red")
 
     monkeypatch.setattr(ImageGrab, "grab", capture)
-    monkeypatch.setattr(client, "_close_image_viewer", lambda viewer, main: calls.append(("close", viewer, main)) or True)
+    def close(viewer, main, **kwargs):
+        assert kwargs["expected_identity"] == identity
+        assert kwargs["expected_uia_identity"] == uia_identity
+        assert kwargs["validate_context"] is None, "只关闭已验证的本次窗口，不操作失效的旧会话"
+        calls.append(("close", viewer, main))
+        return True
+
+    monkeypatch.setattr(client, "_close_image_viewer", close)
     monkeypatch.setattr(client, "_restore_main_window_after_viewer", lambda *_args: pytest.fail("会话变化不得恢复旧前台"))
     assert fetch_bound_image(client, message, tmp_path, reference=True) == ""
     assert calls[-1] == ("close", 200, 123)

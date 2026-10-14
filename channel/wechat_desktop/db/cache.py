@@ -334,12 +334,16 @@ class EncryptedDatabaseCache:
     def refresh(self) -> SnapshotStatus:
         with self._lock:
             last_code = "snapshot_unavailable"
-            for _ in range(self.retry_attempts):
+            for attempt in range(self.retry_attempts):
                 try:
                     with source_snapshot_lock(self.source) as validate_source:
                         return self._refresh_once(validate_source)
                 except DatabaseReadError as exc:
                     last_code = exc.code
+                    if exc.code == "source_busy" and attempt + 1 < self.retry_attempts:
+                        # 微信写事务会短暂占用快照锁；给其释放机会再有限重试。
+                        # 最后一次及完整性/来源变化错误不引入等待。
+                        time.sleep(0.05)
                 except (OSError, sqlite3.Error, ValueError):
                     last_code = "snapshot_io_failed"
             self.status = replace(self.status, healthy=False, stale=True, changed=False, error_code=last_code, changed_pages=())

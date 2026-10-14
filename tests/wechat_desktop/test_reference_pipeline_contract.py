@@ -9,9 +9,10 @@ import pytest
 from channel.wechat_desktop.hybrid import WechatDatabaseBackend
 from channel.wechat_desktop.pipeline.agent_reply import AgentReplyCoordinator
 from channel.wechat_desktop.pipeline.prompts import _link_reading_urls
-from channel.wechat_desktop.references import reference_requires_uia
+from channel.wechat_desktop.references import event_native_xml_unavailable, reference_requires_uia
 from channel.wechat_desktop.storage.store import WechatDesktopStore
 from .test_db_reader import add_message, make_reader, table
+from .test_db_chat_records import TITLE, app_record, text_item
 
 
 @pytest.fixture
@@ -97,6 +98,111 @@ def test_referenced_original_changed_while_queued_stops_agent_reading(native_cha
         conn.execute(f'UPDATE "{table(talker)}" SET message_content=? WHERE local_id=1',
                      ("https://example.invalid/replaced",))
     cache.changed = True
+
+    assert AgentReplyCoordinator(channel).dispatch(event) is False
+    assert captured == []
+
+
+@pytest.mark.parametrize("mode", ["title_reference", "inline_reference", "direct"])
+def test_chat_record_database_body_only_reaches_agent_when_explicitly_quoted(native_channel, mode):
+    backend, reader, _, talker, channel, captured = native_channel
+    body = app_record(text_item("明天上午九点开会", "南街") + text_item("收到，会议室见", "九月底"))
+    add_message(reader.caches["message/message_0.db"], talker, 1, content=body,
+                message_type=49, server_id=71, created=100)
+    content = body if mode == "direct" else reference_xml(49, TITLE if mode == "title_reference" else body)
+    add_message(reader.caches["message/message_1.db"], talker, 2, content=content,
+                message_type=49, server_id=72, created=101)
+    result, count = backend.materialize_event(receive(native_channel))
+    result.history.append({"content": "不应混入的会话旧历史"})
+
+    AgentReplyCoordinator(channel).dispatch(result)
+
+    record = result.chat_record if mode == "direct" else result.reference["chat_record"]
+    assert count == 0 and result.attachment_status == "materialized"
+    assert record["status"] == "success" and len(record["entries"]) == 2
+    if mode == "direct":
+        # 底层仍可从 DB 解析原记录；接收和解析不授予主动回复权限。
+        assert captured == [] and not backend.uia_initialized
+        return
+    assert "南街" in captured[0] and "明天上午九点开会" in captured[0]
+    assert "九月底" in captured[0] and "收到，会议室见" in captured[0]
+    assert "不应混入的会话旧历史" not in captured[0]
+    assert not backend.uia_initialized
+    if mode != "direct":
+        assert result.reference["resolved"] is True
+        assert result.reference["source_message_id"] == "71"
+        assert result.reference["content_signature"]
+
+
+def test_title_only_chat_record_without_origin_stops_before_agent(native_channel):
+    backend, reader, _, talker, channel, captured = native_channel
+    add_message(reader.caches["message/message_1.db"], talker, 2,
+                content=reference_xml(49, TITLE), message_type=49, server_id=72, created=101)
+
+    result, count = backend.materialize_event(receive(native_channel))
+
+    assert count == 0 and result.attachment_status == "unavailable"
+    assert result.reference["content_type"] == "chat_record"
+    assert result.reference["resolved"] is False
+    assert AgentReplyCoordinator(channel).dispatch(result) is False
+    assert captured == [] and not backend.uia_initialized
+
+
+@pytest.mark.parametrize("mode", ["outer_record", "outer_quote", "inner_quote"])
+def test_native_type49_xml_overflow_stops_before_uia_and_agent(native_channel, mode):
+    backend, reader, _, talker, channel, captured = native_channel
+    body = app_record(text_item("超额原始正文" * 100))
+    content = body if mode == "outer_record" else reference_xml(49, body)
+    reader.config["chat_record_max_xml_bytes"] = len(content.encode("utf-8")) if mode == "inner_quote" else 100
+    add_message(reader.caches["message/message_1.db"], talker, 2, content=content,
+                message_type=49, server_id=72, created=101)
+
+    result, count = backend.materialize_event(receive(native_channel))
+
+    assert count == 0 and event_native_xml_unavailable(result)
+    assert "超额原始正文" not in result.content
+    assert "超额原始正文" not in str(result.reference.get("content", ""))
+    assert AgentReplyCoordinator(channel).dispatch(result) is False
+    assert captured == [] and not backend.uia_initialized
+    assert reader.validate_native_event(result) == (True, "")
+
+
+def test_inline_xml_budget_failure_can_be_recovered_by_exact_original(native_channel):
+    backend, reader, _, talker, channel, captured = native_channel
+    body = app_record()
+    question = reference_xml(49, body)
+    reader.config["chat_record_max_xml_bytes"] = len(question.encode("utf-8"))
+    add_message(reader.caches["message/message_0.db"], talker, 1, content=body,
+                message_type=49, server_id=71, created=100)
+    add_message(reader.caches["message/message_1.db"], talker, 2, content=question,
+                message_type=49, server_id=72, created=101)
+
+    result, count = backend.materialize_event(receive(native_channel))
+
+    assert count == 0 and not event_native_xml_unavailable(result)
+    assert result.reference["content_type"] == "chat_record"
+    assert result.reference["chat_record"]["status"] == "success"
+    AgentReplyCoordinator(channel).dispatch(result)
+    assert "完整的合并消息正文" in captured[0]
+
+
+@pytest.mark.parametrize("when", ["before_materialization", "while_queued"])
+def test_chat_record_body_changed_without_title_change_stops_agent(native_channel, when):
+    backend, reader, _, talker, channel, captured = native_channel
+    cache = reader.caches["message/message_0.db"]
+    add_message(cache, talker, 1, content=app_record(), message_type=49, server_id=71, created=100)
+    add_message(reader.caches["message/message_1.db"], talker, 2,
+                content=reference_xml(49, TITLE), message_type=49, server_id=72, created=101)
+    event = receive(native_channel)
+    if when == "while_queued":
+        event, _ = backend.materialize_event(event)
+    with sqlite3.connect(cache.path) as conn:
+        conn.execute(f'UPDATE "{table(talker)}" SET message_content=? WHERE local_id=1',
+                     (app_record(text_item("记录正文已被替换，卡片标题保持原样")),))
+    cache.changed = True
+    if when == "before_materialization":
+        event, _ = backend.materialize_event(event)
+        assert event.attachment_status == "source_invalid"
 
     assert AgentReplyCoordinator(channel).dispatch(event) is False
     assert captured == []
