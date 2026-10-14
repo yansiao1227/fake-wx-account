@@ -214,7 +214,7 @@ def test_deferred_record_is_decided_after_materialization(reply_channel, monkeyp
     event = record_event(status="unavailable", content="", entries=[])
     event.task.deferred_materialization_events = [event]
     order = []
-    channel._send_deferred_attachment_notice = lambda item: order.append("notice") or False
+    channel._send_deferred_attachment_notice = lambda item: pytest.fail("物化前不再发送附件预测通知")
 
     def materialize(events):
         order.append("materialize")
@@ -231,7 +231,7 @@ def test_deferred_record_is_decided_after_materialization(reply_channel, monkeyp
         monkeypatch.setattr(AgentReplyCoordinator, "wait_for_reply", lambda *args: "completed")
 
     assert process(channel, event) == "completed"
-    assert order == (["notice", "materialize", "dispatch"] if ready_after else ["notice", "materialize"])
+    assert order == (["materialize", "dispatch"] if ready_after else ["materialize"])
     assert len(sent) == (0 if ready_after else 1)
     assert failures == []
 

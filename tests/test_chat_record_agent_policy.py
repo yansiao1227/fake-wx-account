@@ -185,6 +185,53 @@ def test_forbidden_call_batch_stops_once_preserving_all_pairs(isolated_tools, ma
     assert events[-1]["data"]["final_response"] == POLICY_REPLY
 
 
+@pytest.mark.parametrize("max_turns", [1, 50])
+def test_jev_policy_rejection_filters_route_and_skips_completion(isolated_tools, monkeypatch, max_turns):
+    import config
+    from unittest.mock import Mock
+    from agent.decision.runtime import CompletionDecision, DecisionRun, RoutingDecision
+
+    decision = SimpleNamespace(
+        version="synthetic-jev", route_wait_seconds=0, completion_wait_seconds=0,
+        completion_enabled=True,
+        resolve=Mock(return_value=RoutingDecision("synthetic-jev", "direct", (), (), .98)),
+        start_completion=Mock(return_value=True),
+        resolve_completion=Mock(return_value=CompletionDecision("continue", .98)),
+        close=Mock(),
+    )
+    start = Mock(return_value=decision)
+    monkeypatch.setattr(config, "conf", lambda: {"agent_decision": {"enabled": True}})
+    monkeypatch.setattr(DecisionRun, "start", start)
+    tools = [_Tool(name) for name in ["read", *DISABLED_TOOLS]]
+    guesses = [{"name": "read"}, {"name": "wechat_history"}, {"name": "bash"}]
+    model = _Model([guesses])
+    agent = Agent("合成系统提示", model=model, tools=tools, enable_skills=False, max_steps=max_turns)
+    monkeypatch.setattr(agent, "get_full_system_prompt", lambda **_kwargs: "合成系统提示")
+    events = []
+
+    assert agent.run_stream("合成转发正文和问题", on_event=events.append,
+                            disabled_tools=DISABLED_TOOLS, completion_gate_context=GATE_CONTEXT,
+                            disabled_tool_reply=POLICY_REPLY) == POLICY_REPLY
+
+    start.assert_called_once()
+    assert [tool.name for tool in start.call_args.args[1]] == ["read"]
+    assert any(event["type"] == "decision_route" for event in events)
+    decision.start_completion.assert_not_called()
+    decision.resolve_completion.assert_not_called()
+    assert decision.close.called
+    assert len(model.requests) == 1
+    assert all(not tool.calls for tool in tools)
+    blocks = [block for message in agent.messages for block in message.get("content", [])
+              if isinstance(block, dict)]
+    uses = [block["id"] for block in blocks if block.get("type") == "tool_use"]
+    results = [block for block in blocks if block.get("type") == "tool_result"]
+    assert uses == [block["tool_use_id"] for block in results]
+    assert len(results) == len(guesses)
+    assert all(block["is_error"] for block in results)
+    assert agent.messages[-1] == {"role": "assistant", "content": [{"type": "text", "text": POLICY_REPLY}]}
+    assert events[-1]["data"]["final_response"] == POLICY_REPLY
+
+
 def test_agent_reuses_full_tools_for_next_ordinary_request(isolated_tools, monkeypatch):
     tools = [_Tool(name) for name in DISABLED_TOOLS + ["read"]]
     model = _Model(["记录答复", "普通答复"])
